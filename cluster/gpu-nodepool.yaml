@@ -42,6 +42,11 @@ spec:
           operator: In
           values: ["on-demand"]
 
+        # Allow all zones for better instance availability
+        - key: topology.kubernetes.io/zone
+          operator: In
+          values: ["us-east-2a", "us-east-2b", "us-east-2c"]
+
   # Safety cap — covers up to g6e.48xlarge level workloads
   limits:
     cpu: "192"

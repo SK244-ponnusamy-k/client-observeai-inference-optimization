@@ -5,37 +5,35 @@
 # S3 path   : s3://shellkode-ai-models/Qwen2.5-0.5B-Instruct/
 # Size      : ~950 MB | VRAM: ~2 GB
 # GPU       : g6e.xlarge (1x L40S 48GB) — auto-provisioned by Karpenter
-# HF Token  : Not required
 # TTFT      : ~15-20ms (in-cluster)
 #
-# Use deploy.sh instead of applying this directly.
-# deploy.sh handles service + PVC + deployment in correct order.
+# Deployment name: vllm-qwen-0.5b  (unique — can run alongside other models)
+# Service name   : vllm-qwen-0.5b
+# Port-forward   : kubectl port-forward svc/vllm-qwen-0.5b 8080:8000 &
 # ==============================================================================
 
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: vllm
+  name: vllm-qwen-0.5b
   namespace: default
   labels:
-    app: vllm
+    app: vllm-qwen-0.5b
     model: qwen-2.5-0.5b
     component: inference-server
 spec:
   replicas: 1
   selector:
     matchLabels:
-      app: vllm
+      app: vllm-qwen-0.5b
   template:
     metadata:
       labels:
-        app: vllm
+        app: vllm-qwen-0.5b
         model: qwen-2.5-0.5b
         component: inference-server
     spec:
       serviceAccountName: model-storage-sa
-      nodeSelector:
-        workload: gpu
       tolerations:
         - key: nvidia.com/gpu
           operator: Exists

@@ -52,8 +52,8 @@ log_info "vLLM is healthy."
 # List models
 echo ""
 log_info "Available models:"
-curl -s "${BASE_URL}/v1/models" | python3 -m json.tool 2>/dev/null || \
-    curl -s "${BASE_URL}/v1/models"
+curl -s "${BASE_URL}/v1/models"
+echo ""
 echo ""
 
 # Chat completion
@@ -69,10 +69,7 @@ curl -s -X POST "${BASE_URL}/v1/chat/completions" \
         ],
         \"max_tokens\": 256,
         \"temperature\": 0.2
-    }" | python3 -m json.tool 2>/dev/null || \
-curl -s -X POST "${BASE_URL}/v1/chat/completions" \
-    -H "Content-Type: application/json" \
-    -d "{\"model\":\"${MODEL_NAME}\",\"messages\":[{\"role\":\"user\",\"content\":\"Explain Kubernetes in two sentences.\"}],\"max_tokens\":256}"
+    }"
 echo ""
 echo "──────────────────────────────────────────────────"
 log_info "Test complete."
