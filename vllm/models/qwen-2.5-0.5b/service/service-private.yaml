@@ -1,0 +1,32 @@
+# ==============================================================================
+# service-private.yaml — ClusterIP (default)
+#
+# Internal cluster access only.
+# Use for: app-to-vLLM communication inside the cluster.
+# Use port-forward for local laptop testing.
+#
+# Apply:
+#   kubectl apply -f vllm/models/qwen-2.5-0.5b/service/service-private.yaml
+#
+# Port-forward for local test:
+#   kubectl port-forward svc/vllm-qwen-0.5b 8080:8000 &
+#   bash inference/quick-test.sh qwen-0.5b 8080
+# ==============================================================================
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: vllm-qwen-0.5b
+  namespace: default
+  labels:
+    app: vllm-qwen-0.5b
+    model: qwen-2.5-0.5b
+spec:
+  type: ClusterIP
+  selector:
+    app: vllm-qwen-0.5b
+  ports:
+    - name: http
+      port: 8000
+      targetPort: 8000
+      protocol: TCP

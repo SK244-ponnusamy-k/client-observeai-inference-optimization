@@ -1,0 +1,35 @@
+# ==============================================================================
+# service-private.yaml — ClusterIP (default)
+#
+# Internal cluster access only.
+# Use for: app-to-vLLM communication inside the cluster.
+# Use port-forward for local laptop testing.
+#
+# Apply:
+#   kubectl apply -f vllm/models/gpt-oss-20b/service/service-private.yaml
+#
+# Port-forward for local test:
+#   kubectl port-forward svc/vllm-gpt-oss-20b 8081:8000 &
+#   bash inference/quick-test.sh gpt-oss-20b 8081
+#
+# Switch to public:
+#   kubectl apply -f vllm/models/gpt-oss-20b/service/service-public.yaml
+# ==============================================================================
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: vllm-gpt-oss-20b
+  namespace: default
+  labels:
+    app: vllm-gpt-oss-20b
+    model: gpt-oss-20b
+spec:
+  type: ClusterIP
+  selector:
+    app: vllm-gpt-oss-20b
+  ports:
+    - name: http
+      port: 8000
+      targetPort: 8000
+      protocol: TCP

@@ -2,14 +2,21 @@
 # ==============================================================================
 # vllm/stop.sh
 #
-# Stops the running vLLM deployment and releases all resources.
-# GPU node terminates automatically within ~10 minutes (Karpenter).
+# Stops ALL running vLLM deployments and releases their resources.
+# GPU nodes terminate automatically within ~10 minutes (Karpenter).
 # S3 model files are NOT affected.
 # Cluster keeps running (control plane ~$0.10/hr continues).
 #
 # Usage:
 #   cd llm-inference-framework
-#   bash vllm/stop.sh
+#   bash vllm/stop.sh                       # stop ALL models
+#
+# To stop a single model only:
+#   bash vllm/models/qwen-2.5-0.5b/stop.sh
+#   bash vllm/models/gpt-oss-20b/stop.sh
+#
+# To revert a public LB to private (no downtime):
+#   kubectl apply -f vllm/models/<model>/service/service-private.yaml
 #
 # To also delete the cluster:
 #   bash cluster/teardown.sh
@@ -28,49 +35,47 @@ log_error() { echo -e "${RED}[ERROR] $(date +'%H:%M:%S')${NC} $1"; }
 
 echo ""
 echo "══════════════════════════════════════════════════"
-echo "  STOP vLLM DEPLOYMENT"
+echo "  STOP ALL vLLM DEPLOYMENTS"
 echo "  Cluster : ${CLUSTER_NAME}"
-echo "  GPU node terminates in ~10 min after stop"
+echo "  GPU nodes terminate in ~10 min after stop"
 echo "  S3 models are NOT affected"
 echo "══════════════════════════════════════════════════"
 echo ""
 
 # ------------------------------------------------------------------------------
-# Check what's currently running
+# Discover all running inference deployments
 # ------------------------------------------------------------------------------
-CURRENT_MODEL=""
-if kubectl get deployment vllm -n "${NAMESPACE}" >/dev/null 2>&1; then
-    CURRENT_MODEL=$(kubectl get deployment vllm -n "${NAMESPACE}" \
-        -o jsonpath='{.metadata.labels.model}' 2>/dev/null || echo "unknown")
-    log_info "Found running deployment — model: ${CURRENT_MODEL}"
-else
-    log_warn "No vLLM deployment found — nothing to stop."
+RUNNING=$(kubectl get deployment -l component=inference-server \
+    -n "${NAMESPACE}" -o jsonpath='{.items[*].metadata.name}' 2>/dev/null || true)
+
+if [[ -z "${RUNNING}" ]]; then
+    log_warn "No vLLM deployments found — nothing to stop."
     exit 0
 fi
 
-read -r -p "Stop deployment '${CURRENT_MODEL}'? [y/N]: " CONFIRM
+log_info "Found deployments: ${RUNNING}"
+
+read -r -p "Stop ALL inference deployments? [y/N]: " CONFIRM
 [[ "${CONFIRM}" =~ ^[yY]$ ]] || { log_info "Cancelled."; exit 0; }
 
 # ------------------------------------------------------------------------------
-# Delete deployment
+# Stop each model by delegating to its own stop.sh
+# (non-interactive: answers 'y' automatically since user already confirmed above)
 # ------------------------------------------------------------------------------
-log_info "Deleting vLLM deployment..."
-kubectl delete deployment vllm -n "${NAMESPACE}" --ignore-not-found=true
+MODELS_DIR="${SCRIPT_DIR}/models"
 
-# ------------------------------------------------------------------------------
-# Delete service (both private and public if either exists)
-# ------------------------------------------------------------------------------
-log_info "Deleting service..."
-kubectl delete svc vllm-inference -n "${NAMESPACE}" --ignore-not-found=true
+for MODEL_DIR in "${MODELS_DIR}"/*/; do
+    MODEL=$(basename "${MODEL_DIR}")
+    STOP_SCRIPT="${MODEL_DIR}stop.sh"
 
-# ------------------------------------------------------------------------------
-# Delete PVC for current model
-# ------------------------------------------------------------------------------
-log_info "Deleting PVC..."
-kubectl delete pvc "metadata-cache-${CURRENT_MODEL}" \
-    -n "${NAMESPACE}" --ignore-not-found=true 2>/dev/null || \
-kubectl delete pvc metadata-cache \
-    -n "${NAMESPACE}" --ignore-not-found=true 2>/dev/null || true
+    if [[ -f "${STOP_SCRIPT}" ]]; then
+        log_info "Stopping model: ${MODEL}..."
+        # Pass 'y' automatically — user already confirmed above
+        echo "y" | bash "${STOP_SCRIPT}" || log_warn "stop.sh for ${MODEL} returned non-zero (may already be stopped)"
+    else
+        log_warn "No stop.sh found for ${MODEL} — skipping."
+    fi
+done
 
 # ------------------------------------------------------------------------------
 # Show remaining resources
@@ -80,16 +85,16 @@ log_info "Remaining pods:"
 kubectl get pods -n "${NAMESPACE}" 2>/dev/null || true
 
 echo ""
-log_info "Remaining nodes (GPU node will terminate in ~10 min):"
+log_info "Remaining nodes (GPU nodes will terminate in ~10 min):"
 kubectl get nodes 2>/dev/null || true
 
 echo ""
 echo "══════════════════════════════════════════════════"
-echo "  STOPPED"
-echo "  Deleted : deployment, service, PVC"
-echo "  Kept    : cluster, S3 models, IAM Role"
+echo "  ALL MODELS STOPPED"
+echo "  Deleted : deployments, services, PVCs"
+echo "  Kept    : cluster, S3 models, IAM Roles"
 echo ""
-echo "  To redeploy:"
+echo "  To redeploy a model:"
 echo "    bash vllm/models/qwen-2.5-0.5b/deploy.sh"
 echo "    bash vllm/models/gpt-oss-20b/deploy.sh"
 echo ""

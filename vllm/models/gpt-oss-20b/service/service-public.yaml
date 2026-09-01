@@ -1,0 +1,40 @@
+# ==============================================================================
+# service-public.yaml — LoadBalancer (AWS NLB)
+#
+# Exposes vLLM publicly via AWS Network Load Balancer.
+# WARNING: No authentication — anyone with the URL can call your GPU.
+#
+# Apply:
+#   kubectl apply -f vllm/models/gpt-oss-20b/service/service-public.yaml
+#
+# Get public URL:
+#   kubectl get svc vllm-gpt-oss-20b   (wait ~2 min for EXTERNAL-IP)
+#
+# Test:
+#   curl http://EXTERNAL-IP:8000/v1/models
+#
+# Switch back to private:
+#   kubectl apply -f vllm/models/gpt-oss-20b/service/service-private.yaml
+# ==============================================================================
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: vllm-gpt-oss-20b
+  namespace: default
+  labels:
+    app: vllm-gpt-oss-20b
+    model: gpt-oss-20b
+  annotations:
+    service.beta.kubernetes.io/aws-load-balancer-type: "external"
+    service.beta.kubernetes.io/aws-load-balancer-nlb-target-type: "ip"
+    service.beta.kubernetes.io/aws-load-balancer-scheme: "internet-facing"
+spec:
+  type: LoadBalancer
+  selector:
+    app: vllm-gpt-oss-20b
+  ports:
+    - name: http
+      port: 8000
+      targetPort: 8000
+      protocol: TCP

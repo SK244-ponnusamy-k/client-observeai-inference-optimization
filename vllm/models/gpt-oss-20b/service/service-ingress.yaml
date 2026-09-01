@@ -1,0 +1,77 @@
+# ==============================================================================
+# service-ingress.yaml — HTTPS Ingress via AWS ALB (Production)
+#
+# Exposes vLLM at https://api.yourdomain.com with SSL termination.
+# Requires: AWS Load Balancer Controller + ACM certificate.
+#
+# Prerequisites:
+#   1. Install ALB controller:
+#        helm repo add eks https://aws.github.io/eks-charts
+#        helm install aws-load-balancer-controller eks/aws-load-balancer-controller \
+#          -n kube-system --set clusterName=ai-eks-cluster
+#
+#   2. Create ACM certificate:
+#        aws acm request-certificate \
+#          --domain-name api.yourdomain.com \
+#          --validation-method DNS \
+#          --region us-east-2
+#      Validate via DNS, then copy the ARN.
+#
+#   3. Edit this file:
+#        - Replace YOUR-ACM-CERT-ARN with actual ARN
+#        - Replace api.yourdomain.com with your domain
+#
+#   4. Apply private service first (Ingress routes to ClusterIP):
+#        kubectl apply -f service/service-private.yaml
+#
+# Apply:
+#   kubectl apply -f vllm/models/gpt-oss-20b/service/service-ingress.yaml
+#
+# Get ALB DNS:
+#   kubectl get ingress vllm-gpt-oss-20b-ingress
+#   → Create CNAME: api.yourdomain.com → ALB DNS name
+#
+# Test:
+#   curl https://api.yourdomain.com/v1/models
+# ==============================================================================
+
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: vllm-gpt-oss-20b-ingress
+  namespace: default
+  labels:
+    app: vllm-gpt-oss-20b
+    model: gpt-oss-20b
+  annotations:
+    kubernetes.io/ingress.class: alb
+    alb.ingress.kubernetes.io/scheme: internet-facing
+    alb.ingress.kubernetes.io/target-type: ip
+    # ── REPLACE WITH YOUR ACM CERTIFICATE ARN ─────────────
+    alb.ingress.kubernetes.io/certificate-arn: arn:aws:acm:us-east-2:ACCOUNT_ID:certificate/YOUR-CERT-ID
+    # ──────────────────────────────────────────────────────
+    alb.ingress.kubernetes.io/listen-ports: '[{"HTTP":80},{"HTTPS":443}]'
+    alb.ingress.kubernetes.io/ssl-redirect: "443"
+    alb.ingress.kubernetes.io/healthcheck-path: /health
+    alb.ingress.kubernetes.io/load-balancer-attributes: idle_timeout.timeout_seconds=300
+spec:
+  rules:
+    # ── REPLACE WITH YOUR DOMAIN ──────────────────────────
+    - host: api.yourdomain.com
+    # ──────────────────────────────────────────────────────
+      http:
+        paths:
+          - path: /v1
+            pathType: Prefix
+            backend:
+              service:
+                name: vllm-gpt-oss-20b
+                port:
+                  number: 8000
+          - path: /health
+            pathType: Exact
+            backend:
+              service:
+                name: vllm-gpt-oss-20b
+                port:
+                  number: 8000

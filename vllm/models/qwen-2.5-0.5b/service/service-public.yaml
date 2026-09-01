@@ -1,0 +1,37 @@
+# ==============================================================================
+# service-public.yaml — LoadBalancer (AWS NLB)
+#
+# Exposes vLLM publicly via AWS Network Load Balancer.
+# WARNING: No authentication — anyone with the URL can call your GPU.
+#
+# Apply:
+#   kubectl apply -f vllm/models/qwen-2.5-0.5b/service/service-public.yaml
+#
+# Get public URL:
+#   kubectl get svc vllm-qwen-0.5b   (wait ~2 min for EXTERNAL-IP)
+#
+# Switch back to private:
+#   kubectl apply -f vllm/models/qwen-2.5-0.5b/service/service-private.yaml
+# ==============================================================================
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: vllm-qwen-0.5b
+  namespace: default
+  labels:
+    app: vllm-qwen-0.5b
+    model: qwen-2.5-0.5b
+  annotations:
+    service.beta.kubernetes.io/aws-load-balancer-type: "external"
+    service.beta.kubernetes.io/aws-load-balancer-nlb-target-type: "ip"
+    service.beta.kubernetes.io/aws-load-balancer-scheme: "internet-facing"
+spec:
+  type: LoadBalancer
+  selector:
+    app: vllm-qwen-0.5b
+  ports:
+    - name: http
+      port: 8000
+      targetPort: 8000
+      protocol: TCP
