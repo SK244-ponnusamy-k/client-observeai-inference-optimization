@@ -1,0 +1,93 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: download-qwen-0.5b
+  namespace: ${NAMESPACE}
+  labels:
+    app: model-download
+    model: qwen-2.5-0.5b
+    component: data-prep
+spec:
+  backoffLimit: 2
+  activeDeadlineSeconds: 7200      # 2 hours — model is ~950MB
+  ttlSecondsAfterFinished: 3600
+
+  template:
+    metadata:
+      labels:
+        app: model-download
+        job-name: download-qwen-0.5b
+        model: qwen-2.5-0.5b
+    spec:
+      restartPolicy: Never
+      serviceAccountName: ${SERVICE_ACCOUNT}
+
+      containers:
+        - name: downloader
+          image: python:3.11-slim
+
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              set -e
+
+              MODEL_ID="Qwen/Qwen2.5-0.5B-Instruct"
+              MODEL_FOLDER="Qwen2.5-0.5B-Instruct"
+              MODEL_BUCKET="${MODEL_BUCKET}"
+              LOCAL_DIR="/tmp/${MODEL_FOLDER}"
+
+              echo "================================================"
+              echo " Model  : ${MODEL_ID}"
+              echo " Bucket : s3://${MODEL_BUCKET}/${MODEL_FOLDER}/"
+              echo "================================================"
+
+              echo "Installing dependencies..."
+              pip install -q huggingface_hub boto3
+
+              echo "Downloading from HuggingFace..."
+              python3 -c "
+              from huggingface_hub import snapshot_download
+              snapshot_download(
+                  repo_id='${MODEL_ID}',
+                  local_dir='${LOCAL_DIR}',
+                  ignore_patterns=['*.msgpack','*.h5','flax_*','tf_*','rust_*']
+              )
+              print('Download complete.')
+              "
+
+              echo "Files downloaded:"
+              ls -lah "${LOCAL_DIR}/"
+
+              echo "Uploading to s3://${MODEL_BUCKET}/${MODEL_FOLDER}/ ..."
+              python3 << PYEOF
+              import boto3
+              from pathlib import Path
+
+              s3 = boto3.client('s3')
+              bucket = "${MODEL_BUCKET}"
+              folder = "${MODEL_FOLDER}"
+              local_dir = Path("${LOCAL_DIR}")
+
+              files = [f for f in local_dir.rglob("*") if f.is_file() and '.cache' not in f.parts]
+              for i, f in enumerate(files, 1):
+                  key = f"{folder}/" + str(f.relative_to(local_dir))
+                  size = f.stat().st_size / 1024 / 1024
+                  print(f"[{i}/{len(files)}] {f.name} ({size:.1f} MB)")
+                  s3.upload_file(str(f), bucket, key)
+
+              print("Upload complete.")
+              PYEOF
+
+          env:
+            - name: AWS_DEFAULT_REGION
+              value: "${AWS_REGION}"
+            - name: HF_HUB_DISABLE_XET
+              value: "1"
+
+          resources:
+            requests:
+              cpu: "2"
+              memory: "8Gi"
+            limits:
+              cpu: "4"
+              memory: "16Gi"

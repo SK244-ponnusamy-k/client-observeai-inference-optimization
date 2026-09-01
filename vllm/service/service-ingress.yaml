@@ -1,0 +1,60 @@
+# ==============================================================================
+# vllm/service/service-ingress.yaml
+#
+# Production HTTPS Ingress via AWS ALB.
+#
+# Prerequisites:
+#   1. AWS Load Balancer Controller installed
+#   2. ACM certificate created for your domain
+#   3. service-private.yaml applied (Ingress routes to ClusterIP)
+#
+# Edit before applying:
+#   - certificate-arn  → your ACM cert ARN
+#   - host             → your domain e.g. api.yourdomain.com
+#
+# Apply:
+#   kubectl apply -f vllm/service/service-ingress.yaml
+#   kubectl get ingress vllm-ingress   # get ALB DNS name
+# ==============================================================================
+
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: vllm-ingress
+  namespace: default
+  labels:
+    app: vllm
+    component: ingress
+  annotations:
+    kubernetes.io/ingress.class: alb
+    alb.ingress.kubernetes.io/scheme: internet-facing
+    alb.ingress.kubernetes.io/target-type: ip
+    # ── REPLACE WITH YOUR ACM CERTIFICATE ARN ─────────────────
+    alb.ingress.kubernetes.io/certificate-arn: arn:aws:acm:us-east-2:ACCOUNT_ID:certificate/YOUR-CERT-ID
+    # ──────────────────────────────────────────────────────────
+    alb.ingress.kubernetes.io/listen-ports: '[{"HTTP":80},{"HTTPS":443}]'
+    alb.ingress.kubernetes.io/ssl-redirect: "443"
+    alb.ingress.kubernetes.io/healthcheck-path: /health
+    alb.ingress.kubernetes.io/healthcheck-interval-seconds: "30"
+    alb.ingress.kubernetes.io/load-balancer-attributes: idle_timeout.timeout_seconds=300
+spec:
+  rules:
+    # ── REPLACE WITH YOUR DOMAIN ──────────────────────────────
+    - host: api.yourdomain.com
+    # ──────────────────────────────────────────────────────────
+      http:
+        paths:
+          - path: /v1
+            pathType: Prefix
+            backend:
+              service:
+                name: vllm-inference
+                port:
+                  number: 8000
+          - path: /health
+            pathType: Exact
+            backend:
+              service:
+                name: vllm-inference
+                port:
+                  number: 8000

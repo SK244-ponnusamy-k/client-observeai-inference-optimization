@@ -1,0 +1,53 @@
+apiVersion: karpenter.sh/v1
+kind: NodePool
+metadata:
+  name: gpu-nodepool
+spec:
+  template:
+    metadata:
+      labels:
+        workload: gpu
+        workload-type: ai-ml
+    spec:
+      nodeClassRef:
+        group: eks.amazonaws.com
+        kind: NodeClass
+        name: default
+
+      # Only GPU-tolerating pods schedule here
+      taints:
+        - key: nvidia.com/gpu
+          effect: NoSchedule
+
+      requirements:
+        # g6e family — NVIDIA L40S (48GB VRAM per GPU)
+        - key: eks.amazonaws.com/instance-category
+          operator: In
+          values: ["g"]
+
+        - key: eks.amazonaws.com/instance-generation
+          operator: In
+          values: ["6"]
+
+        - key: eks.amazonaws.com/instance-family
+          operator: In
+          values: ["g6e"]
+
+        - key: kubernetes.io/arch
+          operator: In
+          values: ["amd64"]
+
+        # On-demand only — no spot interruptions during inference
+        - key: karpenter.sh/capacity-type
+          operator: In
+          values: ["on-demand"]
+
+  # Safety cap — covers up to g6e.48xlarge level workloads
+  limits:
+    cpu: "192"
+    memory: 1536Gi
+
+  disruption:
+    # Terminate idle/underutilized nodes to save cost
+    consolidationPolicy: WhenEmptyOrUnderutilized
+    consolidateAfter: 10m

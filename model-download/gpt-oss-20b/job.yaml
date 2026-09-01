@@ -1,0 +1,101 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: download-gpt-oss-20b
+  namespace: ${NAMESPACE}
+  labels:
+    app: model-download
+    model: gpt-oss-20b
+    component: data-prep
+spec:
+  backoffLimit: 2
+  activeDeadlineSeconds: 86400     # 24 hours — model is ~13GB
+  ttlSecondsAfterFinished: 3600
+
+  template:
+    metadata:
+      labels:
+        app: model-download
+        job-name: download-gpt-oss-20b
+        model: gpt-oss-20b
+    spec:
+      restartPolicy: Never
+      serviceAccountName: ${SERVICE_ACCOUNT}
+
+      containers:
+        - name: downloader
+          image: python:3.11-slim
+
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              set -e
+
+              MODEL_ID="openai/gpt-oss-20b"
+              MODEL_FOLDER="gpt-oss-20b"
+              MODEL_BUCKET="${MODEL_BUCKET}"
+              LOCAL_DIR="/tmp/${MODEL_FOLDER}"
+
+              echo "================================================"
+              echo " Model  : ${MODEL_ID}"
+              echo " Bucket : s3://${MODEL_BUCKET}/${MODEL_FOLDER}/"
+              echo " Size   : ~13 GB (MXFP4 quantized)"
+              echo "================================================"
+
+              echo "Installing dependencies..."
+              pip install -q huggingface_hub boto3 requests
+
+              echo "Downloading from HuggingFace..."
+              python3 -c "
+              from huggingface_hub import snapshot_download
+              import os
+              snapshot_download(
+                  repo_id='${MODEL_ID}',
+                  local_dir='${LOCAL_DIR}',
+                  ignore_patterns=['*.msgpack','*.h5','flax_*','tf_*','rust_*']
+              )
+              print('Download complete.')
+              "
+
+              echo "Files downloaded:"
+              ls -lah "${LOCAL_DIR}/"
+
+              echo "Uploading to s3://${MODEL_BUCKET}/${MODEL_FOLDER}/ ..."
+              python3 << PYEOF
+              import boto3
+              from pathlib import Path
+
+              s3 = boto3.client('s3')
+              bucket = "${MODEL_BUCKET}"
+              folder = "${MODEL_FOLDER}"
+              local_dir = Path("${LOCAL_DIR}")
+
+              files = [f for f in local_dir.rglob("*") if f.is_file() and '.cache' not in f.parts]
+              for i, f in enumerate(files, 1):
+                  key = f"{folder}/" + str(f.relative_to(local_dir))
+                  size = f.stat().st_size / 1024 / 1024
+                  print(f"[{i}/{len(files)}] {f.name} ({size:.1f} MB)")
+                  s3.upload_file(str(f), bucket, key)
+
+              print("Upload complete.")
+              PYEOF
+
+          env:
+            - name: AWS_DEFAULT_REGION
+              value: "${AWS_REGION}"
+
+            # HuggingFace token — required for gated model access
+            # Create secret: kubectl create secret generic hf-token --from-literal=token=hf_YOURTOKEN
+            - name: HF_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: hf-token
+                  key: token
+
+          resources:
+            requests:
+              cpu: "4"
+              memory: "16Gi"
+            limits:
+              cpu: "8"
+              memory: "32Gi"

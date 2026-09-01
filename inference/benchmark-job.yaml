@@ -1,0 +1,154 @@
+# ==============================================================================
+# inference/benchmark-job.yaml
+#
+# In-cluster benchmark — runs 100 requests inside the cluster.
+# Reports real latency without port-forward overhead.
+#
+# Edit MODEL_NAME below to match your deployed model.
+#
+# Apply:
+#   kubectl apply -f inference/benchmark-job.yaml
+#
+# Logs:
+#   kubectl logs job/vllm-benchmark -f
+#   (or use tab completion for pod name)
+#
+# Clean up:
+#   kubectl delete job vllm-benchmark
+# ==============================================================================
+
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: vllm-benchmark
+  namespace: default
+  labels:
+    app: vllm-benchmark
+    component: benchmarking
+spec:
+  backoffLimit: 1
+  ttlSecondsAfterFinished: 3600
+
+  template:
+    metadata:
+      labels:
+        app: vllm-benchmark
+    spec:
+      restartPolicy: Never
+
+      containers:
+        - name: benchmark
+          image: python:3.11-slim
+
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              set -e
+
+              # ── EDIT THIS to match your deployed model ──────────
+              MODEL_NAME="qwen-0.5b"
+              NUM_REQUESTS=100
+              VLLM_ENDPOINT="http://vllm-inference:8000"
+              # ──────────────────────────────────────────────────
+
+              echo "Installing dependencies..."
+              pip install -q openai requests
+
+              echo "Waiting for vLLM..."
+              until python3 -c "import requests; requests.get('${VLLM_ENDPOINT}/health').raise_for_status()" 2>/dev/null; do
+                echo "  waiting..."; sleep 5
+              done
+              echo "vLLM is ready."
+
+              echo ""
+              echo "================================================"
+              echo " IN-CLUSTER BENCHMARK"
+              echo " Model    : ${MODEL_NAME}"
+              echo " Endpoint : ${VLLM_ENDPOINT}"
+              echo " Requests : ${NUM_REQUESTS}"
+              echo "================================================"
+              echo ""
+
+              python3 << 'PYEOF'
+              import time, statistics, os
+              from openai import OpenAI
+
+              MODEL    = os.environ.get("MODEL_NAME", "qwen-0.5b")
+              ENDPOINT = os.environ.get("VLLM_ENDPOINT", "http://vllm-inference:8000")
+              N        = int(os.environ.get("NUM_REQUESTS", "100"))
+
+              client = OpenAI(base_url=f"{ENDPOINT}/v1", api_key="dummy")
+
+              PROMPTS = [
+                  "Explain Kubernetes in two sentences.",
+                  "What is a container?",
+                  "What is machine learning?",
+                  "Explain REST API briefly.",
+                  "What is cloud computing?",
+              ]
+
+              ttfts, totals, tokens = [], [], []
+              print(f"Sending {N} requests...\n")
+
+              for i in range(N):
+                  prompt = PROMPTS[i % len(PROMPTS)]
+                  start  = time.time()
+                  first  = None
+                  text   = ""
+
+                  stream = client.chat.completions.create(
+                      model=MODEL,
+                      messages=[{"role": "user", "content": prompt}],
+                      max_tokens=128,
+                      stream=True,
+                  )
+                  for chunk in stream:
+                      delta = chunk.choices[0].delta.content
+                      if delta:
+                          if first is None:
+                              first = time.time()
+                          text += delta
+
+                  end = time.time()
+                  ttft  = (first - start) * 1000 if first else 0
+                  total = (end - start) * 1000
+                  w     = len(text.split())
+                  ttfts.append(ttft); totals.append(total); tokens.append(w)
+
+                  if (i + 1) % 10 == 0:
+                      print(f"[{i+1}/{N}] TTFT avg so far: {statistics.mean(ttfts):.1f}ms")
+
+              s_t = sorted(ttfts); s_l = sorted(totals)
+              p = lambda lst, pct: lst[max(0, int(len(lst)*pct/100)-1)]
+
+              print(f"\n{'='*55}")
+              print(f"  BENCHMARK RESULTS ({N} requests, in-cluster)")
+              print(f"{'='*55}")
+              print(f"  TTFT avg     : {statistics.mean(ttfts):.1f} ms")
+              print(f"  TTFT p50     : {statistics.median(ttfts):.1f} ms")
+              print(f"  TTFT p90     : {p(s_t,90):.1f} ms")
+              print(f"  TTFT p99     : {p(s_t,99):.1f} ms")
+              print(f"  TTFT min/max : {min(ttfts):.1f} / {max(ttfts):.1f} ms")
+              print(f"  Latency avg  : {statistics.mean(totals):.1f} ms")
+              print(f"  Latency p50  : {statistics.median(totals):.1f} ms")
+              print(f"  Latency p90  : {p(s_l,90):.1f} ms")
+              print(f"  Latency p99  : {p(s_l,99):.1f} ms")
+              print(f"  Total tokens : {sum(tokens)}")
+              print(f"{'='*55}")
+              PYEOF
+
+          env:
+            - name: MODEL_NAME
+              value: "qwen-0.5b"
+            - name: VLLM_ENDPOINT
+              value: "http://vllm-inference:8000"
+            - name: NUM_REQUESTS
+              value: "100"
+
+          resources:
+            requests:
+              cpu: "1"
+              memory: "2Gi"
+            limits:
+              cpu: "2"
+              memory: "4Gi"

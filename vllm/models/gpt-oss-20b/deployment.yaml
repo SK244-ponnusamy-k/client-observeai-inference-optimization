@@ -1,0 +1,102 @@
+# ==============================================================================
+# vllm/models/gpt-oss-20b/deployment.yaml
+#
+# Model     : openai/gpt-oss-20b
+# S3 path   : s3://shellkode-ai-models/gpt-oss-20b/
+# Size      : ~13 GB (MXFP4 quantized) | VRAM: ~16 GB
+# GPU       : g6e.xlarge (1x L40S 48GB) — auto-provisioned by Karpenter
+# HF Token  : Required (gated model)
+# Notes     : MoE — 21B total params, 3.6B active per token
+#             Chain-of-thought reasoning via harmony format
+#
+# Use deploy.sh instead of applying this directly.
+# deploy.sh handles service + PVC + deployment in correct order.
+# ==============================================================================
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vllm
+  namespace: default
+  labels:
+    app: vllm
+    model: gpt-oss-20b
+    component: inference-server
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: vllm
+  template:
+    metadata:
+      labels:
+        app: vllm
+        model: gpt-oss-20b
+        component: inference-server
+    spec:
+      serviceAccountName: model-storage-sa
+      nodeSelector:
+        workload: gpu
+      tolerations:
+        - key: nvidia.com/gpu
+          operator: Exists
+          effect: NoSchedule
+      terminationGracePeriodSeconds: 120
+
+      containers:
+        - name: vllm
+          image: public.ecr.aws/deep-learning-containers/vllm:0.21.0-gpu-py312-cu130-ubuntu22.04-ec2-v1.0-soci
+          args:
+            - "--model=s3://shellkode-ai-models/gpt-oss-20b/"
+            - "--load-format=runai_streamer"
+            - "--host=0.0.0.0"
+            - "--port=8000"
+            - "--served-model-name=gpt-oss-20b"
+            - "--gpu-memory-utilization=0.90"
+            - "--max-model-len=4096"
+            - "--trust-remote-code"
+          ports:
+            - name: http
+              containerPort: 8000
+              protocol: TCP
+          env:
+            - name: AWS_DEFAULT_REGION
+              value: "us-east-2"
+          # gpt-oss-20b MXFP4 quantized ~13GB — fits on g6e.xlarge
+          resources:
+            requests:
+              cpu: "3"
+              memory: "12Gi"
+              nvidia.com/gpu: "1"
+            limits:
+              cpu: "4"
+              memory: "14Gi"
+              nvidia.com/gpu: "1"
+          # Larger model — longer startup delays
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 120
+            periodSeconds: 10
+            failureThreshold: 18
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 150
+            periodSeconds: 30
+            failureThreshold: 5
+          volumeMounts:
+            - name: metadata-cache
+              mountPath: /metadata
+            - name: dshm
+              mountPath: /dev/shm
+      volumes:
+        - name: metadata-cache
+          persistentVolumeClaim:
+            claimName: metadata-cache-gpt-oss-20b
+        - name: dshm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 16Gi

@@ -1,0 +1,18 @@
+# Metadata cache PVC — stores tokenizer + config files only.
+# Model weights stream from S3 — NOT stored here.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: metadata-cache-qwen-0.5b
+  namespace: default
+  labels:
+    app: vllm
+    model: qwen-2.5-0.5b
+    component: metadata-cache
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: gp3
+  resources:
+    requests:
+      storage: 5Gi

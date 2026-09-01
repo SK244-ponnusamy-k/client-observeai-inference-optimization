@@ -1,0 +1,42 @@
+# ==============================================================================
+# vllm/service/service-public.yaml
+#
+# LoadBalancer Service — exposes vLLM publicly via AWS NLB.
+#
+# WARNING: No authentication — anyone with the URL can call your GPU.
+# Restrict by IP or add API key to vLLM if needed.
+#
+# To switch from private to public:
+#   kubectl delete -f vllm/service/service-private.yaml
+#   kubectl apply  -f vllm/service/service-public.yaml
+#   kubectl get svc vllm-inference   # wait ~2 min for EXTERNAL-IP
+#
+# To go back to private:
+#   kubectl delete -f vllm/service/service-public.yaml
+#   kubectl apply  -f vllm/service/service-private.yaml
+#
+# Test:
+#   curl http://EXTERNAL-IP:8000/v1/models
+# ==============================================================================
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: vllm-inference
+  namespace: default
+  labels:
+    app: vllm
+    component: inference-server
+  annotations:
+    service.beta.kubernetes.io/aws-load-balancer-type: "external"
+    service.beta.kubernetes.io/aws-load-balancer-nlb-target-type: "ip"
+    service.beta.kubernetes.io/aws-load-balancer-scheme: "internet-facing"
+spec:
+  type: LoadBalancer
+  selector:
+    app: vllm
+  ports:
+    - name: http
+      port: 8000
+      targetPort: 8000
+      protocol: TCP
