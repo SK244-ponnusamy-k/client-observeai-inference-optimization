@@ -41,13 +41,15 @@ metadata:
     environment: sandbox
 data:
   # ── EDIT THESE before applying ───────────────────────────────────────────────
-  VLLM_ENDPOINT: "http://oai-infopt-vllm-qwen-0.5b:8000"    # ClusterIP svc name
-  RUN_ID: "oai-infopt-2026-09-01-qwen-0.5b-baseline-001"
-  MANIFEST_PATH: "/configs/manifests/qwen-2.5-0.5b-baseline.yaml"
-  PROFILE_PATH: "/configs/profiles/realtime_v1.yaml"
+  VLLM_ENDPOINT: "http://oai-infopt-vllm-gpt-oss-20b:8000"   # ClusterIP svc name
+  RUN_ID: "oai-infopt-2026-09-01-gpt-oss-20b-baseline-001"
+  MANIFEST_PATH: "/configs/manifests/manifest.yaml"
+  PROFILE_PATH: "/configs/profiles/profile.yaml"
   RESULTS_DIR: "/results"
   LOG_LEVEL: "INFO"
   WAIT_TIMEOUT: "300"
+  AWS_DEFAULT_REGION: "us-east-2"
+  RESULTS_BUCKET: "shellkode-ai-results"
   # ─────────────────────────────────────────────────────────────────────────────
 
 ---
@@ -120,12 +122,9 @@ spec:
               pip install --quiet --no-cache-dir \
                 openai==1.35.14 \
                 pyyaml==6.0.1 \
-                aiohttp==3.9.5
+                aiohttp==3.9.5 \
+                boto3==1.34.0
 
-              echo "Copying configs into place..."
-              mkdir -p /configs/manifests /configs/profiles /results
-
-              # Configs are volume-mounted from ConfigMap
               echo "Starting benchmark..."
               python3 /app/load-test.py \
                 --manifest "${MANIFEST_PATH}" \
@@ -134,8 +133,24 @@ spec:
                 --output   "${RESULTS_DIR}" \
                 --wait-timeout "${WAIT_TIMEOUT}"
 
-              echo "Benchmark complete. Results in ${RESULTS_DIR}/"
+              echo "Benchmark complete."
               ls -lh "${RESULTS_DIR}/"
+
+              echo "Uploading results to S3..."
+              python3 -c "
+              import boto3, os, glob
+              bucket = os.environ.get('RESULTS_BUCKET', '')
+              region = os.environ.get('AWS_DEFAULT_REGION', 'us-east-2')
+              if not bucket:
+                  print('RESULTS_BUCKET not set — skipping S3 upload')
+              else:
+                  s3 = boto3.client('s3', region_name=region)
+                  run_id = os.environ.get('RUN_ID', 'unknown')
+                  for f in glob.glob('/results/*.jsonl'):
+                      key = f'results/{run_id}/' + os.path.basename(f)
+                      s3.upload_file(f, bucket, key)
+                      print(f'Uploaded: s3://{bucket}/{key}')
+              " 2>/dev/null || echo "S3 upload skipped"
 
           envFrom:
             - configMapRef:

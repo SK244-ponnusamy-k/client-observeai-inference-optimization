@@ -83,6 +83,7 @@ spec:
                   set -euo pipefail
                   echo "Installing dependencies..."
                   pip install --quiet --no-cache-dir \
+                    --target=/tmp/pip-packages \
                     boto3==1.34.0 \
                     aws-requests-auth==0.4.3 \
                     requests==2.31.0
@@ -104,6 +105,13 @@ spec:
                   value: "30"
                 - name: PIP_NO_CACHE_DIR
                   value: "1"
+                # Required: UID 65534 (nobody) has no home dir — point pip to /tmp
+                - name: HOME
+                  value: "/tmp"
+                - name: PIP_TARGET
+                  value: "/tmp/pip-packages"
+                - name: PYTHONPATH
+                  value: "/tmp/pip-packages"
 
               securityContext:
                 allowPrivilegeEscalation: false

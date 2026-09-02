@@ -28,6 +28,12 @@ log_error() { echo -e "${RED}[ERROR] $(date +'%H:%M:%S')${NC} $1"; }
 DEPLOYMENT_NAME="vllm-qwen-0.5b"
 MODEL_NAME="qwen-0.5b"
 MODEL_FOLDER="Qwen2.5-0.5B-Instruct"
+VALIDATE="false"
+
+# Parse optional --validate flag
+for arg in "$@"; do
+    [[ "${arg}" == "--validate" ]] && VALIDATE="true"
+done
 
 echo ""
 echo "══════════════════════════════════════════════════"
@@ -95,3 +101,15 @@ echo ""
 echo "  Running models:"
 kubectl get deployment -n "${BENCHMARK_NAMESPACE}" 2>/dev/null || true
 echo "══════════════════════════════════════════════════"
+
+# ==============================================================================
+# Auto-validate if --validate flag passed
+# ==============================================================================
+if [[ "${VALIDATE}" == "true" ]]; then
+    echo ""
+    log_info "Starting post-deploy validation (--validate flag set)..."
+    bash "${SCRIPT_DIR}/../post-deploy-validate.sh" \
+        --model "qwen-0.5b" \
+        --manifest "configs/manifests/qwen-2.5-0.5b-baseline.yaml" \
+        --endpoint "http://oai-infopt-vllm-qwen-0.5b:8000"
+fi

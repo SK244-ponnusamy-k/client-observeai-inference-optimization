@@ -151,12 +151,13 @@ if [[ -z "${EXISTING_POLICY}" ]]; then
               \"Effect\": \"Allow\",
               \"Action\": [
                 \"s3:PutObject\",
+                \"s3:PutObjectTagging\",
                 \"s3:GetObject\",
                 \"s3:ListBucket\"
               ],
               \"Resource\": [
                 \"arn:aws:s3:::${RESULTS_BUCKET}\",
-                \"arn:aws:s3:::${RESULTS_BUCKET}/monitoring/*\"
+                \"arn:aws:s3:::${RESULTS_BUCKET}/*\"
               ]
             },
             {
@@ -177,7 +178,56 @@ if [[ -z "${EXISTING_POLICY}" ]]; then
     log_info "Policy created: ${AMP_POLICY_ARN}"
 else
     AMP_POLICY_ARN="${EXISTING_POLICY}"
-    log_warn "Policy already exists: ${AMP_POLICY_ARN}"
+    log_warn "Policy already exists: ${AMP_POLICY_ARN} — updating to ensure correct permissions..."
+    # Create a new policy version with the correct permissions
+    aws iam create-policy-version \
+        --policy-arn "${AMP_POLICY_ARN}" \
+        --policy-document "{
+          \"Version\": \"2012-10-17\",
+          \"Statement\": [
+            {
+              \"Sid\": \"AllowAMPReadWrite\",
+              \"Effect\": \"Allow\",
+              \"Action\": [
+                \"aps:ListWorkspaces\",
+                \"aps:DescribeWorkspace\",
+                \"aps:GetMetricMetadata\",
+                \"aps:GetSeries\",
+                \"aps:QueryMetrics\",
+                \"aps:RemoteWrite\",
+                \"aps:GetLabels\"
+              ],
+              \"Resource\": \"arn:aws:aps:${AWS_REGION}:${AWS_ACCOUNT_ID}:workspace/*\"
+            },
+            {
+              \"Sid\": \"AllowS3ResultsWrite\",
+              \"Effect\": \"Allow\",
+              \"Action\": [
+                \"s3:PutObject\",
+                \"s3:PutObjectTagging\",
+                \"s3:GetObject\",
+                \"s3:ListBucket\"
+              ],
+              \"Resource\": [
+                \"arn:aws:s3:::${RESULTS_BUCKET}\",
+                \"arn:aws:s3:::${RESULTS_BUCKET}/*\"
+              ]
+            },
+            {
+              \"Sid\": \"AllowCloudWatchMetrics\",
+              \"Effect\": \"Allow\",
+              \"Action\": [
+                \"cloudwatch:DescribeAlarmsForMetric\",
+                \"cloudwatch:ListMetrics\",
+                \"cloudwatch:GetMetricData\",
+                \"cloudwatch:GetMetricStatistics\"
+              ],
+              \"Resource\": \"*\"
+            }
+          ]
+        }" \
+        --set-as-default >/dev/null 2>&1 || log_warn "Policy version update failed — may have hit 5-version limit. Check AWS console."
+    log_info "Policy updated: ${AMP_POLICY_ARN}"
 fi
 
 # ==============================================================================

@@ -109,17 +109,26 @@ def _amp_auth() -> BotoAWSRequestsAuth:
     )
 
 
+def _amp_query(url: str, params: dict) -> dict:
+    """Query AMP with SigV4 auth using POST to prevent URL query encoding signature mismatches."""
+    auth = _amp_auth()
+    try:
+        resp = requests.post(url, data=params, auth=auth, timeout=30)
+        resp.raise_for_status()
+        return resp.json()
+    except Exception:
+        import urllib.parse
+        encoded_query = urllib.parse.quote(params.get("query", ""), safe="")
+        full_url = f"{url}?query={encoded_query}"
+        resp = requests.get(full_url, auth=auth, timeout=30)
+        resp.raise_for_status()
+        return resp.json()
+
+
 def query_instant(promql: str) -> list[dict]:
     """Run an instant PromQL query against AMP. Returns result list."""
     url = f"{AMP_ENDPOINT}/api/v1/query"
-    resp = requests.get(
-        url,
-        params={"query": promql},
-        auth=_amp_auth(),
-        timeout=30,
-    )
-    resp.raise_for_status()
-    data = resp.json()
+    data = _amp_query(url, {"query": promql})
     if data.get("status") != "success":
         raise RuntimeError(f"AMP query failed: {data}")
     return data["data"]["result"]
@@ -133,14 +142,7 @@ def query_range(promql: str, duration: str = None) -> list[dict]:
     if duration is None:
         duration = f"{WINDOW_MINUTES}m"
     url = f"{AMP_ENDPOINT}/api/v1/query"
-    resp = requests.get(
-        url,
-        params={"query": f"({promql})[{duration}:]"},
-        auth=_amp_auth(),
-        timeout=30,
-    )
-    resp.raise_for_status()
-    data = resp.json()
+    data = _amp_query(url, {"query": f"({promql})[{duration}:]"})
     if data.get("status") != "success":
         raise RuntimeError(f"AMP range query failed: {data}")
     return data["data"]["result"]

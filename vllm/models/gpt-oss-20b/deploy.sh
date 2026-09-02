@@ -28,6 +28,12 @@ log_error() { echo -e "${RED}[ERROR] $(date +'%H:%M:%S')${NC} $1"; }
 DEPLOYMENT_NAME="vllm-gpt-oss-20b"
 MODEL_NAME="gpt-oss-20b"
 MODEL_FOLDER="gpt-oss-20b"
+VALIDATE="false"
+
+# Parse optional --validate flag
+for arg in "$@"; do
+    [[ "${arg}" == "--validate" ]] && VALIDATE="true"
+done
 
 echo ""
 echo "══════════════════════════════════════════════════"
@@ -96,3 +102,15 @@ echo ""
 echo "  Running models:"
 kubectl get deployment -n "${BENCHMARK_NAMESPACE}" 2>/dev/null || true
 echo "══════════════════════════════════════════════════"
+
+# ==============================================================================
+# Auto-validate if --validate flag passed
+# ==============================================================================
+if [[ "${VALIDATE}" == "true" ]]; then
+    echo ""
+    log_info "Starting post-deploy validation (--validate flag set)..."
+    bash "${SCRIPT_DIR}/../post-deploy-validate.sh" \
+        --model "${MODEL_NAME}" \
+        --manifest "configs/manifests/gpt-oss-20b-baseline.yaml" \
+        --endpoint "http://oai-infopt-vllm-gpt-oss-20b:8000"
+fi
