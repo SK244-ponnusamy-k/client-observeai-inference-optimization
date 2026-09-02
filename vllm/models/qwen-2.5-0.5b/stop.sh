@@ -49,6 +49,12 @@ kubectl delete svc "${SERVICE_NAME}" -n "${BENCHMARK_NAMESPACE}" --ignore-not-fo
 log_info "Deleting PVC: ${PVC_NAME}..."
 kubectl delete pvc "${PVC_NAME}" -n "${BENCHMARK_NAMESPACE}" --ignore-not-found=true 2>/dev/null || true
 
+# Delete GPU nodes so billing stops immediately
+log_info "Terminating GPU nodes..."
+kubectl delete node -l karpenter.sh/nodepool=gpu-inf 2>/dev/null || true
+kubectl delete node -l karpenter.sh/nodepool=gpu-nodepool 2>/dev/null || true
+log_info "GPU nodes deleted — billing stops within minutes."
+
 echo ""
 log_info "Remaining deployments in ${BENCHMARK_NAMESPACE}:"
 kubectl get deployment -n "${BENCHMARK_NAMESPACE}" 2>/dev/null || true
