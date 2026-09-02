@@ -122,9 +122,21 @@ create_or_update_role() {
 }
 
 # ==============================================================================
-# Step 1 — HF Token in Secrets Manager (NOT in shell env or k8s secret)
+# Step 1 — HF Token: read from config/.env → push to Secrets Manager
 # ==============================================================================
 log_step "Secrets Manager — HF Token"
+
+ENV_FILE="${FRAMEWORK_ROOT}/config/.env"
+
+# Load HF_TOKEN from config/.env if it exists and token not already in env
+if [[ -f "${ENV_FILE}" ]]; then
+    # Source only the HF_TOKEN line — avoid overwriting other env vars
+    HF_TOKEN_FROM_FILE=$(grep -E '^HF_TOKEN=' "${ENV_FILE}" | cut -d'=' -f2- | tr -d '"' | tr -d "'")
+    if [[ -n "${HF_TOKEN_FROM_FILE}" && "${HF_TOKEN_FROM_FILE}" != "hf_REPLACE_WITH_YOUR_TOKEN" ]]; then
+        export HF_TOKEN="${HF_TOKEN_FROM_FILE}"
+        log_info "HF token loaded from config/.env"
+    fi
+fi
 
 SECRET_EXISTS=$(aws secretsmanager describe-secret \
     --secret-id "${HF_TOKEN_SECRET_NAME}" \
@@ -132,21 +144,36 @@ SECRET_EXISTS=$(aws secretsmanager describe-secret \
     --query "ARN" --output text 2>/dev/null || echo "NOT_FOUND")
 
 if [[ "${SECRET_EXISTS}" == "NOT_FOUND" ]]; then
-    log_warn "Secret '${HF_TOKEN_SECRET_NAME}' not found in Secrets Manager."
-    log_warn "Create it now (token value is NOT stored in this script):"
-    echo ""
-    echo "  aws secretsmanager create-secret \\"
-    echo "    --name '${HF_TOKEN_SECRET_NAME}' \\"
-    echo "    --description 'HuggingFace API token for gated model download' \\"
-    echo "    --secret-string '{\"token\":\"hf_YOUR_TOKEN_HERE\"}' \\"
-    echo "    --region '${AWS_REGION}' \\"
-    echo "    --tags Key=Project,Value='${TAG_PROJECT}' Key=Environment,Value='${TAG_ENVIRONMENT}'"
-    echo ""
-    log_warn "Re-run this script after creating the secret."
-    log_warn "Continuing with role setup (secret is only needed for download jobs)."
+    # Secret does not exist — create it now from HF_TOKEN
+    if [[ -z "${HF_TOKEN:-}" || "${HF_TOKEN}" == "hf_REPLACE_WITH_YOUR_TOKEN" ]]; then
+        log_warn "HF token not set. To enable gated model download (openai/gpt-oss-20b):"
+        log_warn "  1. Get your token: https://huggingface.co/settings/tokens"
+        log_warn "  2. Set it in config/.env:  HF_TOKEN=\"hf_your_token_here\""
+        log_warn "  3. Re-run this script."
+        log_warn "Continuing without HF token — Qwen (public model) is unaffected."
+    else
+        log_info "Creating secret '${HF_TOKEN_SECRET_NAME}' in Secrets Manager..."
+        aws secretsmanager create-secret \
+            --name "${HF_TOKEN_SECRET_NAME}" \
+            --description "HuggingFace API token for gated model download (oai-infopt)" \
+            --secret-string "{\"token\":\"${HF_TOKEN}\"}" \
+            --region "${AWS_REGION}" \
+            --tags \
+                Key=Project,Value="${TAG_PROJECT}" \
+                Key=Environment,Value="${TAG_ENVIRONMENT}" \
+                Key=ManagedBy,Value="setup-pod-identity" \
+            >/dev/null
+        log_info "Secret created: ${HF_TOKEN_SECRET_NAME}"
+        # Clear from env immediately — no longer needed in memory
+        unset HF_TOKEN
+        unset HF_TOKEN_FROM_FILE
+    fi
 else
     HF_SECRET_ARN="${SECRET_EXISTS}"
-    log_info "HF token secret found: ${HF_SECRET_ARN}"
+    log_info "HF token secret already exists: ${HF_SECRET_ARN}"
+    # Clear from env if loaded — Secrets Manager is the source of truth now
+    unset HF_TOKEN 2>/dev/null || true
+    unset HF_TOKEN_FROM_FILE 2>/dev/null || true
 fi
 
 # ==============================================================================
