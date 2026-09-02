@@ -45,8 +45,8 @@ echo ""
 # ------------------------------------------------------------------------------
 # Discover all running inference deployments
 # ------------------------------------------------------------------------------
-RUNNING=$(kubectl get deployment -l component=inference-server \
-    -n "${NAMESPACE}" -o jsonpath='{.items[*].metadata.name}' 2>/dev/null || true)
+RUNNING=$(kubectl get deployment -l app.kubernetes.io/component=inference-server \
+    -n "${BENCHMARK_NAMESPACE}" -o jsonpath='{.items[*].metadata.name}' 2>/dev/null || true)
 
 if [[ -z "${RUNNING}" ]]; then
     log_warn "No vLLM deployments found — nothing to stop."
@@ -82,7 +82,7 @@ done
 # ------------------------------------------------------------------------------
 echo ""
 log_info "Remaining pods:"
-kubectl get pods -n "${NAMESPACE}" 2>/dev/null || true
+kubectl get pods -n "${BENCHMARK_NAMESPACE}" 2>/dev/null || true
 
 echo ""
 log_info "Remaining nodes (GPU nodes will terminate in ~10 min):"
