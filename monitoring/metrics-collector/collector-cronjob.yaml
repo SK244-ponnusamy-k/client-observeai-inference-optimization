@@ -1,0 +1,161 @@
+# ==============================================================================
+# monitoring/metrics-collector/collector-cronjob.yaml
+#
+# Kubernetes CronJob — runs collector.py every 30 minutes.
+# Pulls metrics from AMP and writes JSON reports to S3.
+#
+# Runtime values injected via envsubst by setup-monitoring.sh:
+#   ${AMP_ENDPOINT}        — AMP workspace prometheus endpoint
+#   ${AMP_WORKSPACE_ID}    — AMP workspace ID
+#   ${RESULTS_BUCKET}      — S3 bucket for reports
+#   ${AWS_REGION}          — AWS region
+#   ${MONITORING_NAMESPACE} — K8s namespace (monitoring)
+#   ${COLLECTOR_SA}        — ServiceAccount name (metrics-collector-sa)
+#
+# Auth: metrics-collector-sa is bound via Pod Identity to collector-role
+#       which has aps:QueryMetrics + s3:PutObject on the results bucket.
+#
+# Apply (done automatically by setup-monitoring.sh):
+#   envsubst < monitoring/metrics-collector/collector-cronjob.yaml | kubectl apply -f -
+# ==============================================================================
+
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: metrics-collector
+  namespace: ${MONITORING_NAMESPACE}
+  labels:
+    app.kubernetes.io/name: metrics-collector
+    app.kubernetes.io/component: metrics-collector
+    app.kubernetes.io/managed-by: kubectl
+    project: observeai-inference-optimization
+    environment: sandbox
+spec:
+  # Every 30 minutes
+  schedule: "*/30 * * * *"
+  concurrencyPolicy: Forbid         # skip run if previous one is still going
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 5
+  startingDeadlineSeconds: 120
+
+  jobTemplate:
+    spec:
+      backoffLimit: 1
+      activeDeadlineSeconds: 600    # 10-minute timeout per run
+
+      template:
+        metadata:
+          labels:
+            app.kubernetes.io/name: metrics-collector
+            app.kubernetes.io/component: metrics-collector
+            project: observeai-inference-optimization
+            environment: sandbox
+        spec:
+          restartPolicy: Never
+          serviceAccountName: ${COLLECTOR_SA}
+          automountServiceAccountToken: false
+
+          hostPID: false
+          hostIPC: false
+          hostNetwork: false
+
+          # Schedule on non-GPU nodes — no GPU needed for a Python script
+          tolerations: []
+
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65534          # nobody
+            runAsGroup: 65534
+            fsGroup: 65534
+            seccompProfile:
+              type: RuntimeDefault
+
+          containers:
+            - name: collector
+              # Standard Python slim image — installs deps at startup
+              # Pin to a specific digest in production for reproducibility
+              image: python:3.11-slim
+              imagePullPolicy: IfNotPresent
+
+              command: ["/bin/bash", "-c"]
+              args:
+                - |
+                  set -euo pipefail
+                  echo "Installing dependencies..."
+                  pip install --quiet --no-cache-dir \
+                    boto3==1.34.0 \
+                    aws-requests-auth==0.4.3 \
+                    requests==2.31.0
+                  echo "Running collector..."
+                  python /app/collector.py
+
+              env:
+                - name: AMP_ENDPOINT
+                  value: "${AMP_ENDPOINT}"
+                - name: AMP_WORKSPACE_ID
+                  value: "${AMP_WORKSPACE_ID}"
+                - name: AWS_REGION
+                  value: "${AWS_REGION}"
+                - name: RESULTS_BUCKET
+                  value: "${RESULTS_BUCKET}"
+                - name: CLUSTER_NAME
+                  value: "${CLUSTER_NAME}"
+                - name: WINDOW_MINUTES
+                  value: "30"
+                - name: PIP_NO_CACHE_DIR
+                  value: "1"
+
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                runAsNonRoot: true
+                runAsUser: 65534
+                runAsGroup: 65534
+                capabilities:
+                  drop: ["ALL"]
+                seccompProfile:
+                  type: RuntimeDefault
+
+              resources:
+                requests:
+                  cpu: "100m"
+                  memory: "256Mi"
+                limits:
+                  cpu: "500m"
+                  memory: "512Mi"
+
+              volumeMounts:
+                - name: app
+                  mountPath: /app
+                  readOnly: true
+                - name: tmp
+                  mountPath: /tmp
+
+          volumes:
+            # collector.py mounted from ConfigMap
+            - name: app
+              configMap:
+                name: metrics-collector-script
+                defaultMode: 0555
+            # /tmp for pip install cache
+            - name: tmp
+              emptyDir:
+                sizeLimit: 1Gi
+
+---
+# ConfigMap — embeds collector.py so no custom image is needed
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: metrics-collector-script
+  namespace: ${MONITORING_NAMESPACE}
+  labels:
+    app.kubernetes.io/name: metrics-collector
+    app.kubernetes.io/component: metrics-collector
+    project: observeai-inference-optimization
+    environment: sandbox
+binaryData: {}
+# collector.py is patched in by setup-monitoring.sh using:
+#   kubectl create configmap metrics-collector-script \
+#     --from-file=collector.py=monitoring/metrics-collector/collector.py \
+#     --namespace monitoring --dry-run=client -o yaml | kubectl apply -f -

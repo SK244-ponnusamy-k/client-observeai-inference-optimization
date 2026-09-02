@@ -63,16 +63,47 @@ for BUCKET in "${MODEL_BUCKET}" "${RESULTS_BUCKET}"; do
     if aws s3api head-bucket --bucket "${BUCKET}" 2>/dev/null; then
         log_info "Bucket exists: s3://${BUCKET}"
     else
-        log_warn "Bucket '${BUCKET}' not found — create it before running download jobs."
-        log_warn "  aws s3 mb s3://${BUCKET} --region ${AWS_REGION}"
+        if [[ "${BUCKET}" == "${RESULTS_BUCKET}" ]]; then
+            log_info "Creating results bucket: s3://${RESULTS_BUCKET} ..."
+            if [[ "${AWS_REGION}" == "us-east-1" ]]; then
+                aws s3api create-bucket --bucket "${RESULTS_BUCKET}" --region "${AWS_REGION}"
+            else
+                aws s3api create-bucket \
+                    --bucket "${RESULTS_BUCKET}" \
+                    --region "${AWS_REGION}" \
+                    --create-bucket-configuration "LocationConstraint=${AWS_REGION}"
+            fi
+            aws s3api put-public-access-block \
+                --bucket "${RESULTS_BUCKET}" \
+                --public-access-block-configuration \
+                    "BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true"
+            aws s3api put-bucket-encryption \
+                --bucket "${RESULTS_BUCKET}" \
+                --server-side-encryption-configuration \
+                    '{"Rules":[{"ApplyServerSideEncryptionByDefault":{"SSEAlgorithm":"AES256"},"BucketKeyEnabled":true}]}'
+            log_info "Results bucket created: s3://${RESULTS_BUCKET}"
+        else
+            log_warn "Bucket '${BUCKET}' not found — create it before running download jobs."
+            log_warn "  aws s3 mb s3://${BUCKET} --region ${AWS_REGION}"
+        fi
     fi
 done
 
 # ==============================================================================
 # Temp dir for policy documents
 # ==============================================================================
-TMPDIR_PATH="$(mktemp -d)"
+# Use a local subdir — avoids all /tmp and file:// path issues on Windows/MINGW64.
+TMPDIR_PATH="${FRAMEWORK_ROOT}/.tmp-pod-identity-$$"
+mkdir -p "${TMPDIR_PATH}"
 trap 'rm -rf "${TMPDIR_PATH}"' EXIT
+
+# Helper: read a JSON file and echo its contents.
+# Used to pass policy documents inline to AWS CLI (--policy-document "$(read_json ...)")
+# This avoids ALL file:// URI path issues on Windows/MINGW64/Git Bash where the
+# AWS CLI (a Windows binary) cannot resolve Unix-style or mixed paths.
+read_json() {
+    cat "$1"
+}
 
 # ==============================================================================
 # Shared Pod Identity trust policy
@@ -107,12 +138,12 @@ create_or_update_role() {
         log_warn "IAM Role '${ROLE_NAME}' already exists — updating trust policy."
         aws iam update-assume-role-policy \
             --role-name "${ROLE_NAME}" \
-            --policy-document "file://${TMPDIR_PATH}/trust.json"
+            --policy-document "$(read_json "${TMPDIR_PATH}/trust.json")"
     else
         log_info "Creating IAM Role: ${ROLE_NAME}..."
         aws iam create-role \
             --role-name "${ROLE_NAME}" \
-            --assume-role-policy-document "file://${TMPDIR_PATH}/trust.json" \
+            --assume-role-policy-document "$(read_json "${TMPDIR_PATH}/trust.json")" \
             --description "${DESCRIPTION}" \
             --tags "${COMMON_TAGS[@]}"
         log_info "Role created: ${ROLE_NAME}"
@@ -182,7 +213,7 @@ fi
 log_step "Download IAM Role: ${DOWNLOAD_IAM_ROLE_NAME}"
 
 create_or_update_role "${DOWNLOAD_IAM_ROLE_NAME}" \
-    "oai-infopt: model download — S3 write + Secrets Manager HF token read"
+    "oai-infopt: model download - S3 write + Secrets Manager HF token read"
 
 # Resolve secret ARN (may not exist yet if skipped above)
 HF_SECRET_ARN=$(aws secretsmanager describe-secret \
@@ -205,7 +236,7 @@ cat > "${TMPDIR_PATH}/download-policy.json" <<EOF
       ],
       "Resource": [
         "arn:aws:s3:::${MODEL_BUCKET}",
-        "arn:aws:s3:::${MODEL_BUCKET}/models/*"
+        "arn:aws:s3:::${MODEL_BUCKET}/*"
       ]
     },
     {
@@ -224,9 +255,9 @@ EOF
 aws iam put-role-policy \
     --role-name "${DOWNLOAD_IAM_ROLE_NAME}" \
     --policy-name "oai-infopt-download-policy" \
-    --policy-document "file://${TMPDIR_PATH}/download-policy.json"
+    --policy-document "$(read_json "${TMPDIR_PATH}/download-policy.json")"
 
-log_info "Download policy attached → s3://${MODEL_BUCKET}/models/* + Secrets Manager HF token"
+log_info "Download policy attached → s3://${MODEL_BUCKET}/* + Secrets Manager HF token"
 
 # ==============================================================================
 # Step 3 — Serving Role (S3 read-only on model prefix — no write, no delete)
@@ -234,7 +265,7 @@ log_info "Download policy attached → s3://${MODEL_BUCKET}/models/* + Secrets M
 log_step "Serving IAM Role: ${SERVING_IAM_ROLE_NAME}"
 
 create_or_update_role "${SERVING_IAM_ROLE_NAME}" \
-    "oai-infopt: vLLM serving — S3 read-only on model prefix"
+    "oai-infopt: vLLM serving - S3 read-only on model prefix"
 
 cat > "${TMPDIR_PATH}/serving-policy.json" <<EOF
 {
@@ -250,7 +281,7 @@ cat > "${TMPDIR_PATH}/serving-policy.json" <<EOF
       ],
       "Resource": [
         "arn:aws:s3:::${MODEL_BUCKET}",
-        "arn:aws:s3:::${MODEL_BUCKET}/models/*"
+        "arn:aws:s3:::${MODEL_BUCKET}/*"
       ]
     }
   ]
@@ -260,9 +291,9 @@ EOF
 aws iam put-role-policy \
     --role-name "${SERVING_IAM_ROLE_NAME}" \
     --policy-name "oai-infopt-serving-policy" \
-    --policy-document "file://${TMPDIR_PATH}/serving-policy.json"
+    --policy-document "$(read_json "${TMPDIR_PATH}/serving-policy.json")"
 
-log_info "Serving policy attached → s3://${MODEL_BUCKET}/models/* (read-only)"
+log_info "Serving policy attached → s3://${MODEL_BUCKET}/* (read-only)"
 
 # ==============================================================================
 # Step 4 — Benchmark Role (results S3 write + CloudWatch metrics)
@@ -270,7 +301,7 @@ log_info "Serving policy attached → s3://${MODEL_BUCKET}/models/* (read-only)"
 log_step "Benchmark IAM Role: ${BENCHMARK_IAM_ROLE_NAME}"
 
 create_or_update_role "${BENCHMARK_IAM_ROLE_NAME}" \
-    "oai-infopt: benchmarking — results S3 write + CloudWatch PutMetricData"
+    "oai-infopt: benchmarking - results S3 write + CloudWatch PutMetricData"
 
 cat > "${TMPDIR_PATH}/benchmark-policy.json" <<EOF
 {
@@ -310,7 +341,7 @@ EOF
 aws iam put-role-policy \
     --role-name "${BENCHMARK_IAM_ROLE_NAME}" \
     --policy-name "oai-infopt-benchmark-policy" \
-    --policy-document "file://${TMPDIR_PATH}/benchmark-policy.json"
+    --policy-document "$(read_json "${TMPDIR_PATH}/benchmark-policy.json")"
 
 log_info "Benchmark policy attached → s3://${RESULTS_BUCKET}/results/* + CloudWatch"
 
@@ -403,9 +434,9 @@ echo "════════════════════════�
 echo ""
 echo "  Roles created (least-privilege):"
 echo "    Download  : arn:aws:iam::${AWS_ACCOUNT_ID}:role/${DOWNLOAD_IAM_ROLE_NAME}"
-echo "                → s3://${MODEL_BUCKET}/models/* (rw) + Secrets Manager HF token"
+echo "                → s3://${MODEL_BUCKET}/* (rw) + Secrets Manager HF token"
 echo "    Serving   : arn:aws:iam::${AWS_ACCOUNT_ID}:role/${SERVING_IAM_ROLE_NAME}"
-echo "                → s3://${MODEL_BUCKET}/models/* (read-only)"
+echo "                → s3://${MODEL_BUCKET}/* (read-only)"
 echo "    Benchmark : arn:aws:iam::${AWS_ACCOUNT_ID}:role/${BENCHMARK_IAM_ROLE_NAME}"
 echo "                → s3://${RESULTS_BUCKET}/results/* (rw) + CloudWatch"
 echo ""

@@ -1,0 +1,238 @@
+# ==============================================================================
+# monitoring/values/kube-prometheus-values.yaml.tmpl
+#
+# Helm values template for kube-prometheus-stack.
+# Rendered by setup-monitoring.sh via envsubst — do NOT apply directly.
+#
+# Variables injected at render time:
+#   ${AMP_ENDPOINT}    — AMP workspace prometheus endpoint URL
+#   ${AWS_REGION}      — AWS region (e.g. us-east-2)
+#   ${MY_CIDR}         — Caller IP /32 for Grafana ALB inbound restriction
+#   ${CLUSTER_NAME}    — EKS cluster name
+# ==============================================================================
+
+alertmanager:
+  enabled: false
+
+prometheus-adapter:
+  enabled: false
+
+# ------------------------------------------------------------------------------
+# Prometheus — scrapes cluster + GPU metrics, remote-writes to AMP
+# ------------------------------------------------------------------------------
+prometheus:
+  serviceAccount:
+    create: false
+    name: amp-iamproxy-ingest-service-account
+
+  prometheusSpec:
+    serviceAccountName: amp-iamproxy-ingest-service-account
+    enableRemoteWriteReceiver: true
+
+    # Keep only 2h local retention — AMP is the long-term store
+    retention: 2h
+    scrapeInterval: 30s
+    evaluationInterval: 30s
+
+    # Discover all PodMonitors and ServiceMonitors in the cluster
+    # (not just those created by this chart)
+    podMonitorSelectorNilUsesHelmValues: false
+    serviceMonitorSelectorNilUsesHelmValues: false
+
+    resources:
+      requests:
+        cpu: 500m
+        memory: 1Gi
+      limits:
+        memory: 8Gi
+
+    # Remote-write to AMP — SigV4 auth via Pod Identity (no static keys)
+    remoteWrite:
+      - url: "${AMP_ENDPOINT}api/v1/remote_write"
+        sigv4:
+          region: "${AWS_REGION}"
+        queueConfig:
+          maxSamplesPerSend: 1000
+          maxShards: 200
+          capacity: 2500
+
+    # Extra scrape configs for vLLM pods in oai-infopt namespace
+    additionalScrapeConfigs:
+      - job_name: vllm-inference
+        scrape_interval: 15s
+        kubernetes_sd_configs:
+          - role: pod
+            namespaces:
+              names: ["oai-infopt"]
+        relabel_configs:
+          - source_labels: [__meta_kubernetes_pod_label_app_kubernetes_io_component]
+            action: keep
+            regex: inference-server
+          - source_labels: [__meta_kubernetes_pod_name]
+            target_label: pod
+          - source_labels: [__meta_kubernetes_namespace]
+            target_label: namespace
+          - source_labels: [__meta_kubernetes_pod_label_model]
+            target_label: model
+        metric_relabel_configs:
+          # Keep only vLLM metrics + standard go/process metrics
+          - source_labels: [__name__]
+            action: keep
+            regex: "vllm:.*|go_.*|process_.*"
+
+# ------------------------------------------------------------------------------
+# Prometheus Operator
+# ------------------------------------------------------------------------------
+prometheusOperator:
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      memory: 256Mi
+
+# ------------------------------------------------------------------------------
+# kube-state-metrics — K8s object state (pod status, resource requests, etc.)
+# ------------------------------------------------------------------------------
+kube-state-metrics:
+  resources:
+    requests:
+      cpu: 50m
+      memory: 128Mi
+    limits:
+      memory: 512Mi
+
+# ------------------------------------------------------------------------------
+# Node Exporter — host metrics on every node including GPU nodes
+# Wildcard toleration lets it schedule on nvidia.com/gpu:NoSchedule nodes
+# ------------------------------------------------------------------------------
+prometheus-node-exporter:
+  resources:
+    requests:
+      cpu: 50m
+      memory: 64Mi
+    limits:
+      memory: 128Mi
+  tolerations:
+    - operator: Exists   # runs on ALL nodes including GPU-tainted ones
+
+# ------------------------------------------------------------------------------
+# Grafana — pre-configured with AMP datasource + GPU + vLLM dashboards
+# ------------------------------------------------------------------------------
+grafana:
+  enabled: true
+
+  serviceAccount:
+    create: false
+    name: grafana-sa
+
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      memory: 1Gi
+
+  # ALB Ingress — internet-facing, HTTPS redirect, restricted to caller IP
+  ingress:
+    enabled: true
+    ingressClassName: alb
+    labels:
+      project: observeai-inference-optimization
+    annotations:
+      alb.ingress.kubernetes.io/scheme: internet-facing
+      alb.ingress.kubernetes.io/target-type: ip
+      alb.ingress.kubernetes.io/inbound-cidrs: "${MY_CIDR}"
+      alb.ingress.kubernetes.io/load-balancer-name: "grafana-${CLUSTER_NAME}"
+      alb.ingress.kubernetes.io/listen-ports: '[{"HTTP":80},{"HTTPS":443}]'
+      alb.ingress.kubernetes.io/ssl-redirect: "443"
+      alb.ingress.kubernetes.io/healthcheck-path: /api/health
+      alb.ingress.kubernetes.io/load-balancer-attributes: idle_timeout.timeout_seconds=300
+
+  grafana.ini:
+    auth.sigv4:
+      enabled: true
+    server:
+      root_url: "%(protocol)s://%(domain)s/"
+
+  # Install the Amazon Managed Prometheus datasource plugin
+  plugins:
+    - grafana-amazonprometheus-datasource
+
+  # Disable default Prometheus datasource — we use AMP instead
+  sidecar:
+    datasources:
+      defaultDatasourceEnabled: false
+
+  # AMP as the default datasource — SigV4 auth via Grafana service account
+  additionalDataSources:
+    - name: Amazon-Managed-Prometheus
+      type: grafana-amazonprometheus-datasource
+      access: proxy
+      url: "${AMP_ENDPOINT}"
+      isDefault: true
+      jsonData:
+        sigV4Auth: true
+        defaultRegion: "${AWS_REGION}"
+        sigV4Region: "${AWS_REGION}"
+      editable: true
+
+  # Dashboard providers — load from configmaps + grafana.com
+  dashboardProviders:
+    dashboardproviders.yaml:
+      apiVersion: 1
+      providers:
+        - name: gpu-monitoring
+          orgId: 1
+          folder: "GPU Monitoring"
+          type: file
+          disableDeletion: false
+          editable: true
+          options:
+            path: /var/lib/grafana/dashboards/gpu-monitoring
+        - name: vllm-monitoring
+          orgId: 1
+          folder: "vLLM Monitoring"
+          type: file
+          disableDeletion: false
+          editable: true
+          options:
+            path: /var/lib/grafana/dashboards/vllm-monitoring
+
+  # Pre-load dashboards from grafana.com + local JSON
+  dashboards:
+    gpu-monitoring:
+      # NVIDIA DCGM Exporter — GPU utilization, memory, temperature, power
+      nvidia-dcgm:
+        gnetId: 25261
+        revision: 1
+        datasource:
+          - name: DS_PROMETHEUS
+            value: Amazon-Managed-Prometheus
+
+    vllm-monitoring:
+      # vLLM — throughput, latency, queue depth
+      vllm:
+        gnetId: 25263
+        revision: 1
+        datasource:
+          - name: DS_PROMETHEUS
+            value: Amazon-Managed-Prometheus
+      # vLLM load analysis — concurrency, TTFT, ITL
+      vllm-load-analysis:
+        gnetId: 25494
+        revision: 1
+        datasource:
+          - name: DS_PROMETHEUS
+            value: Amazon-Managed-Prometheus
+
+  # Local dashboard JSON loaded via sidecar watching ConfigMaps
+  # with label grafana_dashboard=1 (applied by setup-monitoring.sh)
+  sidecar:
+    datasources:
+      defaultDatasourceEnabled: false
+    dashboards:
+      enabled: true
+      label: grafana_dashboard
+      labelValue: "1"
+      searchNamespace: monitoring

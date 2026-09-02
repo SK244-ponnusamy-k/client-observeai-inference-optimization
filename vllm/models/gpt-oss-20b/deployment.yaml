@@ -91,7 +91,7 @@ spec:
           imagePullPolicy: IfNotPresent
 
           args:
-            - "--model=s3://${MODEL_BUCKET}/models/gpt-oss-20b/"
+            - "--model=s3://${MODEL_BUCKET}/gpt-oss-20b/"
             - "--load-format=runai_streamer"
             - "--host=0.0.0.0"
             - "--port=8000"
@@ -108,6 +108,17 @@ spec:
           envFrom:
             - configMapRef:
                 name: oai-infopt-vllm-config
+
+          env:
+            # Required when running as UID 1000 without a passwd entry.
+            # Python's getpass.getuser() calls pwd.getpwuid() which fails if
+            # UID 1000 has no /etc/passwd entry in this container image.
+            - name: HOME
+              value: "/tmp"
+            - name: USER
+              value: "vllm"
+            - name: TORCHINDUCTOR_CACHE_DIR
+              value: "/tmp/torchinductor_cache"
 
           securityContext:
             allowPrivilegeEscalation: false

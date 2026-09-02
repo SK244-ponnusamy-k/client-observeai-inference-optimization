@@ -39,8 +39,8 @@ echo ""
 
 # Check model in S3
 log_info "Checking model in S3..."
-if ! aws s3 ls "s3://${MODEL_BUCKET}/models/${MODEL_FOLDER}/" --region "${AWS_REGION}" >/dev/null 2>&1; then
-    log_error "Model not found: s3://${MODEL_BUCKET}/models/${MODEL_FOLDER}/"
+if ! aws s3 ls "s3://${MODEL_BUCKET}/${MODEL_FOLDER}/" --region "${AWS_REGION}" >/dev/null 2>&1; then
+    log_error "Model not found: s3://${MODEL_BUCKET}/${MODEL_FOLDER}/"
     log_error "Download it first: bash model-download/qwen-2.5-0.5b/download.sh"
     exit 1
 fi
@@ -54,15 +54,16 @@ kubectl apply -f "${SCRIPT_DIR}/pvc.yaml"
 log_info "Applying service: vllm-qwen-0.5b..."
 kubectl apply -f "${SCRIPT_DIR}/service.yaml"
 
-# Apply deployment
+# Apply deployment — envsubst injects MODEL_BUCKET, BENCHMARK_NAMESPACE, VLLM_IMAGE
 log_info "Applying deployment: ${DEPLOYMENT_NAME}..."
-kubectl apply -f "${SCRIPT_DIR}/deployment.yaml"
+export MODEL_BUCKET BENCHMARK_NAMESPACE VLLM_IMAGE
+envsubst < "${SCRIPT_DIR}/deployment.yaml" | kubectl apply -f -
 
 # Wait for pod
 log_info "Waiting for pod (Karpenter provisioning GPU node)..."
 sleep 10
 for i in $(seq 1 24); do
-    POD=$(kubectl get pods -l app="${DEPLOYMENT_NAME}" -n "${NAMESPACE}" \
+    POD=$(kubectl get pods -l app="oai-infopt-${DEPLOYMENT_NAME}" -n "${BENCHMARK_NAMESPACE}" \
         -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)
     [[ -n "${POD}" ]] && break
     echo -n "."
@@ -73,24 +74,24 @@ log_info "Pod: ${POD:-not found yet}"
 
 # Wait for Ready
 log_info "Waiting for pod to be Ready (model loading from S3)..."
-kubectl wait "deployment/${DEPLOYMENT_NAME}" \
+kubectl wait "deployment/oai-infopt-${DEPLOYMENT_NAME}" \
     --for=condition=Available \
     --timeout=600s \
-    -n "${NAMESPACE}" || {
+    -n "${BENCHMARK_NAMESPACE}" || {
     log_warn "Deployment not ready yet — check logs:"
-    log_warn "  kubectl logs deployment/${DEPLOYMENT_NAME} 2>&1 | tail -30"
+    log_warn "  kubectl logs deployment/oai-infopt-${DEPLOYMENT_NAME} -n ${BENCHMARK_NAMESPACE} | tail -30"
 }
 
 echo ""
 echo "══════════════════════════════════════════════════"
 echo "  DEPLOYED — ${MODEL_NAME}"
 echo "══════════════════════════════════════════════════"
-kubectl get pods -l app="${DEPLOYMENT_NAME}"
+kubectl get pods -l app="oai-infopt-${DEPLOYMENT_NAME}" -n "${BENCHMARK_NAMESPACE}"
 echo ""
 echo "  Port-forward:"
-echo "    kubectl port-forward svc/vllm-qwen-0.5b 8080:8000 &"
-echo "    bash inference/quick-test.sh qwen-0.5b 8080"
+echo "    kubectl port-forward svc/oai-infopt-vllm-qwen-0.5b 8080:8000 -n ${BENCHMARK_NAMESPACE} &"
+echo "    curl http://localhost:8080/health"
 echo ""
 echo "  Running models:"
-kubectl get deployment -l component=inference-server 2>/dev/null || true
+kubectl get deployment -n "${BENCHMARK_NAMESPACE}" 2>/dev/null || true
 echo "══════════════════════════════════════════════════"

@@ -1,0 +1,14 @@
+# monitoring/metrics-collector/requirements.txt
+# Pinned dependencies for the metrics collector container
+
+# AWS SDK — S3 writes + SigV4 auth for AMP
+boto3==1.34.0
+
+# SigV4 request signing for AMP HTTP API calls
+aws-requests-auth==0.4.3
+
+# HTTP client for AMP PromQL queries
+requests==2.31.0
+
+# Type annotations backport (Python 3.9 compat)
+typing-extensions==4.9.0

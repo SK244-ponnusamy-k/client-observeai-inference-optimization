@@ -93,7 +93,7 @@ spec:
           imagePullPolicy: IfNotPresent
 
           args:
-            - "--model=s3://${MODEL_BUCKET}/models/Qwen2.5-0.5B-Instruct/"
+            - "--model=s3://${MODEL_BUCKET}/Qwen2.5-0.5B-Instruct/"
             - "--load-format=runai_streamer"
             - "--host=0.0.0.0"
             - "--port=8000"
@@ -110,6 +110,14 @@ spec:
           envFrom:
             - configMapRef:
                 name: oai-infopt-vllm-config
+
+          env:
+            - name: HOME
+              value: "/tmp"
+            - name: USER
+              value: "vllm"
+            - name: TORCHINDUCTOR_CACHE_DIR
+              value: "/tmp/torchinductor_cache"
 
           securityContext:
             allowPrivilegeEscalation: false

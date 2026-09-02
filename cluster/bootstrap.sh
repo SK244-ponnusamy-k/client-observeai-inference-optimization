@@ -279,6 +279,19 @@ log_step "Setting up Pod Identity"
 bash "${SCRIPT_DIR}/setup-pod-identity.sh"
 
 # ==============================================================================
+# Step 12 — Monitoring stack (AMP + Grafana + DCGM + metrics collector)
+# ==============================================================================
+log_step "Step 12 — Monitoring stack"
+
+if command -v helm >/dev/null 2>&1; then
+    log_info "Installing monitoring stack..."
+    bash "${FRAMEWORK_ROOT}/monitoring/setup-monitoring.sh"
+else
+    log_warn "helm not found — skipping monitoring setup."
+    log_warn "Install helm and run:  bash monitoring/setup-monitoring.sh"
+fi
+
+# ==============================================================================
 # Done
 # ==============================================================================
 echo ""
@@ -295,6 +308,10 @@ echo "  Model bucket  : s3://${MODEL_BUCKET}"
 echo "  Results bucket: s3://${RESULTS_BUCKET}"
 echo "  Namespace     : ${BENCHMARK_NAMESPACE}"
 echo ""
+echo "  Monitoring:"
+echo "    kubectl get pods -n monitoring"
+echo "    kubectl get ingress kube-prometheus-stack-grafana -n monitoring"
+echo ""
 echo "  Next steps:"
 echo "    1. Store HF token in Secrets Manager (if not done):"
 echo "       aws secretsmanager create-secret \\"
@@ -305,4 +322,8 @@ echo ""
 echo "    2. Download a model:"
 echo "       bash model-download/qwen-2.5-0.5b/download.sh"
 echo "       bash model-download/gpt-oss-20b/download.sh"
+echo ""
+echo "    3. Deploy a model:"
+echo "       bash vllm/models/qwen-2.5-0.5b/deploy.sh"
+echo "       bash vllm/models/gpt-oss-20b/deploy.sh"
 echo "══════════════════════════════════════════════════════"

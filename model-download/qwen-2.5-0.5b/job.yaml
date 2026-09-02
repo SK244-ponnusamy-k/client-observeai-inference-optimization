@@ -78,7 +78,7 @@ spec:
               LOCAL_DIR="/tmp/${MODEL_FOLDER}"
 
               echo "Model  : ${MODEL_ID}"
-              echo "Bucket : s3://${MODEL_BUCKET}/models/${MODEL_FOLDER}/"
+              echo "Bucket : s3://${MODEL_BUCKET}/${MODEL_FOLDER}/"
 
               echo "Installing dependencies..."
               pip install --quiet --no-cache-dir huggingface_hub==0.24.7 boto3==1.34.0
@@ -97,7 +97,7 @@ spec:
               echo "Files downloaded:"
               ls -lah "${LOCAL_DIR}/"
 
-              echo "Uploading to s3://${MODEL_BUCKET}/models/${MODEL_FOLDER}/ ..."
+              echo "Uploading to s3://${MODEL_BUCKET}/${MODEL_FOLDER}/ ..."
               python3 << 'PYEOF'
               import boto3
               import os
@@ -112,7 +112,7 @@ spec:
                        if f.is_file() and ".cache" not in f.parts]
               print(f"Uploading {len(files)} files...")
               for i, f in enumerate(files, 1):
-                  key = f"models/{folder}/" + str(f.relative_to(local_dir))
+                  key = f"{folder}/" + str(f.relative_to(local_dir))
                   size_mb = f.stat().st_size / 1_048_576
                   print(f"[{i}/{len(files)}] {f.name} ({size_mb:.1f} MB)")
                   s3.upload_file(str(f), bucket, key)
