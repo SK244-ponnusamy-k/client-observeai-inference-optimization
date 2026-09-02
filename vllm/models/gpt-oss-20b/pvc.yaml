@@ -1,14 +1,17 @@
-# Metadata cache PVC — stores tokenizer + config files only.
-# Model weights stream from S3 — NOT stored here.
+# Metadata cache PVC — tokenizer + config files only.
+# Model weights stream from S3 via Run:ai streamer — NOT stored here.
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
-  name: metadata-cache-gpt-oss-20b
-  namespace: default
+  name: oai-infopt-metadata-gpt-oss-20b
+  namespace: oai-infopt
   labels:
-    app: vllm
+    app.kubernetes.io/name: oai-infopt-metadata-gpt-oss-20b
+    app.kubernetes.io/component: metadata-cache
+    project: observeai-inference-optimization
+    engagement: shellkode-sow
+    environment: sandbox
     model: gpt-oss-20b
-    component: metadata-cache
 spec:
   accessModes:
     - ReadWriteOnce

@@ -1,0 +1,47 @@
+# ==============================================================================
+# configs/manifests/qwen-2.5-0.5b-baseline.yaml
+#
+# Benchmark run manifest — Qwen2.5-0.5B baseline (no quantization)
+# Per oai-infopt-standards.md: every field here drives the benchmark;
+# nothing is hardcoded in framework code.
+# ==============================================================================
+
+run_id: oai-infopt-2026-09-01-qwen-0.5b-baseline-001
+description: "Qwen2.5-0.5B-Instruct baseline — no quantization, g6e.xlarge"
+
+model:
+  hf_id: Qwen/Qwen2.5-0.5B-Instruct
+  s3_prefix: models/Qwen2.5-0.5B-Instruct/   # relative to MODEL_BUCKET
+  source: eks_gpu
+
+serving:
+  # Pin exact image tag for reproducibility — verify on ECR Public Gallery
+  image: public.ecr.aws/deep-learning-containers/vllm:0.26.0-gpu-py312-cu130-ubuntu22.04-ec2-v1.0-soci
+  nodepool: gpu-inf
+  instance_type: g6e.xlarge
+
+optimization_variants:
+  - label: baseline
+    quantization: none
+    tensor_parallel_size: 1
+    max_num_seqs: 64
+    max_num_batched_tokens: 4096
+    max_model_len: 4096
+    kv_cache_dtype: auto
+
+benchmark:
+  workload_profiles:
+    - configs/workload_profiles/realtime_v1.yaml
+    - configs/workload_profiles/batch_v1.yaml
+
+cost:
+  instance_hourly_usd: 1.08   # g6e.xlarge on-demand us-east-2 — verify before run
+
+tags:
+  Project: observeai-inference-optimization
+  Engagement: shellkode-sow
+  Environment: sandbox
+  ManagedBy: benchmark-runner
+  Owner: TBD
+  CostCenter: TBD
+  RunId: oai-infopt-2026-09-01-qwen-0.5b-baseline-001

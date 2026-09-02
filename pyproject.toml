@@ -1,0 +1,72 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.backends.legacy:build"
+
+[project]
+name = "oai-infopt"
+version = "0.1.0"
+description = "ObserveAI Inference Optimization — EKS + vLLM benchmarking framework"
+requires-python = ">=3.11"
+dependencies = [
+    "openai==1.35.14",
+    "pyyaml==6.0.1",
+    "aiohttp==3.9.5",
+    "boto3==1.34.0",
+    "pydantic==2.7.4",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest==8.2.2",
+    "pytest-asyncio==0.23.7",
+    "ruff==0.6.5",
+    "bandit[toml]==1.7.5",
+    "mypy==1.7.1",
+    "pre-commit==3.7.1",
+    "types-pyyaml==6.0.12.20240311",
+]
+
+# ------------------------------------------------------------------------------
+# Ruff — linter + formatter (replaces flake8, isort, pyupgrade)
+# ------------------------------------------------------------------------------
+[tool.ruff]
+target-version = "py311"
+line-length = 88
+
+[tool.ruff.lint]
+select = ["E", "W", "F", "I", "B", "C4", "UP", "S", "T20", "SIM"]
+ignore = ["E501", "S101"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["S101", "T20"]
+"scripts/*" = ["T20"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["oai_infopt"]
+force-single-line = true
+
+# ------------------------------------------------------------------------------
+# Bandit — Python security scan (medium severity and above)
+# ------------------------------------------------------------------------------
+[tool.bandit]
+exclude_dirs = ["tests", "venv", ".venv", "notebooks"]
+skips = ["B101"]   # assert statements OK in tests
+
+# ------------------------------------------------------------------------------
+# mypy — strict static typing
+# ------------------------------------------------------------------------------
+[tool.mypy]
+python_version = "3.11"
+strict = true
+ignore_missing_imports = true
+warn_return_any = true
+warn_unused_configs = true
+
+# ------------------------------------------------------------------------------
+# pytest
+# ------------------------------------------------------------------------------
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+log_cli = true
+log_cli_level = "INFO"

@@ -1,60 +1,75 @@
 # ==============================================================================
 # vllm/service/service-ingress.yaml
 #
-# Production HTTPS Ingress via AWS ALB.
+# HTTPS ALB Ingress for controlled external access to vLLM.
+# Replaces the prohibited public NLB (see service-public.yaml).
 #
 # Prerequisites:
-#   1. AWS Load Balancer Controller installed
-#   2. ACM certificate created for your domain
+#   1. AWS Load Balancer Controller installed in the cluster
+#   2. ACM certificate issued for your domain
 #   3. service-private.yaml applied (Ingress routes to ClusterIP)
 #
-# Edit before applying:
+# Security posture:
+#   - HTTPS only; HTTP redirected to HTTPS (ssl-redirect: "443")
+#   - internet-facing scheme — restrict source IPs via security group or
+#     add API Gateway + Cognito authorizer in front for token-based auth
+#   - WAF attachment recommended for production (add wafv2-arn annotation)
+#
+# REQUIRED — update before applying:
 #   - certificate-arn  → your ACM cert ARN
-#   - host             → your domain e.g. api.yourdomain.com
+#   - host             → your domain (e.g. api-sandbox.observe.ai)
+#   - allowed-cidrs    → restrict to your office/VPN CIDR
 #
 # Apply:
 #   kubectl apply -f vllm/service/service-ingress.yaml
-#   kubectl get ingress vllm-ingress   # get ALB DNS name
+#   kubectl get ingress -n oai-infopt oai-infopt-vllm-ingress
 # ==============================================================================
 
 apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
-  name: vllm-ingress
-  namespace: default
+  name: oai-infopt-vllm-ingress
+  namespace: oai-infopt
   labels:
-    app: vllm
-    component: ingress
+    app.kubernetes.io/name: oai-infopt-vllm-ingress
+    app.kubernetes.io/component: ingress
+    project: observeai-inference-optimization
+    engagement: shellkode-sow
+    environment: sandbox
   annotations:
     kubernetes.io/ingress.class: alb
     alb.ingress.kubernetes.io/scheme: internet-facing
     alb.ingress.kubernetes.io/target-type: ip
-    # ── REPLACE WITH YOUR ACM CERTIFICATE ARN ─────────────────
-    alb.ingress.kubernetes.io/certificate-arn: arn:aws:acm:us-east-2:ACCOUNT_ID:certificate/YOUR-CERT-ID
-    # ──────────────────────────────────────────────────────────
+    # ── REQUIRED: replace with your ACM certificate ARN ────────────────────
+    alb.ingress.kubernetes.io/certificate-arn: "arn:aws:acm:REGION:ACCOUNT_ID:certificate/CERT-ID"
+    # ────────────────────────────────────────────────────────────────────────
     alb.ingress.kubernetes.io/listen-ports: '[{"HTTP":80},{"HTTPS":443}]'
     alb.ingress.kubernetes.io/ssl-redirect: "443"
     alb.ingress.kubernetes.io/healthcheck-path: /health
     alb.ingress.kubernetes.io/healthcheck-interval-seconds: "30"
     alb.ingress.kubernetes.io/load-balancer-attributes: idle_timeout.timeout_seconds=300
+    # ── Restrict source IPs to office/VPN CIDR — REQUIRED before go-live ───
+    # alb.ingress.kubernetes.io/inbound-cidrs: "10.0.0.0/8,YOUR_OFFICE_CIDR"
+    # ── Attach AWS WAF WebACL (recommended) ────────────────────────────────
+    # alb.ingress.kubernetes.io/wafv2-acl-arn: "arn:aws:wafv2:..."
 spec:
   rules:
-    # ── REPLACE WITH YOUR DOMAIN ──────────────────────────────
-    - host: api.yourdomain.com
-    # ──────────────────────────────────────────────────────────
+    # ── REQUIRED: replace with your domain ────────────────────────────────
+    - host: "api-sandbox.REPLACE-WITH-YOUR-DOMAIN.com"
+    # ───────────────────────────────────────────────────────────────────────
       http:
         paths:
           - path: /v1
             pathType: Prefix
             backend:
               service:
-                name: vllm-inference
+                name: oai-infopt-vllm-inference
                 port:
                   number: 8000
           - path: /health
             pathType: Exact
             backend:
               service:
-                name: vllm-inference
+                name: oai-infopt-vllm-inference
                 port:
                   number: 8000

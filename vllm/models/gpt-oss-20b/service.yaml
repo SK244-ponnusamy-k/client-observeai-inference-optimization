@@ -1,15 +1,21 @@
 apiVersion: v1
 kind: Service
 metadata:
-  name: vllm-gpt-oss-20b
-  namespace: default
+  name: oai-infopt-vllm-gpt-oss-20b
+  namespace: oai-infopt
   labels:
-    app: vllm-gpt-oss-20b
+    app.kubernetes.io/name: oai-infopt-vllm-gpt-oss-20b
+    app.kubernetes.io/component: inference-server
+    project: observeai-inference-optimization
+    engagement: shellkode-sow
+    environment: sandbox
     model: gpt-oss-20b
 spec:
+  # ClusterIP only — internal cluster access via benchmark runner or port-forward.
+  # No public LoadBalancer. Use ALB Ingress with auth for external access.
   type: ClusterIP
   selector:
-    app: vllm-gpt-oss-20b
+    app: oai-infopt-vllm-gpt-oss-20b
   ports:
     - name: http
       port: 8000

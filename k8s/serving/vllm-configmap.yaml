@@ -1,0 +1,43 @@
+# ==============================================================================
+# k8s/serving/vllm-configmap.yaml
+#
+# Non-secret runtime configuration for vLLM deployments.
+# Injected as env vars into every vLLM pod — no hardcoded values in
+# deployment.yaml files.
+#
+# Values that ARE secrets (HF token) stay in Secrets Manager via ESO.
+# Values that change per run (model S3 path, optimization flags) come from
+# the benchmark manifest and are passed as vllm serve args in deployment.yaml.
+#
+# Apply:
+#   kubectl apply -f k8s/serving/vllm-configmap.yaml
+# ==============================================================================
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: oai-infopt-vllm-config
+  namespace: oai-infopt
+  labels:
+    app.kubernetes.io/name: oai-infopt-vllm-config
+    app.kubernetes.io/component: vllm-config
+    app.kubernetes.io/managed-by: kubectl
+    project: observeai-inference-optimization
+    engagement: shellkode-sow
+    environment: sandbox
+data:
+  # AWS region for Run:ai model streamer S3 access
+  AWS_DEFAULT_REGION: "us-east-2"    # updated by bootstrap / overridden at deploy time
+
+  # vLLM serving defaults (overridden per-deployment via args)
+  VLLM_PORT: "8000"
+  VLLM_HOST: "0.0.0.0"
+  GPU_MEMORY_UTILIZATION: "0.90"
+
+  # Logging
+  VLLM_LOGGING_LEVEL: "INFO"
+  VLLM_STRUCTURED_LOG: "1"
+
+  # Disable HF telemetry inside serving container
+  HF_HUB_DISABLE_TELEMETRY: "1"
+  TRANSFORMERS_VERBOSITY: "error"

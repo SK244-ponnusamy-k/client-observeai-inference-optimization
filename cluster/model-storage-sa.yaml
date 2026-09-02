@@ -1,8 +1,67 @@
+# ==============================================================================
+# cluster/model-storage-sa.yaml
+#
+# ServiceAccounts for vLLM inference framework workloads.
+# Three separate SAs with least-privilege Pod Identity bindings:
+#
+#   oai-infopt-download-sa   → download IAM role (S3 write + Secrets Manager read)
+#   oai-infopt-serving-sa    → serving IAM role  (S3 read-only)
+#   oai-infopt-benchmark-sa  → benchmark IAM role (results S3 write)
+#
+# Security:
+#   - automountServiceAccountToken: false on all SAs (Checkov CKV_K8S_43)
+#     Pods that need API server access set it explicitly in their pod spec.
+#   - Namespace: oai-infopt (not default) for blast-radius isolation.
+#
+# Apply:
+#   kubectl apply -f cluster/model-storage-sa.yaml
+# ==============================================================================
+
+---
 apiVersion: v1
 kind: ServiceAccount
 metadata:
-  name: model-storage-sa
-  namespace: default
+  name: oai-infopt-download-sa
+  namespace: oai-infopt
   labels:
-    app: vllm
-    component: storage-access
+    app.kubernetes.io/name: oai-infopt-download-sa
+    app.kubernetes.io/component: service-account
+    app.kubernetes.io/managed-by: kubectl
+    project: observeai-inference-optimization
+    engagement: shellkode-sow
+    environment: sandbox
+    workload: model-download
+# No token auto-mount — Pod Identity injects credentials via webhook, not SA token
+automountServiceAccountToken: false
+
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: oai-infopt-serving-sa
+  namespace: oai-infopt
+  labels:
+    app.kubernetes.io/name: oai-infopt-serving-sa
+    app.kubernetes.io/component: service-account
+    app.kubernetes.io/managed-by: kubectl
+    project: observeai-inference-optimization
+    engagement: shellkode-sow
+    environment: sandbox
+    workload: gpu-inference
+automountServiceAccountToken: false
+
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: oai-infopt-benchmark-sa
+  namespace: oai-infopt
+  labels:
+    app.kubernetes.io/name: oai-infopt-benchmark-sa
+    app.kubernetes.io/component: service-account
+    app.kubernetes.io/managed-by: kubectl
+    project: observeai-inference-optimization
+    engagement: shellkode-sow
+    environment: sandbox
+    workload: benchmarking
+automountServiceAccountToken: false

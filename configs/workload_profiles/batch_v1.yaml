@@ -1,0 +1,52 @@
+# ==============================================================================
+# configs/workload_profiles/batch_v1.yaml
+#
+# Frozen workload profile — BATCH
+# Profile version: v1  |  Status: FROZEN (do not modify; create v2 if changes needed)
+#
+# Purpose: Throughput-bound benchmark simulating bulk QA form processing.
+#          High concurrency, measures completed interactions/min and tokens/s.
+#
+# Per ml-pipeline-standards.md: freeze this profile BEFORE benchmarking.
+# Metrics are only comparable across models when the profile is fixed.
+# ==============================================================================
+
+profile_id: batch_v1
+profile_type: batch
+description: >
+  High-concurrency throughput-bound profile for bulk QA form processing.
+  Simulates a queue of conversations processed concurrently.
+  Measures throughput_tokens_s, completed_interactions_min, KV-cache utilization.
+
+# -- Input distribution -------------------------------------------------------
+input:
+  dataset: configs/workload_profiles/datasets/qa_prompts_v1.jsonl
+  token_distribution:
+    p50_tokens: 512
+    p95_tokens: 1024
+    max_tokens: 2048
+  guided_decoding: true
+  output_schema: configs/workload_profiles/schemas/qa_form_v1.json
+
+# -- Output target ------------------------------------------------------------
+output:
+  max_new_tokens: 512
+  temperature: 0.0
+  seed: 42
+
+# -- Concurrency --------------------------------------------------------------
+concurrency_levels: [16, 32, 64, 128]
+warmup_requests: 20
+measurement_requests: 500    # larger sample for throughput stability
+duration_s: 300
+
+# -- Throughput SLO -----------------------------------------------------------
+slo:
+  throughput_tokens_s_min: 500    # minimum acceptable tokens/s
+  completed_interactions_min: 20  # minimum QA forms completed per minute
+  error_rate_pct: 2.0
+
+# -- Runner -------------------------------------------------------------------
+runner: vllm_openai
+endpoint_path: /v1/chat/completions
+stream: true

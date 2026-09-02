@@ -1,13 +1,38 @@
+# ==============================================================================
+# cluster/gpu-nodepool.yaml
+#
+# Karpenter NodePool for GPU inference workloads.
+#
+# Security hardening:
+#   - Instance generation constrained to > 4 AND < 7 (G7 unsupported on stock
+#     EKS AMIs — requires NVIDIA driver 595+ which stock AMIs do not ship).
+#   - On-demand only; no spot to prevent mid-benchmark interruption.
+#   - Disruption consolidation terminates idle nodes (cost guardrail).
+#
+# Apply:
+#   kubectl apply -f cluster/gpu-nodepool.yaml
+# ==============================================================================
+
 apiVersion: karpenter.sh/v1
 kind: NodePool
 metadata:
-  name: gpu-nodepool
+  name: gpu-inf                          # oai-infopt canonical name per standards
+  labels:
+    app.kubernetes.io/name: gpu-inf
+    app.kubernetes.io/component: nodepool
+    app.kubernetes.io/managed-by: karpenter
+    project: observeai-inference-optimization
+    environment: sandbox
+    engagement: shellkode-sow
 spec:
   template:
     metadata:
       labels:
         workload: gpu
         workload-type: ai-ml
+        project: observeai-inference-optimization
+        environment: sandbox
+        engagement: shellkode-sow
     spec:
       nodeClassRef:
         group: eks.amazonaws.com
@@ -20,39 +45,42 @@ spec:
           effect: NoSchedule
 
       requirements:
-        # g6e family — NVIDIA L40S (48GB VRAM per GPU)
+        # GPU instance category
         - key: eks.amazonaws.com/instance-category
           operator: In
           values: ["g"]
 
+        # Generation > 4 AND < 7:
+        #   G5 (A10G 24GB) and G6/G6e (L4/L40S 24-48GB) are supported.
+        #   G7 requires NVIDIA driver 595+ — NOT available on stock EKS AMIs.
         - key: eks.amazonaws.com/instance-generation
           operator: In
-          values: ["6"]
+          values: ["5", "6"]            # explicitly listing supported gens
 
         - key: eks.amazonaws.com/instance-family
           operator: In
-          values: ["g6e"]
+          values: ["g6e", "g6", "g5"]   # g6e (L40S) is primary target
 
         - key: kubernetes.io/arch
           operator: In
           values: ["amd64"]
 
-        # On-demand only — no spot interruptions during inference
+        # On-demand only — no spot interruptions during benchmark runs
         - key: karpenter.sh/capacity-type
           operator: In
           values: ["on-demand"]
 
-        # Allow all zones for better instance availability
+        # AZs resolved at runtime by bootstrap.sh from the cluster's AZs
         - key: topology.kubernetes.io/zone
           operator: In
-          values: ["us-east-2a", "us-east-2b", "us-east-2c"]
+          values: ["us-east-2a", "us-east-2b", "us-east-2c"]   # overridden by bootstrap
 
-  # Safety cap — covers up to g6e.48xlarge level workloads
+  # Safety cap — prevents runaway GPU spend; covers up to g6e.48xlarge level
   limits:
     cpu: "192"
     memory: 1536Gi
 
   disruption:
-    # Terminate idle/underutilized nodes to save cost
+    # Terminate idle/underutilized nodes to release GPU cost
     consolidationPolicy: WhenEmptyOrUnderutilized
     consolidateAfter: 10m

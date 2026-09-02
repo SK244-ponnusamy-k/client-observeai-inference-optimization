@@ -1,96 +1,162 @@
+# ==============================================================================
+# model-download/gpt-oss-20b/job.yaml
+#
+# Kubernetes Job: downloads openai/gpt-oss-20b from HuggingFace → S3.
+# Gated model — HF token required. Token is pulled from Secrets Manager
+# via ExternalSecret (k8s/download/hf-token-external-secret.yaml).
+#
+# Runtime values injected via envsubst by download.sh:
+#   ${MODEL_BUCKET}  ${AWS_REGION}  ${DOWNLOAD_SERVICE_ACCOUNT}  ${BENCHMARK_NAMESPACE}
+#
+# Security hardening (Checkov CKV_K8S_*):
+#   - Non-root user (UID 65534 / nobody)            [CKV_K8S_6,  CKV_K8S_40]
+#   - readOnlyRootFilesystem: true                  [CKV_K8S_22]
+#   - allowPrivilegeEscalation: false               [CKV_K8S_20]
+#   - Capabilities: drop ALL, add none              [CKV_K8S_25, CKV_K8S_28]
+#   - automountServiceAccountToken: false           [CKV_K8S_43]
+#   - CPU + memory requests and limits set          [CKV_K8S_10, CKV_K8S_11]
+#   - No hostPath, hostPID, hostIPC, hostNetwork    [CKV_K8S_14-19]
+#   - HF_TOKEN sourced from k8s Secret (ESO-synced from Secrets Manager)
+#   - /tmp writable emptyDir (pip + HF cache + ~13 GB model staging)
+# ==============================================================================
+
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: download-gpt-oss-20b
-  namespace: ${NAMESPACE}
+  name: oai-infopt-download-gpt-oss-20b
+  namespace: ${BENCHMARK_NAMESPACE}
   labels:
-    app: model-download
+    app.kubernetes.io/name: oai-infopt-download-gpt-oss-20b
+    app.kubernetes.io/component: model-download
+    app.kubernetes.io/managed-by: kubectl
+    project: observeai-inference-optimization
+    engagement: shellkode-sow
+    environment: sandbox
     model: gpt-oss-20b
-    component: data-prep
 spec:
   backoffLimit: 2
-  activeDeadlineSeconds: 86400     # 24 hours — model is ~13GB
+  activeDeadlineSeconds: 86400     # 24 h — model is ~13 GB
   ttlSecondsAfterFinished: 3600
 
   template:
     metadata:
       labels:
-        app: model-download
-        job-name: download-gpt-oss-20b
+        app.kubernetes.io/name: oai-infopt-download-gpt-oss-20b
+        app.kubernetes.io/component: model-download
+        project: observeai-inference-optimization
+        engagement: shellkode-sow
+        environment: sandbox
         model: gpt-oss-20b
     spec:
       restartPolicy: Never
-      serviceAccountName: ${SERVICE_ACCOUNT}
+      serviceAccountName: ${DOWNLOAD_SERVICE_ACCOUNT}
+      automountServiceAccountToken: false
+
+      hostPID: false
+      hostIPC: false
+      hostNetwork: false
+
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65534       # nobody
+        runAsGroup: 65534
+        fsGroup: 65534
+        seccompProfile:
+          type: RuntimeDefault
 
       containers:
         - name: downloader
           image: python:3.11-slim
+          imagePullPolicy: IfNotPresent
 
           command: ["/bin/bash", "-c"]
           args:
             - |
-              set -e
+              set -euo pipefail
 
               MODEL_ID="openai/gpt-oss-20b"
               MODEL_FOLDER="gpt-oss-20b"
-              MODEL_BUCKET="${MODEL_BUCKET}"
               LOCAL_DIR="/tmp/${MODEL_FOLDER}"
 
-              echo "================================================"
-              echo " Model  : ${MODEL_ID}"
-              echo " Bucket : s3://${MODEL_BUCKET}/${MODEL_FOLDER}/"
-              echo " Size   : ~13 GB (MXFP4 quantized)"
-              echo "================================================"
+              echo "Model  : ${MODEL_ID}"
+              echo "Bucket : s3://${MODEL_BUCKET}/models/${MODEL_FOLDER}/"
+              echo "Token  : sourced from Secrets Manager via ESO"
 
               echo "Installing dependencies..."
-              pip install -q huggingface_hub boto3 requests
+              pip install --quiet --no-cache-dir huggingface_hub==0.24.7 boto3==1.34.0
 
-              echo "Downloading from HuggingFace..."
+              echo "Downloading from HuggingFace (gated model — token required)..."
               python3 -c "
-              from huggingface_hub import snapshot_download
               import os
+              from huggingface_hub import snapshot_download
+              token = os.environ.get('HF_TOKEN')
+              if not token:
+                  raise RuntimeError('HF_TOKEN not set — check ExternalSecret sync status')
               snapshot_download(
                   repo_id='${MODEL_ID}',
                   local_dir='${LOCAL_DIR}',
-                  ignore_patterns=['*.msgpack','*.h5','flax_*','tf_*','rust_*']
+                  token=token,
+                  ignore_patterns=['*.msgpack','*.h5','flax_*','tf_*','rust_*'],
               )
-              print('Download complete.')
+              print('HF download complete.')
               "
 
               echo "Files downloaded:"
               ls -lah "${LOCAL_DIR}/"
 
-              echo "Uploading to s3://${MODEL_BUCKET}/${MODEL_FOLDER}/ ..."
-              python3 << PYEOF
+              echo "Uploading to s3://${MODEL_BUCKET}/models/${MODEL_FOLDER}/ ..."
+              python3 << 'PYEOF'
               import boto3
+              import os
               from pathlib import Path
 
-              s3 = boto3.client('s3')
-              bucket = "${MODEL_BUCKET}"
-              folder = "${MODEL_FOLDER}"
-              local_dir = Path("${LOCAL_DIR}")
+              s3 = boto3.client("s3", region_name=os.environ["AWS_DEFAULT_REGION"])
+              bucket = os.environ["MODEL_BUCKET"]
+              folder = "gpt-oss-20b"
+              local_dir = Path(f"/tmp/{folder}")
 
-              files = [f for f in local_dir.rglob("*") if f.is_file() and '.cache' not in f.parts]
+              files = [f for f in local_dir.rglob("*")
+                       if f.is_file() and ".cache" not in f.parts]
+              print(f"Uploading {len(files)} files...")
               for i, f in enumerate(files, 1):
-                  key = f"{folder}/" + str(f.relative_to(local_dir))
-                  size = f.stat().st_size / 1024 / 1024
-                  print(f"[{i}/{len(files)}] {f.name} ({size:.1f} MB)")
+                  key = f"models/{folder}/" + str(f.relative_to(local_dir))
+                  size_mb = f.stat().st_size / 1_048_576
+                  print(f"[{i}/{len(files)}] {f.name} ({size_mb:.1f} MB)")
                   s3.upload_file(str(f), bucket, key)
-
               print("Upload complete.")
               PYEOF
 
           env:
             - name: AWS_DEFAULT_REGION
               value: "${AWS_REGION}"
-
-            # HuggingFace token — required for gated model access
-            # Create secret: kubectl create secret generic hf-token --from-literal=token=hf_YOURTOKEN
+            - name: MODEL_BUCKET
+              value: "${MODEL_BUCKET}"
+            - name: HF_HUB_DISABLE_TELEMETRY
+              value: "1"
+            - name: TRANSFORMERS_CACHE
+              value: "/tmp/hf-cache"
+            - name: HF_HOME
+              value: "/tmp/hf-home"
+            - name: PIP_NO_CACHE_DIR
+              value: "1"
+            # HF token from Secrets Manager via External Secrets Operator.
+            # Apply k8s/download/hf-token-external-secret.yaml first.
             - name: HF_TOKEN
               valueFrom:
                 secretKeyRef:
-                  name: hf-token
+                  name: hf-token      # synced by ExternalSecret from Secrets Manager
                   key: token
+
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            runAsUser: 65534
+            runAsGroup: 65534
+            capabilities:
+              drop: ["ALL"]
+            seccompProfile:
+              type: RuntimeDefault
 
           resources:
             requests:
@@ -99,3 +165,13 @@ spec:
             limits:
               cpu: "8"
               memory: "32Gi"
+
+          volumeMounts:
+            - name: tmp-workspace
+              mountPath: /tmp
+
+      volumes:
+        # /tmp for pip, HF cache, and ~13 GB model staging before S3 upload
+        - name: tmp-workspace
+          emptyDir:
+            sizeLimit: 30Gi

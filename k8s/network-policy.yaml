@@ -1,0 +1,181 @@
+# ==============================================================================
+# k8s/network-policy.yaml
+#
+# NetworkPolicies for the oai-infopt namespace.
+# Default-deny all ingress/egress then explicitly allow only what is needed.
+#
+# Policies:
+#   1. default-deny-all        — deny everything by default (Checkov CKV_K8S_7)
+#   2. allow-vllm-from-benchmark — benchmark runner → vLLM on port 8000
+#   3. allow-vllm-egress-s3    — vLLM pods → S3 (via Gateway Endpoint, port 443)
+#   4. allow-benchmark-egress  — benchmark → vLLM (port 8000) + DNS (53)
+#   5. allow-dns               — all pods → kube-dns on port 53
+#   6. allow-metrics-scrape    — Prometheus scraper → vLLM /metrics (port 8000)
+#
+# Apply:
+#   kubectl apply -f k8s/network-policy.yaml -n oai-infopt
+# ==============================================================================
+
+---
+# 1. Default deny all ingress and egress for every pod in the namespace
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-all
+  namespace: oai-infopt
+  labels:
+    app.kubernetes.io/name: default-deny-all
+    app.kubernetes.io/component: network-policy
+    project: observeai-inference-optimization
+spec:
+  podSelector: {}   # applies to ALL pods in namespace
+  policyTypes:
+    - Ingress
+    - Egress
+
+---
+# 2. Allow benchmark runner to reach vLLM inference pods on port 8000
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-vllm-from-benchmark
+  namespace: oai-infopt
+  labels:
+    app.kubernetes.io/component: network-policy
+    project: observeai-inference-optimization
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/component: inference-server
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: benchmark-runner
+      ports:
+        - protocol: TCP
+          port: 8000
+
+---
+# 3. Allow vLLM pods outbound to S3 (HTTPS 443) via the S3 Gateway Endpoint
+#    and to ECR for image pulls (443). No open internet egress.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-vllm-egress
+  namespace: oai-infopt
+  labels:
+    app.kubernetes.io/component: network-policy
+    project: observeai-inference-optimization
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/component: inference-server
+  policyTypes:
+    - Egress
+  egress:
+    # S3 Gateway Endpoint + ECR + Secrets Manager (all via HTTPS)
+    - ports:
+        - protocol: TCP
+          port: 443
+    # DNS
+    - ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+
+---
+# 4. Allow benchmark runner outbound to vLLM port 8000 + DNS
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-benchmark-egress
+  namespace: oai-infopt
+  labels:
+    app.kubernetes.io/component: network-policy
+    project: observeai-inference-optimization
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/component: benchmark-runner
+  policyTypes:
+    - Egress
+  egress:
+    # vLLM inference endpoint
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: inference-server
+      ports:
+        - protocol: TCP
+          port: 8000
+    # S3 (results upload) + Secrets Manager
+    - ports:
+        - protocol: TCP
+          port: 443
+    # DNS
+    - ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+
+---
+# 5. Allow all pods outbound DNS (kube-dns in kube-system)
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-dns-egress
+  namespace: oai-infopt
+  labels:
+    app.kubernetes.io/component: network-policy
+    project: observeai-inference-optimization
+spec:
+  podSelector: {}
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+
+---
+# 6. Allow Prometheus (kube-prometheus-stack) to scrape vLLM /metrics
+#    Prometheus runs in the monitoring namespace — adjust namespace label if different.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-prometheus-scrape
+  namespace: oai-infopt
+  labels:
+    app.kubernetes.io/component: network-policy
+    project: observeai-inference-optimization
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/component: inference-server
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: monitoring
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: prometheus
+      ports:
+        - protocol: TCP
+          port: 8000

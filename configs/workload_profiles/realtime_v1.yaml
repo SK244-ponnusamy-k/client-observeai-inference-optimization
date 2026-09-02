@@ -1,0 +1,54 @@
+# ==============================================================================
+# configs/workload_profiles/realtime_v1.yaml
+#
+# Frozen workload profile — REALTIME
+# Profile version: v1  |  Status: FROZEN (do not modify; create v2 if changes needed)
+#
+# Purpose: Latency-bound benchmark simulating interactive QA / real-time
+#          inference on conversation transcripts. Low concurrency, tight TTFT SLO.
+#
+# Per ml-pipeline-standards.md: freeze this profile BEFORE benchmarking.
+# Metrics are only comparable across models when the profile is fixed.
+# ==============================================================================
+
+profile_id: realtime_v1
+profile_type: realtime
+description: >
+  Low-concurrency latency-bound profile for real-time QA form completion.
+  Simulates a single agent processing one conversation at a time.
+  Measures TTFT, inter-token latency (ITL), P50/P95/P99.
+
+# -- Input distribution (transcript segments) ---------------------------------
+input:
+  dataset: configs/workload_profiles/datasets/qa_prompts_v1.jsonl
+  # Token distribution derived from ObserveAI QA form transcript analysis
+  token_distribution:
+    p50_tokens: 512
+    p95_tokens: 1024
+    max_tokens: 2048
+  # Structured / guided decoding (JSON schema output)
+  guided_decoding: true
+  output_schema: configs/workload_profiles/schemas/qa_form_v1.json
+
+# -- Output target ------------------------------------------------------------
+output:
+  max_new_tokens: 512        # QA form field count × avg field length
+  temperature: 0.0           # deterministic for reproducibility
+  seed: 42
+
+# -- Concurrency --------------------------------------------------------------
+concurrency_levels: [1, 2, 4]
+warmup_requests: 10          # discard before measurement
+measurement_requests: 100    # steady-state sample size per concurrency level
+duration_s: 300              # wall-clock cap per level
+
+# -- Latency SLO (pass/fail threshold) ----------------------------------------
+slo:
+  ttft_p95_ms: 500           # 500 ms TTFT p95 target
+  itl_p95_ms: 50             # 50 ms inter-token latency p95
+  error_rate_pct: 1.0        # max 1% errors
+
+# -- Runner -------------------------------------------------------------------
+runner: vllm_openai          # uses OpenAI-compatible /v1/chat/completions
+endpoint_path: /v1/chat/completions
+stream: true                 # streaming required for accurate TTFT measurement

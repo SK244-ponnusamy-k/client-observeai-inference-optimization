@@ -39,8 +39,8 @@ echo ""
 
 # Check model in S3
 log_info "Checking model in S3..."
-if ! aws s3 ls "s3://${MODEL_BUCKET}/${MODEL_FOLDER}/" --region "${AWS_REGION}" >/dev/null 2>&1; then
-    log_error "Model not found: s3://${MODEL_BUCKET}/${MODEL_FOLDER}/"
+if ! aws s3 ls "s3://${MODEL_BUCKET}/models/${MODEL_FOLDER}/" --region "${AWS_REGION}" >/dev/null 2>&1; then
+    log_error "Model not found: s3://${MODEL_BUCKET}/models/${MODEL_FOLDER}/"
     log_error "Download it first: bash model-download/qwen-2.5-0.5b/download.sh"
     exit 1
 fi

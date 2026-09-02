@@ -2,50 +2,96 @@
 # vllm/models/gpt-oss-20b/deployment.yaml
 #
 # Model     : openai/gpt-oss-20b
-# S3 path   : s3://shellkode-ai-models/gpt-oss-20b/
-# Size      : ~13 GB (MXFP4 quantized) | VRAM: ~16 GB
-# GPU       : g6e.2xlarge (32GB RAM) — auto-provisioned by Karpenter
+# S3 path   : s3://<MODEL_BUCKET>/models/gpt-oss-20b/
+#             (MODEL_BUCKET resolved at runtime — not hardcoded here)
+# Size      : ~13 GB (MXFP4) | VRAM: ~16 GB
+# GPU       : g6e.2xlarge (1x L40S 48 GB) — auto-provisioned by Karpenter
 # Notes     : MoE — 21B total params, 3.6B active per token
-#             Chain-of-thought reasoning via harmony format
 #
-# Deployment name: vllm-gpt-oss-20b  (unique — can run alongside other models)
-# Service name   : vllm-gpt-oss-20b
-# Port-forward   : kubectl port-forward svc/vllm-gpt-oss-20b 8081:8000 &
+# Runtime values injected via envsubst by deploy.sh:
+#   ${MODEL_BUCKET}  ${BENCHMARK_NAMESPACE}  ${VLLM_IMAGE}
+#
+# Security hardening (Checkov CKV_K8S_*):
+#   - Non-root user (UID 1000)                      [CKV_K8S_6,  CKV_K8S_40]
+#   - readOnlyRootFilesystem: true                  [CKV_K8S_22]
+#   - allowPrivilegeEscalation: false               [CKV_K8S_20]
+#   - Capabilities: drop ALL                        [CKV_K8S_25, CKV_K8S_28]
+#   - automountServiceAccountToken: false           [CKV_K8S_43]
+#   - No hostPath, hostPID, hostIPC, hostNetwork    [CKV_K8S_14-19]
+#   - CPU + memory requests and limits set          [CKV_K8S_10, CKV_K8S_11]
+#   - Liveness/readiness probes defined             [CKV_K8S_8,  CKV_K8S_9]
+#   - Config from ConfigMap, no hardcoded env vals  [CKV_K8S_35]
 # ==============================================================================
 
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: vllm-gpt-oss-20b
-  namespace: default
+  name: oai-infopt-vllm-gpt-oss-20b
+  namespace: ${BENCHMARK_NAMESPACE}
   labels:
-    app: vllm-gpt-oss-20b
+    app.kubernetes.io/name: oai-infopt-vllm-gpt-oss-20b
+    app.kubernetes.io/component: inference-server
+    app.kubernetes.io/managed-by: kubectl
+    app.kubernetes.io/version: "gpt-oss-20b"
+    project: observeai-inference-optimization
+    engagement: shellkode-sow
+    environment: sandbox
     model: gpt-oss-20b
-    component: inference-server
 spec:
   replicas: 1
   selector:
     matchLabels:
-      app: vllm-gpt-oss-20b
+      app: oai-infopt-vllm-gpt-oss-20b
   template:
     metadata:
       labels:
-        app: vllm-gpt-oss-20b
+        app: oai-infopt-vllm-gpt-oss-20b
+        app.kubernetes.io/name: oai-infopt-vllm-gpt-oss-20b
+        app.kubernetes.io/component: inference-server
+        project: observeai-inference-optimization
+        engagement: shellkode-sow
+        environment: sandbox
         model: gpt-oss-20b
-        component: inference-server
     spec:
-      serviceAccountName: model-storage-sa
+      serviceAccountName: oai-infopt-serving-sa
+      automountServiceAccountToken: false
+
+      hostPID: false
+      hostIPC: false
+      hostNetwork: false
+
       tolerations:
         - key: nvidia.com/gpu
           operator: Exists
           effect: NoSchedule
+
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    app.kubernetes.io/component: benchmark-runner
+                topologyKey: kubernetes.io/hostname
+
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+
       terminationGracePeriodSeconds: 120
 
       containers:
         - name: vllm
-          image: public.ecr.aws/deep-learning-containers/vllm:0.21.0-gpu-py312-cu130-ubuntu22.04-ec2-v1.0-soci
+          image: ${VLLM_IMAGE}
+          imagePullPolicy: IfNotPresent
+
           args:
-            - "--model=s3://shellkode-ai-models/gpt-oss-20b/"
+            - "--model=s3://${MODEL_BUCKET}/models/gpt-oss-20b/"
             - "--load-format=runai_streamer"
             - "--host=0.0.0.0"
             - "--port=8000"
@@ -53,14 +99,27 @@ spec:
             - "--gpu-memory-utilization=0.90"
             - "--max-model-len=4096"
             - "--trust-remote-code"
+
           ports:
             - name: http
               containerPort: 8000
               protocol: TCP
-          env:
-            - name: AWS_DEFAULT_REGION
-              value: "us-east-2"
-          # Needs g6e.2xlarge (32GB RAM) — g6e.xlarge OOMs during startup
+
+          envFrom:
+            - configMapRef:
+                name: oai-infopt-vllm-config
+
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            runAsUser: 1000
+            runAsGroup: 1000
+            capabilities:
+              drop: ["ALL"]
+            seccompProfile:
+              type: RuntimeDefault
+
           resources:
             requests:
               cpu: "4"
@@ -70,6 +129,7 @@ spec:
               cpu: "8"
               memory: "30Gi"
               nvidia.com/gpu: "1"
+
           readinessProbe:
             httpGet:
               path: /health
@@ -77,6 +137,8 @@ spec:
             initialDelaySeconds: 300
             periodSeconds: 10
             failureThreshold: 30
+            timeoutSeconds: 5
+
           livenessProbe:
             httpGet:
               path: /health
@@ -84,16 +146,24 @@ spec:
             initialDelaySeconds: 360
             periodSeconds: 30
             failureThreshold: 10
+            timeoutSeconds: 5
+
           volumeMounts:
             - name: metadata-cache
               mountPath: /metadata
             - name: dshm
               mountPath: /dev/shm
+            - name: tmp
+              mountPath: /tmp
+
       volumes:
         - name: metadata-cache
           persistentVolumeClaim:
-            claimName: metadata-cache-gpt-oss-20b
+            claimName: oai-infopt-metadata-gpt-oss-20b
         - name: dshm
           emptyDir:
             medium: Memory
             sizeLimit: 16Gi
+        - name: tmp
+          emptyDir:
+            sizeLimit: 2Gi

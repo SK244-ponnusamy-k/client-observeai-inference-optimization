@@ -1,149 +1,156 @@
 # ==============================================================================
 # inference/benchmark-job.yaml
 #
-# In-cluster benchmark — runs 100 requests inside the cluster.
-# Reports real latency without port-forward overhead.
+# In-cluster benchmark Job — profile-driven, runs on a SEPARATE CPU node
+# from the GPU inference pod to avoid co-location latency contamination.
 #
-# Edit MODEL_NAME below to match your deployed model.
+# All benchmark parameters come from the ConfigMap below — no inline edits.
+# Update the ConfigMap values (MANIFEST_PATH, PROFILE_PATH, VLLM_ENDPOINT,
+# RUN_ID) before applying.
+#
+# Security hardening (Checkov):
+#   - Non-root user (UID 65534)                     [CKV_K8S_6,  CKV_K8S_40]
+#   - readOnlyRootFilesystem: true                  [CKV_K8S_22]
+#   - allowPrivilegeEscalation: false               [CKV_K8S_20]
+#   - Capabilities: drop ALL                        [CKV_K8S_25, CKV_K8S_28]
+#   - automountServiceAccountToken: false           [CKV_K8S_43]
+#   - No hostPID/hostIPC/hostNetwork                [CKV_K8S_14-19]
+#   - CPU + memory requests and limits set          [CKV_K8S_10, CKV_K8S_11]
+#   - podAntiAffinity prevents co-location with GPU [latency isolation]
 #
 # Apply:
-#   kubectl apply -f inference/benchmark-job.yaml
-#
-# Logs:
-#   kubectl logs job/vllm-benchmark -f
-#   (or use tab completion for pod name)
-#
-# Clean up:
-#   kubectl delete job vllm-benchmark
+#   # 1. Edit the ConfigMap values below
+#   # 2. Apply:
+#   kubectl apply -f inference/benchmark-job.yaml -n oai-infopt
+#   kubectl logs -n oai-infopt job/oai-infopt-benchmark -f
+#   kubectl delete -f inference/benchmark-job.yaml -n oai-infopt
 # ==============================================================================
 
+---
+# ConfigMap — all run parameters here; no hardcoded values in the Job spec
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: oai-infopt-benchmark-config
+  namespace: oai-infopt
+  labels:
+    app.kubernetes.io/name: oai-infopt-benchmark-config
+    app.kubernetes.io/component: benchmark-config
+    project: observeai-inference-optimization
+    engagement: shellkode-sow
+    environment: sandbox
+data:
+  # ── EDIT THESE before applying ───────────────────────────────────────────────
+  VLLM_ENDPOINT: "http://oai-infopt-vllm-qwen-0.5b:8000"    # ClusterIP svc name
+  RUN_ID: "oai-infopt-2026-09-01-qwen-0.5b-baseline-001"
+  MANIFEST_PATH: "/configs/manifests/qwen-2.5-0.5b-baseline.yaml"
+  PROFILE_PATH: "/configs/profiles/realtime_v1.yaml"
+  RESULTS_DIR: "/results"
+  LOG_LEVEL: "INFO"
+  WAIT_TIMEOUT: "300"
+  # ─────────────────────────────────────────────────────────────────────────────
+
+---
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: vllm-benchmark
-  namespace: default
+  name: oai-infopt-benchmark
+  namespace: oai-infopt
   labels:
-    app: vllm-benchmark
-    component: benchmarking
+    app.kubernetes.io/name: oai-infopt-benchmark
+    app.kubernetes.io/component: benchmark-runner
+    app.kubernetes.io/managed-by: kubectl
+    project: observeai-inference-optimization
+    engagement: shellkode-sow
+    environment: sandbox
 spec:
   backoffLimit: 1
   ttlSecondsAfterFinished: 3600
+  activeDeadlineSeconds: 7200   # 2 h hard cap
 
   template:
     metadata:
       labels:
-        app: vllm-benchmark
+        app.kubernetes.io/name: oai-infopt-benchmark
+        app.kubernetes.io/component: benchmark-runner
+        project: observeai-inference-optimization
+        engagement: shellkode-sow
+        environment: sandbox
     spec:
       restartPolicy: Never
+      serviceAccountName: oai-infopt-benchmark-sa
+      automountServiceAccountToken: false
+
+      hostPID: false
+      hostIPC: false
+      hostNetwork: false
+
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65534
+        runAsGroup: 65534
+        fsGroup: 65534
+        seccompProfile:
+          type: RuntimeDefault
+
+      # Benchmark runner MUST NOT co-locate on the GPU node
+      # (would contaminate latency measurements)
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels:
+                  app.kubernetes.io/component: inference-server
+              topologyKey: kubernetes.io/hostname
+
+      # Only schedule on CPU (non-GPU) nodes
+      tolerations: []   # explicit: do not tolerate nvidia.com/gpu taint
 
       containers:
         - name: benchmark
           image: python:3.11-slim
+          imagePullPolicy: IfNotPresent
 
           command: ["/bin/bash", "-c"]
           args:
             - |
-              set -e
+              set -euo pipefail
 
-              # ── EDIT THIS to match your deployed model ──────────
-              MODEL_NAME="qwen-0.5b"
-              NUM_REQUESTS=100
-              VLLM_ENDPOINT="http://vllm-inference:8000"
-              # ──────────────────────────────────────────────────
+              echo "Installing benchmark dependencies..."
+              pip install --quiet --no-cache-dir \
+                openai==1.35.14 \
+                pyyaml==6.0.1 \
+                aiohttp==3.9.5
 
-              echo "Installing dependencies..."
-              pip install -q openai requests
+              echo "Copying configs into place..."
+              mkdir -p /configs/manifests /configs/profiles /results
 
-              echo "Waiting for vLLM..."
-              until python3 -c "import requests; requests.get('${VLLM_ENDPOINT}/health').raise_for_status()" 2>/dev/null; do
-                echo "  waiting..."; sleep 5
-              done
-              echo "vLLM is ready."
+              # Configs are volume-mounted from ConfigMap
+              echo "Starting benchmark..."
+              python3 /app/load-test.py \
+                --manifest "${MANIFEST_PATH}" \
+                --profile  "${PROFILE_PATH}" \
+                --endpoint "${VLLM_ENDPOINT}" \
+                --output   "${RESULTS_DIR}" \
+                --wait-timeout "${WAIT_TIMEOUT}"
 
-              echo ""
-              echo "================================================"
-              echo " IN-CLUSTER BENCHMARK"
-              echo " Model    : ${MODEL_NAME}"
-              echo " Endpoint : ${VLLM_ENDPOINT}"
-              echo " Requests : ${NUM_REQUESTS}"
-              echo "================================================"
-              echo ""
+              echo "Benchmark complete. Results in ${RESULTS_DIR}/"
+              ls -lh "${RESULTS_DIR}/"
 
-              python3 << 'PYEOF'
-              import time, statistics, os
-              from openai import OpenAI
+          envFrom:
+            - configMapRef:
+                name: oai-infopt-benchmark-config
 
-              MODEL    = os.environ.get("MODEL_NAME", "qwen-0.5b")
-              ENDPOINT = os.environ.get("VLLM_ENDPOINT", "http://vllm-inference:8000")
-              N        = int(os.environ.get("NUM_REQUESTS", "100"))
-
-              client = OpenAI(base_url=f"{ENDPOINT}/v1", api_key="dummy")
-
-              PROMPTS = [
-                  "Explain Kubernetes in two sentences.",
-                  "What is a container?",
-                  "What is machine learning?",
-                  "Explain REST API briefly.",
-                  "What is cloud computing?",
-              ]
-
-              ttfts, totals, tokens = [], [], []
-              print(f"Sending {N} requests...\n")
-
-              for i in range(N):
-                  prompt = PROMPTS[i % len(PROMPTS)]
-                  start  = time.time()
-                  first  = None
-                  text   = ""
-
-                  stream = client.chat.completions.create(
-                      model=MODEL,
-                      messages=[{"role": "user", "content": prompt}],
-                      max_tokens=128,
-                      stream=True,
-                  )
-                  for chunk in stream:
-                      delta = chunk.choices[0].delta.content
-                      if delta:
-                          if first is None:
-                              first = time.time()
-                          text += delta
-
-                  end = time.time()
-                  ttft  = (first - start) * 1000 if first else 0
-                  total = (end - start) * 1000
-                  w     = len(text.split())
-                  ttfts.append(ttft); totals.append(total); tokens.append(w)
-
-                  if (i + 1) % 10 == 0:
-                      print(f"[{i+1}/{N}] TTFT avg so far: {statistics.mean(ttfts):.1f}ms")
-
-              s_t = sorted(ttfts); s_l = sorted(totals)
-              p = lambda lst, pct: lst[max(0, int(len(lst)*pct/100)-1)]
-
-              print(f"\n{'='*55}")
-              print(f"  BENCHMARK RESULTS ({N} requests, in-cluster)")
-              print(f"{'='*55}")
-              print(f"  TTFT avg     : {statistics.mean(ttfts):.1f} ms")
-              print(f"  TTFT p50     : {statistics.median(ttfts):.1f} ms")
-              print(f"  TTFT p90     : {p(s_t,90):.1f} ms")
-              print(f"  TTFT p99     : {p(s_t,99):.1f} ms")
-              print(f"  TTFT min/max : {min(ttfts):.1f} / {max(ttfts):.1f} ms")
-              print(f"  Latency avg  : {statistics.mean(totals):.1f} ms")
-              print(f"  Latency p50  : {statistics.median(totals):.1f} ms")
-              print(f"  Latency p90  : {p(s_l,90):.1f} ms")
-              print(f"  Latency p99  : {p(s_l,99):.1f} ms")
-              print(f"  Total tokens : {sum(tokens)}")
-              print(f"{'='*55}")
-              PYEOF
-
-          env:
-            - name: MODEL_NAME
-              value: "qwen-0.5b"
-            - name: VLLM_ENDPOINT
-              value: "http://vllm-inference:8000"
-            - name: NUM_REQUESTS
-              value: "100"
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            runAsUser: 65534
+            runAsGroup: 65534
+            capabilities:
+              drop: ["ALL"]
+            seccompProfile:
+              type: RuntimeDefault
 
           resources:
             requests:
@@ -152,3 +159,41 @@ spec:
             limits:
               cpu: "2"
               memory: "4Gi"
+
+          volumeMounts:
+            - name: app-code
+              mountPath: /app
+              readOnly: true
+            - name: manifest-volume
+              mountPath: /configs/manifests
+              readOnly: true
+            - name: profile-volume
+              mountPath: /configs/profiles
+              readOnly: true
+            - name: results
+              mountPath: /results
+            - name: tmp
+              mountPath: /tmp
+
+      volumes:
+        # load-test.py script (mounted from a ConfigMap or init container)
+        - name: app-code
+          configMap:
+            name: oai-infopt-benchmark-script
+            optional: true   # falls back to image-bundled script if not present
+        # Manifest + profile ConfigMaps (created alongside this Job)
+        - name: manifest-volume
+          configMap:
+            name: oai-infopt-benchmark-manifest
+            optional: true
+        - name: profile-volume
+          configMap:
+            name: oai-infopt-benchmark-profile
+            optional: true
+        # Results written here; upload to S3 after job completes
+        - name: results
+          emptyDir:
+            sizeLimit: 1Gi
+        - name: tmp
+          emptyDir:
+            sizeLimit: 512Mi

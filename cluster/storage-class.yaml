@@ -1,12 +1,36 @@
+# ==============================================================================
+# cluster/storage-class.yaml
+#
+# gp3 StorageClass for EBS-backed PVCs (metadata cache only).
+# Model weights stream from S3 — they are NOT stored on EBS.
+#
+# Security hardening (Checkov CKV_K8S_28):
+#   - encrypted: "true"   — EBS volumes encrypted at rest (KMS default key)
+#   - WaitForFirstConsumer — volume created in same AZ as the pod (avoids
+#     cross-AZ latency and prevents AZ-mismatch scheduling failures)
+#
+# Apply:
+#   kubectl apply -f cluster/storage-class.yaml
+# ==============================================================================
+
 apiVersion: storage.k8s.io/v1
 kind: StorageClass
 metadata:
   name: gp3
   annotations:
     storageclass.kubernetes.io/is-default-class: "true"
+  labels:
+    app.kubernetes.io/name: gp3
+    app.kubernetes.io/component: storage-class
+    app.kubernetes.io/managed-by: kubectl
+    project: observeai-inference-optimization
+    environment: sandbox
 provisioner: ebs.csi.eks.amazonaws.com
 volumeBindingMode: WaitForFirstConsumer
 allowVolumeExpansion: true
 parameters:
   type: gp3
   encrypted: "true"
+  # kmsKeyId: ""   # uncomment and set a customer-managed KMS key ARN if required
+  throughput: "125"
+  iops: "3000"
