@@ -2,23 +2,28 @@
 # ==============================================================================
 # vllm/stop.sh
 #
-# Stops ALL running vLLM deployments and releases their resources.
-# GPU nodes terminate automatically within ~10 minutes (Karpenter).
-# S3 model files are NOT affected.
-# Cluster keeps running (control plane ~$0.10/hr continues).
+# Stops ALL running vLLM models and releases ALL GPU nodes.
+# Run this and close your laptop — everything expensive stops.
+#
+# What this does:
+#   1. Finds and deletes every inference-server deployment in oai-infopt
+#   2. Deletes ALL GPU node claims — stops billing immediately
+#   3. Cleans up all benchmark jobs
+#   4. Confirms nothing expensive remains
+#
+# What this does NOT touch:
+#   - S3 model weights
+#   - Monitoring stack (Grafana/Prometheus on CPU nodes — ~$0.15/hr)
 #
 # Usage:
 #   cd llm-inference-framework
-#   bash vllm/stop.sh                       # stop ALL models
+#   bash vllm/stop.sh                        # stop ALL models
 #
 # To stop a single model only:
 #   bash vllm/models/qwen-2.5-0.5b/stop.sh
 #   bash vllm/models/gpt-oss-20b/stop.sh
 #
-# To revert a public LB to private (no downtime):
-#   kubectl apply -f vllm/models/<model>/service/service-private.yaml
-#
-# To also delete the cluster:
+# To also delete the entire cluster:
 #   bash cluster/teardown.sh
 # ==============================================================================
 
@@ -28,76 +33,79 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 FRAMEWORK_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 source "${FRAMEWORK_ROOT}/config/config.env"
 
+# Source shared GPU termination helper
+source "${SCRIPT_DIR}/lib/gpu-terminate.sh"
+
 GREEN='\033[0;32m'; YELLOW='\033[1;33m'; RED='\033[0;31m'; NC='\033[0m'
 log_info()  { echo -e "${GREEN}[INFO]  $(date +'%H:%M:%S')${NC} $1"; }
 log_warn()  { echo -e "${YELLOW}[WARN]  $(date +'%H:%M:%S')${NC} $1"; }
-log_error() { echo -e "${RED}[ERROR] $(date +'%H:%M:%S')${NC} $1"; }
 
 echo ""
 echo "══════════════════════════════════════════════════"
-echo "  STOP ALL vLLM DEPLOYMENTS"
-echo "  Cluster : ${CLUSTER_NAME}"
-echo "  GPU nodes terminate in ~10 min after stop"
-echo "  S3 models are NOT affected"
+echo "  STOP ALL vLLM MODELS"
+echo "  Cluster   : ${CLUSTER_NAME}"
+echo "  Namespace : ${BENCHMARK_NAMESPACE}"
 echo "══════════════════════════════════════════════════"
 echo ""
+echo "  This will:"
+echo "    • Delete ALL inference-server deployments"
+echo "    • Terminate ALL GPU nodes (stops billing)"
+echo "    • Clean up all benchmark jobs"
+echo "    • Leave monitoring stack running (~\$0.15/hr)"
+echo ""
 
-# ------------------------------------------------------------------------------
-# Discover all running inference deployments
-# ------------------------------------------------------------------------------
-RUNNING=$(kubectl get deployment -l app.kubernetes.io/component=inference-server \
-    -n "${BENCHMARK_NAMESPACE}" -o jsonpath='{.items[*].metadata.name}' 2>/dev/null || true)
+# ── Discover running deployments ────────────────────────────────────────────
+RUNNING=$(kubectl get deployment \
+    -l app.kubernetes.io/component=inference-server \
+    -n "${BENCHMARK_NAMESPACE}" \
+    -o jsonpath='{.items[*].metadata.name}' 2>/dev/null || true)
 
 if [[ -z "${RUNNING}" ]]; then
-    log_warn "No vLLM deployments found — nothing to stop."
-    exit 0
+    log_warn "No inference-server deployments found in ${BENCHMARK_NAMESPACE}."
+else
+    log_info "Found deployments: ${RUNNING}"
 fi
 
-log_info "Found deployments: ${RUNNING}"
+# Show current GPU nodes before confirming
+GPU_NODECLAIMS=$(kubectl get nodeclaims --no-headers 2>/dev/null | \
+    awk '{print $1, $2}' | grep -E "g4|g5|g6|p3|p4|p5|inf" || true)
+if [[ -n "${GPU_NODECLAIMS}" ]]; then
+    log_info "GPU nodes currently running (billing):"
+    echo "${GPU_NODECLAIMS}" | while read -r line; do echo "    ${line}"; done
+fi
 
-read -r -p "Stop ALL inference deployments? [y/N]: " CONFIRM
+echo ""
+read -r -p "Stop everything? [y/N]: " CONFIRM
 [[ "${CONFIRM}" =~ ^[yY]$ ]] || { log_info "Cancelled."; exit 0; }
 
-# ------------------------------------------------------------------------------
-# Stop each model by delegating to its own stop.sh
-# (non-interactive: answers 'y' automatically since user already confirmed above)
-# ------------------------------------------------------------------------------
-MODELS_DIR="${SCRIPT_DIR}/models"
+# ── Step 1: Delete all inference-server deployments + services + PVCs ────────
+if [[ -n "${RUNNING}" ]]; then
+    log_info "Deleting all inference-server deployments..."
+    kubectl delete deployment \
+        -l app.kubernetes.io/component=inference-server \
+        -n "${BENCHMARK_NAMESPACE}" --ignore-not-found=true
 
-for MODEL_DIR in "${MODELS_DIR}"/*/; do
-    MODEL=$(basename "${MODEL_DIR}")
-    STOP_SCRIPT="${MODEL_DIR}stop.sh"
+    log_info "Deleting all inference-server services..."
+    kubectl delete svc \
+        -l app.kubernetes.io/component=inference-server \
+        -n "${BENCHMARK_NAMESPACE}" --ignore-not-found=true 2>/dev/null || true
 
-    if [[ -f "${STOP_SCRIPT}" ]]; then
-        log_info "Stopping model: ${MODEL}..."
-        # Pass 'y' automatically — user already confirmed above
-        echo "y" | bash "${STOP_SCRIPT}" || log_warn "stop.sh for ${MODEL} returned non-zero (may already be stopped)"
-    else
-        log_warn "No stop.sh found for ${MODEL} — skipping."
-    fi
-done
+    log_info "Deleting all PVCs in ${BENCHMARK_NAMESPACE}..."
+    kubectl delete pvc --all \
+        -n "${BENCHMARK_NAMESPACE}" --ignore-not-found=true 2>/dev/null || true
+fi
 
-# ------------------------------------------------------------------------------
-# Show remaining resources
-# ------------------------------------------------------------------------------
-echo ""
-log_info "Remaining pods:"
-kubectl get pods -n "${BENCHMARK_NAMESPACE}" 2>/dev/null || true
+# ── Step 2: Terminate ALL GPU nodes ─────────────────────────────────────────
+terminate_gpu_nodes
 
-echo ""
-log_info "Remaining nodes (GPU nodes will terminate in ~10 min):"
-kubectl get nodes 2>/dev/null || true
+# ── Step 3: Clean up ALL benchmark jobs ─────────────────────────────────────
+log_info "Cleaning up all jobs in ${BENCHMARK_NAMESPACE}..."
+ALL_JOBS=$(kubectl get jobs -n "${BENCHMARK_NAMESPACE}" \
+    --no-headers 2>/dev/null | awk '{print $1}' || true)
+if [[ -n "${ALL_JOBS}" ]]; then
+    echo "${ALL_JOBS}" | xargs -r kubectl delete job \
+        -n "${BENCHMARK_NAMESPACE}" --ignore-not-found=true
+fi
 
-echo ""
-echo "══════════════════════════════════════════════════"
-echo "  ALL MODELS STOPPED"
-echo "  Deleted : deployments, services, PVCs"
-echo "  Kept    : cluster, S3 models, IAM Roles"
-echo ""
-echo "  To redeploy a model:"
-echo "    bash vllm/models/qwen-2.5-0.5b/deploy.sh"
-echo "    bash vllm/models/gpt-oss-20b/deploy.sh"
-echo ""
-echo "  To delete cluster too:"
-echo "    bash cluster/teardown.sh"
-echo "══════════════════════════════════════════════════"
+# ── Step 4: Final status ─────────────────────────────────────────────────────
+print_stop_summary "ALL MODELS" "${BENCHMARK_NAMESPACE}"
