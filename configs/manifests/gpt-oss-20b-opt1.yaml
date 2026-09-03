@@ -1,0 +1,87 @@
+# ==============================================================================
+# configs/manifests/gpt-oss-20b-opt1.yaml
+#
+# Benchmark run manifest — gpt-oss-20b opt1 (chunked prefill + prefix cache)
+#
+# Optimizations vs baseline (gpt-oss-20b-baseline.yaml):
+#   ┌─────────────────────────────┬──────────────┬──────────────┐
+#   │ Parameter                   │ Baseline     │ Opt1         │
+#   ├─────────────────────────────┼──────────────┼──────────────┤
+#   │ gpu_memory_utilization      │ 0.90         │ 0.95         │
+#   │ max_model_len               │ 4096*        │ 8192         │
+#   │ max_num_seqs                │ 128          │ 256          │
+#   │ max_num_batched_tokens      │ 8192         │ 2048         │
+#   │ chunked_prefill             │ disabled     │ enabled      │
+#   │ prefix_caching              │ disabled     │ enabled      │
+#   │ scheduler_delay_factor      │ 0.0          │ 0.5          │
+#   └─────────────────────────────┴──────────────┴──────────────┘
+#   * baseline deployment.yaml had 4096 despite manifest saying 8192 — fixed.
+#
+# Expected improvements:
+#   - TTFT p95 batch:   8,479ms → ~4,000-5,000ms (chunked prefill)
+#   - Throughput conc=64: 498 tok/s → >500 tok/s (max-num-seqs=256)
+#   - TTFT realtime:    39ms → ~20-30ms (prefix cache hits on QA system prompt)
+#   - Cost/1M:          $0.82 → ~$0.60-0.70 (higher GPU utilisation)
+#
+# Baseline reference results:
+#   realtime: TTFT p95 38.9ms ✅  ITL p95 23.1ms ✅
+#   batch:    conc=64 498 tok/s ❌ (2 short)  conc=128 734 tok/s ✅
+#
+# Run:
+#   bash vllm/models/gpt-oss-20b/deploy.sh          # redeploy with opt1 config
+#   bash inference/run-benchmark.sh --model gpt-oss-20b --profile realtime
+#   bash inference/run-benchmark.sh --model gpt-oss-20b --profile batch
+# ==============================================================================
+
+run_id: oai-infopt-2026-09-03-gpt-oss-20b-opt1-001
+description: "openai/gpt-oss-20b MXFP4 opt1 — chunked prefill + prefix cache + scheduler tuning"
+
+model:
+  hf_id: openai/gpt-oss-20b
+  s3_prefix: models/gpt-oss-20b/
+  source: eks_gpu
+
+serving:
+  image: public.ecr.aws/deep-learning-containers/vllm:0.26.0-gpu-py312-cu130-ubuntu22.04-ec2-v1.0-soci
+  nodepool: gpu-inf
+  instance_type: g6e.2xlarge
+
+optimization_variants:
+  - label: mxfp4-opt1-chunked-prefill-prefix-cache
+    quantization: mxfp4
+    tensor_parallel_size: 1
+    # Scheduler: 256 sequences (was 128) — fills larger batches at conc=64+
+    max_num_seqs: 256
+    # Chunked prefill chunk size: 2048 tokens (was 8192 monolithic)
+    # Smaller chunks interleave with decode → lower TTFT at high concurrency
+    max_num_batched_tokens: 2048
+    # Aligned with deployment.yaml (baseline had 4096/8192 mismatch)
+    max_model_len: 8192
+    kv_cache_dtype: fp8
+    # Optimizations enabled
+    chunked_prefill: true
+    prefix_caching: true
+    scheduler_delay_factor: 0.5
+    gpu_memory_utilization: 0.95
+
+benchmark:
+  workload_profiles:
+    - configs/workload_profiles/realtime_v1.yaml
+    - configs/workload_profiles/batch_v1.yaml
+
+cost:
+  instance_hourly_usd: 2.17   # g6e.2xlarge on-demand us-east-2
+
+# Comparison baseline for regression detection
+baseline_run_id: oai-infopt-2026-09-01-gpt-oss-20b-baseline-001
+
+tags:
+  Project: observeai-inference-optimization
+  Engagement: shellkode-sow
+  Environment: sandbox
+  ManagedBy: benchmark-runner
+  Owner: TBD
+  CostCenter: TBD
+  RunId: oai-infopt-2026-09-03-gpt-oss-20b-opt1-001
+  OptimizationRound: "1"
+  BaselineRunId: oai-infopt-2026-09-01-gpt-oss-20b-baseline-001

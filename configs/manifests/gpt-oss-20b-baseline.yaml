@@ -25,7 +25,7 @@ optimization_variants:
     tensor_parallel_size: 1
     max_num_seqs: 128
     max_num_batched_tokens: 8192
-    max_model_len: 8192
+    max_model_len: 8192          # corrected: deployment.yaml had 4096, manifest had 8192 — aligned to 8192
     kv_cache_dtype: fp8
 
 benchmark:

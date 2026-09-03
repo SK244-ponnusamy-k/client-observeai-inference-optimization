@@ -32,7 +32,7 @@ data:
   # vLLM serving defaults (overridden per-deployment via args)
   VLLM_PORT: "8000"
   VLLM_HOST: "0.0.0.0"
-  GPU_MEMORY_UTILIZATION: "0.90"
+  GPU_MEMORY_UTILIZATION: "0.95"     # opt1: was 0.90 — extra ~2.3 GB for KV cache
 
   # Logging
   VLLM_LOGGING_LEVEL: "INFO"
@@ -41,3 +41,26 @@ data:
   # Disable HF telemetry inside serving container
   HF_HUB_DISABLE_TELEMETRY: "1"
   TRANSFORMERS_VERBOSITY: "error"
+
+  # ── Performance tuning (opt1 — 2026-09-03) ──────────────────────────────
+  # CUDA memory allocator: reduce fragmentation under large concurrent batches.
+  # expandable_segments allows PyTorch to grow allocations incrementally
+  # rather than reserving a single large block — important at 0.95 utilization.
+  PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
+
+  # Tokenizer parallelism: vLLM manages its own async tokenizer workers.
+  # Disabling HF tokenizer parallelism avoids fork-safety warnings and
+  # prevents double-threading contention with vLLM's internal pool.
+  TOKENIZERS_PARALLELISM: "false"
+
+  # NCCL tuning: not used for single-GPU (TP=1) but set correctly for
+  # future tensor-parallel experiments without needing a config change.
+  NCCL_TIMEOUT: "600"
+
+  # vLLM async engine: use the fully async engine path for better
+  # scheduling throughput under high concurrency.
+  VLLM_USE_V1: "1"
+
+  # Torch compile: disabled for MoE models — compilation overhead exceeds
+  # benefit and can cause instability with expert routing kernels.
+  VLLM_TORCH_COMPILE_LEVEL: "0"

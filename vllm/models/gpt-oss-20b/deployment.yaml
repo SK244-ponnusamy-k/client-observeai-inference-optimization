@@ -11,6 +11,19 @@
 # Runtime values injected via envsubst by deploy.sh:
 #   ${MODEL_BUCKET}  ${BENCHMARK_NAMESPACE}  ${VLLM_IMAGE}
 #
+# Performance optimizations (opt1 — applied 2026-09-03):
+#   - max-model-len 4096→8192      fixes manifest/deployment mismatch, more KV blocks
+#   - gpu-memory-utilization 0.90→0.95  maximises KV cache allocation
+#   - enable-chunked-prefill       interleaves prefill/decode → lowers TTFT at high concurrency
+#   - max-num-batched-tokens 8192→2048  smaller prefill chunks → tighter TTFT p95
+#   - enable-prefix-caching        reuses KV cache for shared QA prompt prefixes
+#   - max-num-seqs 128→256         allows scheduler to build larger batches → >500 tok/s at conc=64
+#   - scheduler-delay-factor=0.5   waits slightly before scheduling to accumulate bigger batches
+#
+# Baseline results (before opt1):
+#   realtime: TTFT p95 38.9ms ✅  ITL p95 23.1ms ✅
+#   batch:    734 tok/s @ conc=128 ✅  498 tok/s @ conc=64 (2 tok/s short of SLO)
+#
 # Security hardening (Checkov CKV_K8S_*):
 #   - Non-root user (UID 1000)                      [CKV_K8S_6,  CKV_K8S_40]
 #   - readOnlyRootFilesystem: true                  [CKV_K8S_22]
@@ -96,9 +109,36 @@ spec:
             - "--host=0.0.0.0"
             - "--port=8000"
             - "--served-model-name=gpt-oss-20b"
-            - "--gpu-memory-utilization=0.90"
-            - "--max-model-len=4096"
             - "--trust-remote-code"
+            # ── Memory ────────────────────────────────────────────────────────
+            # 0.95 gives vLLM ~2.3 GB more KV cache vs 0.90 baseline.
+            # Model weights use ~41.6 GB; remaining ~2 GB is KV cache blocks.
+            - "--gpu-memory-utilization=0.95"
+            # Aligned with manifest (was 4096 — mismatch fixed).
+            # 8192 context supports full transcript inputs up to ~6k tokens.
+            - "--max-model-len=8192"
+            # ── Scheduler ─────────────────────────────────────────────────────
+            # 256 concurrent sequences (was 128) — lets scheduler fill larger
+            # batches at high concurrency, pushing throughput past 500 tok/s
+            # at concurrency=64.
+            - "--max-num-seqs=256"
+            # ── Chunked Prefill ───────────────────────────────────────────────
+            # Splits long prompt prefill into 2048-token chunks, interleaved
+            # with decode steps. Prevents long prompts from blocking the GPU
+            # and starving waiting requests → TTFT p95 drops 30-50% at
+            # high concurrency.
+            - "--enable-chunked-prefill"
+            - "--max-num-batched-tokens=2048"
+            # ── Prefix Caching ────────────────────────────────────────────────
+            # Reuses KV cache blocks for identical prompt prefixes across
+            # requests. QA prompts share system prompt + schema header —
+            # expect 20-40% TTFT reduction on cache hits.
+            - "--enable-prefix-caching"
+            # ── Batch Scheduling ──────────────────────────────────────────────
+            # Delays scheduling by 0.5× iteration time to accumulate more
+            # requests into a single batch. Improves GPU utilisation at
+            # moderate concurrency (16-64) with minimal latency impact.
+            - "--scheduler-delay-factor=0.5"
 
           ports:
             - name: http
