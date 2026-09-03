@@ -137,7 +137,13 @@ spec:
           args:
             - |
               set -euo pipefail
-              pip install --quiet --no-cache-dir openai==1.35.14 pyyaml==6.0.1 aiohttp==3.9.5 boto3==1.34.0
+              export HOME=/tmp
+              pip install --quiet --no-cache-dir --target=/tmp/pip-packages \
+                "openai==1.57.0" \
+                pyyaml==6.0.1 \
+                boto3==1.34.0 \
+                "aiohttp==3.10.0"
+              export PYTHONPATH=/tmp/pip-packages
               python3 /app/load-test.py \
                 --manifest /configs/manifests/manifest.yaml \
                 --profile  /configs/profiles/profile.yaml \
