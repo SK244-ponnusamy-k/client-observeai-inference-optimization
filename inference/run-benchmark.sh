@@ -41,9 +41,9 @@ case "${MODEL}" in
         MANIFEST="configs/manifests/gpt-oss-20b-baseline.yaml"
         SVC="oai-infopt-vllm-gpt-oss-20b"
         ;;
-    qwen-0.5b|qwen)
+    qwen-0.5b|qwen-0-5b|qwen)
         MANIFEST="configs/manifests/qwen-2.5-0.5b-baseline.yaml"
-        SVC="oai-infopt-vllm-qwen-0.5b"
+        SVC="oai-infopt-vllm-qwen-0-5b"
         ;;
     *)
         log_error "Unknown model: ${MODEL}. Use gpt-oss-20b or qwen-0.5b"
@@ -144,12 +144,13 @@ spec:
                 boto3==1.34.0 \
                 "aiohttp==3.10.0"
               export PYTHONPATH=/tmp/pip-packages
+              TEST_EXIT=0
               python3 /app/load-test.py \
                 --manifest /configs/manifests/manifest.yaml \
                 --profile  /configs/profiles/profile.yaml \
                 --endpoint "${ENDPOINT}" \
                 --output   /results \
-                --wait-timeout 300
+                --wait-timeout 300 || TEST_EXIT=\$?
               echo "=== Uploading results to S3 ==="
               python3 -c "
               import boto3, os, glob
@@ -158,7 +159,8 @@ spec:
                   key = 'results/${TIMESTAMP}/${PROFILE}/' + os.path.basename(f)
                   s3.upload_file(f, '${RESULTS_BUCKET}', key)
                   print('Uploaded: s3://${RESULTS_BUCKET}/' + key)
-              "
+              " || true
+              exit \${TEST_EXIT}
           env:
             - name: AWS_DEFAULT_REGION
               value: "${AWS_REGION}"

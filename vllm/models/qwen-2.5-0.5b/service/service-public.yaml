@@ -1,37 +1,29 @@
 # ==============================================================================
-# service-public.yaml — LoadBalancer (AWS NLB)
-#
-# Exposes vLLM publicly via AWS Network Load Balancer.
-# WARNING: No authentication — anyone with the URL can call your GPU.
-#
-# Apply:
-#   kubectl apply -f vllm/models/qwen-2.5-0.5b/service/service-public.yaml
-#
-# Get public URL:
-#   kubectl get svc vllm-qwen-0.5b   (wait ~2 min for EXTERNAL-IP)
-#
-# Switch back to private:
-#   kubectl apply -f vllm/models/qwen-2.5-0.5b/service/service-private.yaml
+# vllm/models/qwen-2.5-0.5b/service/service-public.yaml  — SECURITY HOLD
 # ==============================================================================
-
-apiVersion: v1
-kind: Service
-metadata:
-  name: vllm-qwen-0.5b
-  namespace: default
-  labels:
-    app: vllm-qwen-0.5b
-    model: qwen-2.5-0.5b
-  annotations:
-    service.beta.kubernetes.io/aws-load-balancer-type: "external"
-    service.beta.kubernetes.io/aws-load-balancer-nlb-target-type: "ip"
-    service.beta.kubernetes.io/aws-load-balancer-scheme: "internet-facing"
-spec:
-  type: LoadBalancer
-  selector:
-    app: vllm-qwen-0.5b
-  ports:
-    - name: http
-      port: 8000
-      targetPort: 8000
-      protocol: TCP
+#
+# A public NLB (LoadBalancer type, internet-facing scheme, port 8000) with no
+# authentication was previously defined here.
+#
+# This configuration is PROHIBITED:
+#   - An unauthenticated, internet-facing NLB on port 8000 exposes the vLLM
+#     OpenAI-compatible API to anyone who discovers the DNS name.
+#   - No API key, no JWT, no IP allowlist — full GPU access at zero cost to
+#     an attacker.
+#   - Flagged by Checkov CKV_K8S_21 (default namespace) and identified as a
+#     high-severity exposure in the shellkode security review.
+#
+# APPROVED alternatives:
+#
+#   For controlled external access (HTTPS + TLS):
+#     vllm/models/qwen-2.5-0.5b/service/service-ingress.yaml
+#     — ALB Ingress with ACM certificate, HTTP→HTTPS redirect, optional WAF
+#     — Add alb.ingress.kubernetes.io/inbound-cidrs to restrict source IPs
+#     — Add API Gateway + Cognito authorizer for token-based auth before vLLM
+#
+#   For in-cluster / local access (benchmarking, development):
+#     vllm/models/qwen-2.5-0.5b/service/service-private.yaml
+#     — ClusterIP + kubectl port-forward
+#
+# DO NOT recreate a public unauthenticated LoadBalancer Service for vLLM.
+# ==============================================================================

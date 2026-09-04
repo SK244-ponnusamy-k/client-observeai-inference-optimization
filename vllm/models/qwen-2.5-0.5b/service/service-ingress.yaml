@@ -1,54 +1,86 @@
 # ==============================================================================
-# service-ingress.yaml — HTTPS Ingress via AWS ALB (Production)
+# vllm/models/qwen-2.5-0.5b/service/service-ingress.yaml
+# HTTPS ALB Ingress — controlled external access to vLLM qwen-2.5-0.5b
 #
-# Exposes vLLM at https://qwen.yourdomain.com with SSL termination.
-# Requires: AWS Load Balancer Controller + ACM certificate.
+# Namespace : oai-infopt  (matches Deployment, Service, and NetworkPolicy)
+# Requires  : AWS Load Balancer Controller + ACM certificate
 #
-# Edit before applying:
-#   - Replace YOUR-ACM-CERT-ARN with actual ARN
-#   - Replace qwen.yourdomain.com with your domain
+# Prerequisites:
+#   1. Install ALB controller (if not already present):
+#        helm repo add eks https://aws.github.io/eks-charts
+#        helm install aws-load-balancer-controller eks/aws-load-balancer-controller \
+#          -n kube-system --set clusterName=ai-eks-cluster
 #
-# Apply:
-#   kubectl apply -f vllm/models/qwen-2.5-0.5b/service/service-ingress.yaml
+#   2. Create ACM certificate:
+#        aws acm request-certificate \
+#          --domain-name qwen.yourdomain.com \
+#          --validation-method DNS \
+#          --region us-east-2
+#      Validate via DNS, then copy the ARN.
+#
+#   3. Apply the ClusterIP service first (Ingress routes to it):
+#        kubectl apply -f vllm/models/qwen-2.5-0.5b/service/service-private.yaml
+#
+#   4. Edit this file:
+#        - Replace YOUR-ACM-CERT-ARN with actual ARN
+#        - Replace qwen.yourdomain.com with your domain
+#        - Optionally restrict inbound-cidrs to office/VPN CIDR
+#
+#   5. Apply:
+#        kubectl apply -f vllm/models/qwen-2.5-0.5b/service/service-ingress.yaml
+#
+# Security fix (2026-09-03): moved from namespace 'default' to 'oai-infopt';
+#   backend service name corrected to oai-infopt-vllm-qwen-0.5b.
+#   Fixes Checkov CKV_K8S_21.
 # ==============================================================================
 
 apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
-  name: vllm-qwen-0.5b-ingress
-  namespace: default
+  name: oai-infopt-vllm-qwen-0-5b-ingress
+  namespace: oai-infopt
   labels:
-    app: vllm-qwen-0.5b
+    app.kubernetes.io/name: oai-infopt-vllm-qwen-0-5b-ingress
+    app.kubernetes.io/component: ingress
+    app.kubernetes.io/managed-by: kubectl
+    project: observeai-inference-optimization
+    engagement: shellkode-sow
+    environment: sandbox
     model: qwen-2.5-0.5b
   annotations:
     kubernetes.io/ingress.class: alb
     alb.ingress.kubernetes.io/scheme: internet-facing
     alb.ingress.kubernetes.io/target-type: ip
-    # ── REPLACE WITH YOUR ACM CERTIFICATE ARN ─────────────
-    alb.ingress.kubernetes.io/certificate-arn: arn:aws:acm:us-east-2:ACCOUNT_ID:certificate/YOUR-CERT-ID
-    # ──────────────────────────────────────────────────────
+    # ── REQUIRED: replace with your ACM certificate ARN ────────────────────
+    alb.ingress.kubernetes.io/certificate-arn: "arn:aws:acm:us-east-2:ACCOUNT_ID:certificate/YOUR-CERT-ID"
+    # ────────────────────────────────────────────────────────────────────────
     alb.ingress.kubernetes.io/listen-ports: '[{"HTTP":80},{"HTTPS":443}]'
     alb.ingress.kubernetes.io/ssl-redirect: "443"
     alb.ingress.kubernetes.io/healthcheck-path: /health
+    alb.ingress.kubernetes.io/healthcheck-interval-seconds: "30"
     alb.ingress.kubernetes.io/load-balancer-attributes: idle_timeout.timeout_seconds=300
+    # ── Restrict source IPs to office/VPN CIDR before go-live ──────────────
+    # alb.ingress.kubernetes.io/inbound-cidrs: "10.0.0.0/8,YOUR_OFFICE_CIDR"
+    # ── Attach AWS WAF WebACL (recommended for production) ──────────────────
+    # alb.ingress.kubernetes.io/wafv2-acl-arn: "arn:aws:wafv2:..."
 spec:
   rules:
-    # ── REPLACE WITH YOUR DOMAIN ──────────────────────────
-    - host: qwen.yourdomain.com
-    # ──────────────────────────────────────────────────────
+    # ── REQUIRED: replace with your domain ────────────────────────────────
+    - host: "qwen.yourdomain.com"
+    # ───────────────────────────────────────────────────────────────────────
       http:
         paths:
           - path: /v1
             pathType: Prefix
             backend:
               service:
-                name: vllm-qwen-0.5b
+                name: oai-infopt-vllm-qwen-0-5b
                 port:
                   number: 8000
           - path: /health
             pathType: Exact
             backend:
               service:
-                name: vllm-qwen-0.5b
+                name: oai-infopt-vllm-qwen-0-5b
                 port:
                   number: 8000

@@ -72,9 +72,9 @@ spec:
 
           containers:
             - name: collector
-              # Standard Python slim image — installs deps at startup
-              # Pin to a specific digest in production for reproducibility
-              image: python:3.11-slim
+              # Image digest pinned 2026-09-03 — linux/amd64, resolves CKV_K8S_43.
+              # Re-pin: see model-download/gpt-oss-20b/job.yaml header for one-liner.
+              image: python:3.11-slim@sha256:d1053354624536b044162aaab1e418bd000ea35184fb1ae098ab3166b1072e72
               imagePullPolicy: IfNotPresent
 
               command: ["/bin/bash", "-c"]

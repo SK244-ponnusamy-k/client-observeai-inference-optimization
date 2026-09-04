@@ -8,7 +8,7 @@ Created : 2026-09-01
 Deps    : openai>=1.0, pyyaml, aiohttp (pip install openai pyyaml aiohttp)
 
 Usage (local via port-forward):
-    kubectl port-forward -n oai-infopt svc/oai-infopt-vllm-qwen-0.5b 8080:8000 &
+    kubectl port-forward -n oai-infopt svc/oai-infopt-vllm-qwen-0-5b 8080:8000 &
     python inference/load-test.py \\
         --manifest configs/manifests/qwen-2.5-0.5b-baseline.yaml \\
         --profile  configs/workload_profiles/realtime_v1.yaml \\
@@ -19,7 +19,7 @@ Usage (in-cluster, called by benchmark-job.yaml):
     python inference/load-test.py \\
         --manifest /configs/manifest.yaml \\
         --profile  /configs/profile.yaml \\
-        --endpoint http://oai-infopt-vllm-qwen-0.5b:8000 \\
+        --endpoint http://oai-infopt-vllm-qwen-0-5b:8000 \\
         --output   /results/
 """
 

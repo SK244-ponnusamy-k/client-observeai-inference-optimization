@@ -162,7 +162,7 @@ bash vllm/models/gpt-oss-20b/deploy.sh
 **Local (via port-forward):**
 
 ```bash
-kubectl port-forward -n oai-infopt svc/oai-infopt-vllm-qwen-0.5b 8080:8000 &
+kubectl port-forward -n oai-infopt svc/oai-infopt-vllm-qwen-0-5b 8080:8000 &
 
 pip install openai pyyaml aiohttp
 python inference/load-test.py \

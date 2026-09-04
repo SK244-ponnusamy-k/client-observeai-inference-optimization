@@ -17,6 +17,11 @@ FRAMEWORK_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
 source "${FRAMEWORK_ROOT}/config/config.env"
 source "${SCRIPT_DIR}/model.env"
 
+# Fail fast if VLLM_IMAGE is unset or empty — prevents accidental 'latest' pull.
+# Set in config/config.env. Value must include a digest for supply-chain safety.
+# Added 2026-09-03 — fixes Checkov CKV_K8S_14 / CKV_K8S_43 guard.
+: "${VLLM_IMAGE:?ERROR: VLLM_IMAGE is not set. Ensure config/config.env is sourced and exports VLLM_IMAGE with a pinned digest.}"
+
 GREEN='\033[0;32m'; YELLOW='\033[1;33m'; RED='\033[0;31m'; NC='\033[0m'
 log_info()  { echo -e "${GREEN}[INFO]  $(date +'%H:%M:%S')${NC} $1"; }
 log_warn()  { echo -e "${YELLOW}[WARN]  $(date +'%H:%M:%S')${NC} $1"; }

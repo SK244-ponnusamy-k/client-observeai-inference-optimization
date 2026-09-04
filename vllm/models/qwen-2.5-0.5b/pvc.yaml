@@ -3,10 +3,10 @@
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
-  name: oai-infopt-metadata-qwen-0.5b
+  name: oai-infopt-metadata-qwen-0-5b
   namespace: oai-infopt
   labels:
-    app.kubernetes.io/name: oai-infopt-metadata-qwen-0.5b
+    app.kubernetes.io/name: oai-infopt-metadata-qwen-0-5b
     app.kubernetes.io/component: metadata-cache
     project: observeai-inference-optimization
     engagement: shellkode-sow

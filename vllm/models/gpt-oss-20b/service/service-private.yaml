@@ -1,33 +1,45 @@
 # ==============================================================================
-# service-private.yaml — ClusterIP (default)
+# vllm/models/gpt-oss-20b/service/service-private.yaml — ClusterIP (internal)
 #
 # Internal cluster access only.
-# Use for: app-to-vLLM communication inside the cluster.
+# Use for: in-cluster benchmark runner → vLLM communication.
 # Use port-forward for local laptop testing.
+#
+# Namespace : oai-infopt  (matches Deployment and NetworkPolicy)
+# Selector  : app: oai-infopt-vllm-gpt-oss-20b  (matches Deployment pod label)
 #
 # Apply:
 #   kubectl apply -f vllm/models/gpt-oss-20b/service/service-private.yaml
 #
 # Port-forward for local test:
-#   kubectl port-forward svc/vllm-gpt-oss-20b 8081:8000 &
-#   bash inference/quick-test.sh gpt-oss-20b 8081
+#   kubectl port-forward svc/oai-infopt-vllm-gpt-oss-20b 8081:8000 -n oai-infopt &
+#   curl http://localhost:8081/health
 #
-# Switch to public:
-#   kubectl apply -f vllm/models/gpt-oss-20b/service/service-public.yaml
+# Switch to ALB Ingress for external HTTPS access:
+#   kubectl apply -f vllm/models/gpt-oss-20b/service/service-ingress.yaml
+#
+# Security fix (2026-09-03): moved from namespace 'default' to 'oai-infopt';
+#   selector corrected to match Deployment pod label.
+#   Fixes Checkov CKV_K8S_21.
 # ==============================================================================
 
 apiVersion: v1
 kind: Service
 metadata:
-  name: vllm-gpt-oss-20b
-  namespace: default
+  name: oai-infopt-vllm-gpt-oss-20b
+  namespace: oai-infopt
   labels:
-    app: vllm-gpt-oss-20b
+    app.kubernetes.io/name: oai-infopt-vllm-gpt-oss-20b
+    app.kubernetes.io/component: inference-server
+    app.kubernetes.io/managed-by: kubectl
+    project: observeai-inference-optimization
+    engagement: shellkode-sow
+    environment: sandbox
     model: gpt-oss-20b
 spec:
   type: ClusterIP
   selector:
-    app: vllm-gpt-oss-20b
+    app: oai-infopt-vllm-gpt-oss-20b
   ports:
     - name: http
       port: 8000

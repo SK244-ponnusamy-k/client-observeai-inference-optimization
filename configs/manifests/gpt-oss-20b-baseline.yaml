@@ -15,7 +15,8 @@ model:
   source: eks_gpu
 
 serving:
-  image: public.ecr.aws/deep-learning-containers/vllm:0.26.0-gpu-py312-cu130-ubuntu22.04-ec2-v1.0-soci
+  # Image digest pinned 2026-09-03 — linux/amd64, see config/config.env for re-pin one-liner.
+  image: public.ecr.aws/deep-learning-containers/vllm:0.26.0-gpu-py312-cu130-ubuntu22.04-ec2-v1.0-soci@sha256:e70d649d964dd0b568669453df523e764d23933987ea378d0f423cbe4ae56b81
   nodepool: gpu-inf
   instance_type: g6e.2xlarge
 

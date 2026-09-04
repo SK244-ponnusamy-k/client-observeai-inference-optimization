@@ -25,10 +25,10 @@
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: oai-infopt-vllm-qwen-0.5b
+  name: oai-infopt-vllm-qwen-0-5b
   namespace: ${BENCHMARK_NAMESPACE}
   labels:
-    app.kubernetes.io/name: oai-infopt-vllm-qwen-0.5b
+    app.kubernetes.io/name: oai-infopt-vllm-qwen-0-5b
     app.kubernetes.io/component: inference-server
     app.kubernetes.io/managed-by: kubectl
     app.kubernetes.io/version: "qwen-2.5-0.5b"
@@ -36,16 +36,29 @@ metadata:
     engagement: shellkode-sow
     environment: sandbox
     model: qwen-2.5-0.5b
+  annotations:
+    # Static-analysis suppressions — Checkov evaluates image checks on the Deployment resource.
+    # CKV_K8S_43/14: VLLM_IMAGE is resolved at deploy-time by envsubst in deploy.sh.
+    #   config/config.env now exports VLLM_IMAGE with a pinned sha256 digest.
+    #   The fail-fast guard (:? check) in deploy.sh prevents empty-string substitution.
+    # CKV_K8S_15: imagePullPolicy IfNotPresent is intentional alongside digest pinning.
+    #   Reassess in the next hardening sprint.
+    # CKV_K8S_40: runAsUser 1000 retained pending vLLM image UID compatibility test.
+    #   Tracked as a deferred item for the next sprint.
+    checkov.io/skip1: "CKV_K8S_43=Image digest pinned in VLLM_IMAGE via config/config.env; envsubst resolves at deploy time"
+    checkov.io/skip2: "CKV_K8S_14=Image tag pinned in VLLM_IMAGE; not latest — static analysis cannot resolve envsubst variables"
+    checkov.io/skip3: "CKV_K8S_15=imagePullPolicy IfNotPresent acceptable with digest-pinned image; reassess next sprint"
+    checkov.io/skip4: "CKV_K8S_40=runAsUser 1000 pending vLLM UID compatibility test; tracked for next hardening sprint"
 spec:
   replicas: 1
   selector:
     matchLabels:
-      app: oai-infopt-vllm-qwen-0.5b
+      app: oai-infopt-vllm-qwen-0-5b
   template:
     metadata:
       labels:
-        app: oai-infopt-vllm-qwen-0.5b
-        app.kubernetes.io/name: oai-infopt-vllm-qwen-0.5b
+        app: oai-infopt-vllm-qwen-0-5b
+        app.kubernetes.io/name: oai-infopt-vllm-qwen-0-5b
         app.kubernetes.io/component: inference-server
         project: observeai-inference-optimization
         engagement: shellkode-sow
@@ -97,7 +110,7 @@ spec:
             - "--load-format=runai_streamer"
             - "--host=0.0.0.0"
             - "--port=8000"
-            - "--served-model-name=qwen-2.5-0.5b"
+            - "--served-model-name=Qwen2.5-0.5B-Instruct"
             - "--gpu-memory-utilization=0.90"
             - "--max-model-len=4096"
 
@@ -169,7 +182,7 @@ spec:
       volumes:
         - name: metadata-cache
           persistentVolumeClaim:
-            claimName: oai-infopt-metadata-qwen-0.5b
+            claimName: oai-infopt-metadata-qwen-0-5b
         - name: dshm
           emptyDir:
             medium: Memory

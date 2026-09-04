@@ -16,8 +16,14 @@
 #   - automountServiceAccountToken: false           [CKV_K8S_43]
 #   - CPU + memory requests and limits set          [CKV_K8S_10, CKV_K8S_11]
 #   - No hostPath, hostPID, hostIPC, hostNetwork    [CKV_K8S_14-19]
-#   - HF_TOKEN sourced from k8s Secret (ESO-synced from Secrets Manager)
+#   - HF token mounted as Secret volume (NOT env var)  [CKV_K8S_35]
+#     Mounted read-only at /var/secrets/hf/token
+#     Secret created by ESO from AWS Secrets Manager (hf-token-external-secret.yaml)
 #   - /tmp writable emptyDir (pip + HF cache + ~13 GB model staging)
+#
+# Security fix (2026-09-03): HF_TOKEN moved from secretKeyRef env var to a
+#   read-only Secret volume mount. Env vars are visible in kubectl describe pod
+#   output and /proc/<pid>/environ; file mounts are not. Fixes CKV_K8S_35.
 # ==============================================================================
 
 apiVersion: batch/v1
@@ -66,7 +72,9 @@ spec:
 
       containers:
         - name: downloader
-          image: python:3.11-slim
+          # Image digest pinned 2026-09-03 — linux/amd64, resolves CKV_K8S_43.
+          # Re-pin: python -c "import urllib.request,json,ssl; ctx=ssl.create_default_context(); r=urllib.request.urlopen('https://auth.docker.io/token?service=registry.docker.io&scope=repository:library/python:pull',context=ctx); tok=json.loads(r.read())['token']; req=urllib.request.Request('https://registry-1.docker.io/v2/library/python/manifests/3.11-slim',headers={'Authorization':'Bearer '+tok,'Accept':'application/vnd.docker.distribution.manifest.list.v2+json'}); r2=urllib.request.urlopen(req,context=ctx); body=json.loads(r2.read()); [print(m['digest']) for m in body['manifests'] if m['platform']['os']=='linux' and m['platform']['architecture']=='amd64']"
+          image: python:3.11-slim@sha256:d1053354624536b044162aaab1e418bd000ea35184fb1ae098ab3166b1072e72
           imagePullPolicy: IfNotPresent
 
           command: ["/bin/bash", "-c"]
@@ -89,9 +97,13 @@ spec:
               python3 -c "
               import os
               from huggingface_hub import snapshot_download
-              token = os.environ.get('HF_TOKEN')
+              try:
+                  with open('/var/secrets/hf/token') as f:
+                      token = f.read().strip()
+              except FileNotFoundError:
+                  raise RuntimeError('HF token file not found at /var/secrets/hf/token — check ExternalSecret sync status')
               if not token:
-                  raise RuntimeError('HF_TOKEN not set — check ExternalSecret sync status')
+                  raise RuntimeError('HF token file is empty — check ExternalSecret sync status')
               snapshot_download(
                   repo_id='${MODEL_ID}',
                   local_dir='${LOCAL_DIR}',
@@ -139,13 +151,6 @@ spec:
               value: "/tmp/hf-home"
             - name: PIP_NO_CACHE_DIR
               value: "1"
-            # HF token from Secrets Manager via External Secrets Operator.
-            # Apply k8s/download/hf-token-external-secret.yaml first.
-            - name: HF_TOKEN
-              valueFrom:
-                secretKeyRef:
-                  name: hf-token      # synced by ExternalSecret from Secrets Manager
-                  key: token
 
           securityContext:
             allowPrivilegeEscalation: false
@@ -169,9 +174,21 @@ spec:
           volumeMounts:
             - name: tmp-workspace
               mountPath: /tmp
+            # HF token mounted read-only from Secret (ESO-synced from Secrets Manager).
+            # Avoids env-var exposure in kubectl describe / /proc/<pid>/environ.
+            # Fixes CKV_K8S_35.
+            - name: hf-token-vol
+              mountPath: /var/secrets/hf
+              readOnly: true
 
       volumes:
         # /tmp for pip, HF cache, and ~13 GB model staging before S3 upload
         - name: tmp-workspace
           emptyDir:
             sizeLimit: 30Gi
+        # HF token Secret volume (created by ExternalSecret from Secrets Manager)
+        # Apply k8s/download/hf-token-external-secret.yaml before running this Job.
+        - name: hf-token-vol
+          secret:
+            secretName: hf-token
+            defaultMode: 0440   # read-only for owner+group; no world read
