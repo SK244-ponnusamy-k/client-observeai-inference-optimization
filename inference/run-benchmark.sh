@@ -25,11 +25,13 @@ log_error() { echo -e "${RED}[ERROR] $(date +'%H:%M:%S')${NC} $1"; }
 # Defaults
 MODEL="gpt-oss-20b"
 PROFILE="realtime"
+DATASET_XLSX=""   # optional override; defaults to qa_eval_v1.xlsx
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --model)   MODEL="$2";   shift 2 ;;
         --profile) PROFILE="$2"; shift 2 ;;
+        --dataset) DATASET_XLSX="$2"; shift 2 ;;
         *) log_error "Unknown: $1"; exit 1 ;;
     esac
 done
@@ -85,10 +87,16 @@ kubectl create configmap "oai-infopt-benchmark-profile-${PROFILE}" \
     --from-file=profile.yaml="${FRAMEWORK_ROOT}/${PROFILE_FILE}" \
     -n "${BENCHMARK_NAMESPACE}" --dry-run=client -o yaml | kubectl apply -f - >/dev/null
 
-# Dataset — upload to S3 (ConfigMap limit is 3 MB; dataset exceeds that)
-DATASET_JSONL="${FRAMEWORK_ROOT}/configs/workload_profiles/datasets/qa_eval_v1.jsonl"
-DATASET_XLSX="${FRAMEWORK_ROOT}/configs/workload_profiles/datasets/qa_eval_v1.xlsx"
-DATASET_S3_KEY="datasets/qa_eval_v1.jsonl"
+# Dataset paths — use --dataset override if provided, else default
+if [[ -n "${DATASET_XLSX}" ]]; then
+    # User passed a custom dataset path
+    DATASET_JSONL="${DATASET_XLSX%.xlsx}.jsonl"
+    DATASET_S3_KEY="datasets/$(basename "${DATASET_JSONL}")"
+else
+    DATASET_XLSX="${FRAMEWORK_ROOT}/configs/workload_profiles/datasets/qa_eval_v1.xlsx"
+    DATASET_JSONL="${FRAMEWORK_ROOT}/configs/workload_profiles/datasets/qa_eval_v1.jsonl"
+    DATASET_S3_KEY="datasets/qa_eval_v1.jsonl"
+fi
 
 if [[ ! -f "${DATASET_JSONL}" && -f "${DATASET_XLSX}" ]]; then
     log_info "Exporting dataset from Excel..."

@@ -981,8 +981,153 @@
           }
         }
       },
-      "panel-30": {
+      "panel-60": {
         "kind": "Panel",
+        "spec": {
+          "data": {
+            "kind": "QueryGroup",
+            "spec": {
+              "queries": [
+                {
+                  "kind": "PanelQuery",
+                  "spec": {
+                    "hidden": false,
+                    "query": {
+                      "datasource": {
+                        "name": "${DS_PROMETHEUS}"
+                      },
+                      "group": "grafana-amazonprometheus-datasource",
+                      "kind": "DataQuery",
+                      "spec": {
+                        "expr": "count by (modelName) (DCGM_FI_DEV_GPU_UTIL)",
+                        "legendFormat": "{{modelName}}",
+                        "instant": true
+                      },
+                      "version": "v0"
+                    },
+                    "refId": "A"
+                  }
+                }
+              ],
+              "queryOptions": {},
+              "transformations": []
+            }
+          },
+          "description": "GPU model type detected by DCGM exporter from the running GPU node.",
+          "id": 60,
+          "links": [],
+          "title": "GPU Type",
+          "vizConfig": {
+            "group": "stat",
+            "kind": "VizConfig",
+            "spec": {
+              "fieldConfig": {
+                "defaults": {
+                  "color": {
+                    "fixedColor": "blue",
+                    "mode": "fixed"
+                  },
+                  "unit": "string",
+                  "noValue": "No GPU node active"
+                },
+                "overrides": []
+              },
+              "options": {
+                "colorMode": "background",
+                "graphMode": "none",
+                "justifyMode": "center",
+                "orientation": "auto",
+                "reduceOptions": {
+                  "calcs": ["lastNotNull"],
+                  "fields": "/^modelName$/",
+                  "values": false
+                },
+                "textMode": "name",
+                "wideLayout": true
+              }
+            },
+            "version": "13.2.0"
+          }
+        }
+      },
+      "panel-61": {
+        "kind": "Panel",
+        "spec": {
+          "data": {
+            "kind": "QueryGroup",
+            "spec": {
+              "queries": [
+                {
+                  "kind": "PanelQuery",
+                  "spec": {
+                    "hidden": false,
+                    "query": {
+                      "datasource": {
+                        "name": "${DS_PROMETHEUS}"
+                      },
+                      "group": "grafana-amazonprometheus-datasource",
+                      "kind": "DataQuery",
+                      "spec": {
+                        "expr": "max_over_time(DCGM_FI_DEV_GPU_UTIL[$__range])",
+                        "legendFormat": "Peak GPU {{gpu}}"
+                      },
+                      "version": "v0"
+                    },
+                    "refId": "A"
+                  }
+                }
+              ],
+              "queryOptions": {},
+              "transformations": []
+            }
+          },
+          "description": "Highest GPU utilization recorded over the selected time range. Persists after the run ends.",
+          "id": 61,
+          "links": [],
+          "title": "Peak GPU Utilization",
+          "vizConfig": {
+            "group": "stat",
+            "kind": "VizConfig",
+            "spec": {
+              "fieldConfig": {
+                "defaults": {
+                  "color": {
+                    "mode": "thresholds"
+                  },
+                  "thresholds": {
+                    "mode": "absolute",
+                    "steps": [
+                      { "color": "green", "value": 0 },
+                      { "color": "yellow", "value": 50 },
+                      { "color": "orange", "value": 70 },
+                      { "color": "red", "value": 90 }
+                    ]
+                  },
+                  "unit": "percent",
+                  "min": 0,
+                  "max": 100
+                },
+                "overrides": []
+              },
+              "options": {
+                "colorMode": "background",
+                "graphMode": "none",
+                "justifyMode": "center",
+                "orientation": "auto",
+                "reduceOptions": {
+                  "calcs": ["max"],
+                  "fields": "",
+                  "values": false
+                },
+                "textMode": "auto",
+                "wideLayout": true
+              }
+            },
+            "version": "13.2.0"
+          }
+        }
+      },
+      "panel-30": {        "kind": "Panel",
         "spec": {
           "data": {
             "kind": "QueryGroup",
@@ -1056,7 +1201,7 @@
                       "mode": "none"
                     },
                     "thresholdsStyle": {
-                      "mode": "off"
+                      "mode": "line"
                     }
                   },
                   "max": 100,
@@ -1069,8 +1214,12 @@
                         "value": 0
                       },
                       {
+                        "color": "yellow",
+                        "value": 85
+                      },
+                      {
                         "color": "red",
-                        "value": 80
+                        "value": 95
                       }
                     ]
                   },
@@ -2363,6 +2512,19 @@
                         "x": 20,
                         "y": 0
                       }
+                    },
+                    {
+                      "kind": "GridLayoutItem",
+                      "spec": {
+                        "element": {
+                          "kind": "ElementReference",
+                          "name": "panel-60"
+                        },
+                        "height": 4,
+                        "width": 8,
+                        "x": 0,
+                        "y": 4
+                      }
                     }
                   ]
                 }
@@ -2530,11 +2692,24 @@
                       "spec": {
                         "element": {
                           "kind": "ElementReference",
+                          "name": "panel-61"
+                        },
+                        "height": 4,
+                        "width": 8,
+                        "x": 8,
+                        "y": 0
+                      }
+                    },
+                    {
+                      "kind": "GridLayoutItem",
+                      "spec": {
+                        "element": {
+                          "kind": "ElementReference",
                           "name": "panel-31"
                         },
                         "height": 8,
                         "width": 8,
-                        "x": 8,
+                        "x": 16,
                         "y": 0
                       }
                     },
@@ -2547,8 +2722,8 @@
                         },
                         "height": 8,
                         "width": 8,
-                        "x": 16,
-                        "y": 0
+                        "x": 8,
+                        "y": 4
                       }
                     }
                   ]
@@ -2651,7 +2826,7 @@
       "inference"
     ],
     "timeSettings": {
-      "autoRefresh": "",
+      "autoRefresh": "30s",
       "autoRefreshIntervals": [
         "5s",
         "10s",
@@ -2665,7 +2840,7 @@
         "1d"
       ],
       "fiscalYearStartMonth": 0,
-      "from": "now-1h",
+      "from": "now-6h",
       "hideTimepicker": false,
       "timezone": "browser",
       "to": "now"

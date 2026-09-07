@@ -126,7 +126,7 @@ spec:
             # ── Memory ────────────────────────────────────────────────────────
             # 0.95 gives vLLM ~2.3 GB more KV cache vs 0.90 baseline.
             # Model weights use ~41.6 GB; remaining ~2 GB is KV cache blocks.
-            - "--gpu-memory-utilization=0.95"
+            - "--gpu-memory-utilization=0.80"
             # Aligned with manifest (was 4096 — mismatch fixed).
             # 8192 context supports full transcript inputs up to ~6k tokens.
             - "--max-model-len=8192"
