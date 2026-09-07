@@ -999,7 +999,7 @@
                       "group": "grafana-amazonprometheus-datasource",
                       "kind": "DataQuery",
                       "spec": {
-                        "expr": "count by (modelName) (DCGM_FI_DEV_GPU_UTIL)",
+                        "expr": "DCGM_FI_DEV_GPU_UTIL{exported_namespace=\"oai-infopt\"}",
                         "legendFormat": "{{modelName}}",
                         "instant": true
                       },
@@ -1013,7 +1013,7 @@
               "transformations": []
             }
           },
-          "description": "GPU model type detected by DCGM exporter from the running GPU node.",
+          "description": "GPU model type from DCGM exporter label.",
           "id": 60,
           "links": [],
           "title": "GPU Type",
@@ -1027,8 +1027,7 @@
                     "fixedColor": "blue",
                     "mode": "fixed"
                   },
-                  "unit": "string",
-                  "noValue": "No GPU node active"
+                  "noValue": "No GPU active"
                 },
                 "overrides": []
               },
@@ -1039,7 +1038,7 @@
                 "orientation": "auto",
                 "reduceOptions": {
                   "calcs": ["lastNotNull"],
-                  "fields": "/^modelName$/",
+                  "fields": "",
                   "values": false
                 },
                 "textMode": "name",
@@ -2572,47 +2571,6 @@
               "title": "vLLM - Latency"
             }
           },
-          {
-            "kind": "RowsLayoutRow",
-            "spec": {
-              "collapse": false,
-              "layout": {
-                "kind": "GridLayout",
-                "spec": {
-                  "items": [
-                    {
-                      "kind": "GridLayoutItem",
-                      "spec": {
-                        "element": {
-                          "kind": "ElementReference",
-                          "name": "panel-7"
-                        },
-                        "height": 8,
-                        "width": 8,
-                        "x": 0,
-                        "y": 0
-                      }
-                    },
-                    {
-                      "kind": "GridLayoutItem",
-                      "spec": {
-                        "element": {
-                          "kind": "ElementReference",
-                          "name": "panel-8"
-                        },
-                        "height": 8,
-                        "width": 16,
-                        "x": 8,
-                        "y": 0
-                      }
-                    }
-                  ]
-                }
-              },
-              "title": "vLLM - Quality & Accuracy"
-            }
-          },
-
           {
             "kind": "RowsLayoutRow",
             "spec": {

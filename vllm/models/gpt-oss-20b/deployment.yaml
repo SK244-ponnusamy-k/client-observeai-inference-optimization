@@ -65,6 +65,8 @@ metadata:
     checkov.io/skip4: "CKV_K8S_40=runAsUser 1000 pending vLLM UID compatibility test; tracked for next hardening sprint"
 spec:
   replicas: 1
+  strategy:
+    type: Recreate
   selector:
     matchLabels:
       app: oai-infopt-vllm-gpt-oss-20b

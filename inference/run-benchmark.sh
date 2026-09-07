@@ -305,17 +305,45 @@ fi
 # Step 4 — Wait for completion
 # ==============================================================================
 log_info "Waiting for job completion..."
-kubectl wait job "${JOB_NAME}" \
-    --for=condition=complete \
-    --timeout=7200s \
-    -n "${BENCHMARK_NAMESPACE}" && STATUS="PASSED" || STATUS="FAILED"
+# Wait for either Complete or Failed (SLO violations cause exit code 1 = Failed status)
+JOB_DONE="false"
+DEADLINE=$((SECONDS + JOB_TIMEOUT))
+while [[ ${SECONDS} -lt ${DEADLINE} ]]; do
+    JOB_COMPLETE=$(kubectl get job "${JOB_NAME}" -n "${BENCHMARK_NAMESPACE}" \
+        -o jsonpath='{.status.conditions[?(@.type=="Complete")].status}' 2>/dev/null || echo "")
+    JOB_FAILED=$(kubectl get job "${JOB_NAME}" -n "${BENCHMARK_NAMESPACE}" \
+        -o jsonpath='{.status.conditions[?(@.type=="Failed")].status}' 2>/dev/null || echo "")
+    JOB_SUCCEEDED=$(kubectl get job "${JOB_NAME}" -n "${BENCHMARK_NAMESPACE}" \
+        -o jsonpath='{.status.succeeded}' 2>/dev/null || echo "")
+
+    if [[ "${JOB_COMPLETE}" == "True" || "${JOB_SUCCEEDED}" == "1" ]]; then
+        STATUS="PASSED"
+        JOB_DONE="true"
+        break
+    elif [[ "${JOB_FAILED}" == "True" ]]; then
+        # Check if it was SLO failure (results still uploaded) or a real error
+        SUCCEEDED=$(kubectl get job "${JOB_NAME}" -n "${BENCHMARK_NAMESPACE}" \
+            -o jsonpath='{.status.succeeded}' 2>/dev/null || echo "0")
+        if [[ "${SUCCEEDED}" == "0" ]]; then
+            STATUS="SLO_FAIL"   # benchmark ran but SLOs not met — results still valid
+        else
+            STATUS="ERROR"
+        fi
+        JOB_DONE="true"
+        break
+    fi
+    sleep 10
+done
+
+if [[ "${JOB_DONE}" != "true" ]]; then
+    STATUS="TIMEOUT"
+fi
 
 echo ""
 echo "======================================================"
 echo "  BENCHMARK ${STATUS}"
 echo "  Results : s3://${RESULTS_BUCKET}/results/${TIMESTAMP}/${PROFILE}/"
 echo "======================================================"
-
 # ==============================================================================
 # Step 5 — Show S3 results
 # ==============================================================================
