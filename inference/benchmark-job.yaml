@@ -50,6 +50,7 @@ data:
   WAIT_TIMEOUT: "300"
   AWS_DEFAULT_REGION: "us-east-2"
   RESULTS_BUCKET: "shellkode-ai-results"
+  RESULTS_BUCKET: "shellkode-ai-results"
   # ─────────────────────────────────────────────────────────────────────────────
 
 ---
@@ -187,18 +188,21 @@ spec:
             - name: profile-volume
               mountPath: /configs/profiles
               readOnly: true
+            - name: dataset-volume
+              mountPath: /configs/profiles/datasets
+              readOnly: true
             - name: results
               mountPath: /results
             - name: tmp
               mountPath: /tmp
 
       volumes:
-        # load-test.py script (mounted from a ConfigMap or init container)
+        # load-test.py script
         - name: app-code
           configMap:
             name: oai-infopt-benchmark-script
-            optional: true   # falls back to image-bundled script if not present
-        # Manifest + profile ConfigMaps (created alongside this Job)
+            optional: true
+        # Manifest + profile + dataset ConfigMaps
         - name: manifest-volume
           configMap:
             name: oai-infopt-benchmark-manifest
@@ -207,7 +211,11 @@ spec:
           configMap:
             name: oai-infopt-benchmark-profile
             optional: true
-        # Results written here; upload to S3 after job completes
+        - name: dataset-volume
+          configMap:
+            name: oai-infopt-benchmark-dataset
+            optional: true
+        # Results written here; uploaded to S3 after job completes
         - name: results
           emptyDir:
             sizeLimit: 1Gi

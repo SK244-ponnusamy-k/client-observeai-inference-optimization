@@ -202,7 +202,7 @@
           "description": "",
           "id": 10,
           "links": [],
-          "title": "Time to First Token (TTFT) — p50 / p95 / p99",
+          "title": "Time to First Token (TTFT) - p50 / p95 / p99",
           "vizConfig": {
             "group": "timeseries",
             "kind": "VizConfig",
@@ -353,7 +353,7 @@
           "description": "",
           "id": 11,
           "links": [],
-          "title": "Inter-Token Latency (ITL) — p50 / p95 / p99",
+          "title": "Inter-Token Latency (ITL) - p50 / p95 / p99",
           "vizConfig": {
             "group": "timeseries",
             "kind": "VizConfig",
@@ -2080,7 +2080,199 @@
             "version": "13.2.0"
           }
         }
+      },
+      "panel-7": {
+        "kind": "Panel",
+        "spec": {
+          "data": {
+            "kind": "QueryGroup",
+            "spec": {
+              "queries": [
+                {
+                  "kind": "PanelQuery",
+                  "spec": {
+                    "hidden": false,
+                    "query": {
+                      "datasource": {
+                        "name": "${DS_PROMETHEUS}"
+                      },
+                      "group": "grafana-amazonprometheus-datasource",
+                      "kind": "DataQuery",
+                      "spec": {
+                        "expr": "llm_benchmark_accuracy_pct{namespace=\"oai-infopt\",model_name=~\"$model\"}",
+                        "legendFormat": "{{model_name}} c={{concurrency}} ({{profile}})"
+                      },
+                      "version": "v0"
+                    },
+                    "refId": "A"
+                  }
+                }
+              ],
+              "queryOptions": {},
+              "transformations": []
+            }
+          },
+          "description": "Model evaluation output accuracy percentage based on ground-truth comparison (SLO >= 90%).",
+          "id": 7,
+          "links": [],
+          "title": "Model Output Accuracy (SLO ≥ 80%)",
+          "vizConfig": {
+            "group": "stat",
+            "kind": "VizConfig",
+            "spec": {
+              "fieldConfig": {
+                "defaults": {
+                  "color": {
+                    "mode": "thresholds"
+                  },
+                  "thresholds": {
+                    "mode": "absolute",
+                    "steps": [
+                      {
+                        "color": "red",
+                        "value": 0
+                      },
+                      {
+                        "color": "yellow",
+                        "value": 60
+                      },
+                      {
+                        "color": "green",
+                        "value": 80
+                      }
+                    ]
+                  },
+                  "unit": "percent"
+                },
+                "overrides": []
+              },
+              "options": {
+                "colorMode": "background",
+                "graphMode": "area",
+                "justifyMode": "auto",
+                "orientation": "auto",
+                "percentChangeColorMode": "standard",
+                "reduceOptions": {
+                  "calcs": [
+                    "lastNotNull"
+                  ],
+                  "fields": "",
+                  "values": false
+                },
+                "showPercentChange": false,
+                "textMode": "auto",
+                "wideLayout": true
+              }
+            },
+            "version": "13.2.0"
+          }
+        }
+      },
+      "panel-8": {
+        "kind": "Panel",
+        "spec": {
+          "data": {
+            "kind": "QueryGroup",
+            "spec": {
+              "queries": [
+                {
+                  "kind": "PanelQuery",
+                  "spec": {
+                    "hidden": false,
+                    "query": {
+                      "datasource": {
+                        "name": "${DS_PROMETHEUS}"
+                      },
+                      "group": "grafana-amazonprometheus-datasource",
+                      "kind": "DataQuery",
+                      "spec": {
+                        "expr": "llm_benchmark_accuracy_pct{namespace=\"oai-infopt\",model_name=~\"$model\"}",
+                        "legendFormat": "{{model_name}} accuracy %"
+                      },
+                      "version": "v0"
+                    },
+                    "refId": "A"
+                  }
+                }
+              ],
+              "queryOptions": {},
+              "transformations": []
+            }
+          },
+          "description": "Output quality and ground-truth evaluation accuracy over time.",
+          "id": 8,
+          "links": [],
+          "title": "Model Quality & Accuracy Over Time (SLO ≥ 80%)",
+          "vizConfig": {
+            "group": "timeseries",
+            "kind": "VizConfig",
+            "spec": {
+              "fieldConfig": {
+                "defaults": {
+                  "color": {
+                    "mode": "palette-classic"
+                  },
+                  "custom": {
+                    "axisBorderShow": false,
+                    "axisCenteredZero": false,
+                    "axisColorMode": "text",
+                    "axisLabel": "Accuracy %",
+                    "axisPlacement": "auto",
+                    "barAlignment": 0,
+                    "drawStyle": "line",
+                    "fillOpacity": 10,
+                    "gradientMode": "none",
+                    "hideFrom": {
+                      "legend": false,
+                      "tooltip": false,
+                      "viz": false
+                    },
+                    "insertNulls": false,
+                    "lineInterpolation": "smooth",
+                    "lineWidth": 2,
+                    "pointSize": 5,
+                    "scaleDistribution": {
+                      "type": "linear"
+                    },
+                    "showPoints": "auto",
+                    "spanNulls": false
+                  },
+                  "thresholds": {
+                    "mode": "absolute",
+                    "steps": [
+                      {
+                        "color": "green",
+                        "value": 0
+                      },
+                      {
+                        "color": "red",
+                        "value": 90
+                      }
+                    ]
+                  },
+                  "unit": "percent"
+                },
+                "overrides": []
+              },
+              "options": {
+                "legend": {
+                  "calcs": [],
+                  "displayMode": "list",
+                  "placement": "bottom",
+                  "showLegend": true
+                },
+                "tooltip": {
+                  "hideZeros": false,
+                  "mode": "multi",
+                  "sort": "none"
+                }
+              }
+            },
+            "version": "13.2.0"
+          }
+        }
       }
+
     },
     "layout": {
       "kind": "RowsLayout",
@@ -2215,9 +2407,50 @@
                   ]
                 }
               },
-              "title": "vLLM — Latency"
+              "title": "vLLM - Latency"
             }
           },
+          {
+            "kind": "RowsLayoutRow",
+            "spec": {
+              "collapse": false,
+              "layout": {
+                "kind": "GridLayout",
+                "spec": {
+                  "items": [
+                    {
+                      "kind": "GridLayoutItem",
+                      "spec": {
+                        "element": {
+                          "kind": "ElementReference",
+                          "name": "panel-7"
+                        },
+                        "height": 8,
+                        "width": 8,
+                        "x": 0,
+                        "y": 0
+                      }
+                    },
+                    {
+                      "kind": "GridLayoutItem",
+                      "spec": {
+                        "element": {
+                          "kind": "ElementReference",
+                          "name": "panel-8"
+                        },
+                        "height": 8,
+                        "width": 16,
+                        "x": 8,
+                        "y": 0
+                      }
+                    }
+                  ]
+                }
+              },
+              "title": "vLLM - Quality & Accuracy"
+            }
+          },
+
           {
             "kind": "RowsLayoutRow",
             "spec": {
@@ -2268,7 +2501,7 @@
                   ]
                 }
               },
-              "title": "vLLM — Throughput & Queue"
+              "title": "vLLM - Throughput & Queue"
             }
           },
           {
@@ -2321,7 +2554,7 @@
                   ]
                 }
               },
-              "title": "GPU — Utilization & Memory"
+              "title": "GPU - Utilization & Memory"
             }
           },
           {
@@ -2361,7 +2594,7 @@
                   ]
                 }
               },
-              "title": "GPU — Power & Temperature"
+              "title": "GPU - Power & Temperature"
             }
           },
           {
@@ -2401,7 +2634,7 @@
                   ]
                 }
               },
-              "title": "Cluster — Nodes & Pods"
+              "title": "Cluster - Nodes & Pods"
             }
           }
         ]
@@ -2437,7 +2670,7 @@
       "timezone": "browser",
       "to": "now"
     },
-    "title": "vLLM + GPU Overview — observeai-inference-optimization",
+    "title": "vLLM + GPU Overview - observeai-inference-optimization",
     "variables": [
       {
         "kind": "QueryVariable",

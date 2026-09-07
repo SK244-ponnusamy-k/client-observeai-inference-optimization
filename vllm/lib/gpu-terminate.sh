@@ -150,6 +150,7 @@ for item in data.get('items', []):
         echo "${gpu_nodeclaims}" | while read -r nc; do
             _log_info "  Deleting nodeclaim: ${nc}"
             kubectl delete nodeclaim "${nc}" --ignore-not-found=true 2>/dev/null || true
+            kubectl patch nodeclaim "${nc}" -p '{"metadata":{"finalizers":null}}' --type=merge 2>/dev/null || true
         done
     else
         _log_warn "  No GPU nodeclaims found by instance type — trying labels..."
@@ -164,6 +165,8 @@ for item in data.get('items', []):
             _log_info "  Deleting ${count} nodeclaim(s) in nodepool: ${pool}"
             kubectl delete nodeclaims -l "karpenter.sh/nodepool=${pool}" \
                 --ignore-not-found=true 2>/dev/null || true
+            kubectl get nodeclaims -l "karpenter.sh/nodepool=${pool}" -o jsonpath='{.items[*].metadata.name}' 2>/dev/null | \
+                xargs -r -n1 -I{} kubectl patch nodeclaim {} -p '{"metadata":{"finalizers":null}}' --type=merge 2>/dev/null || true
         fi
     done
 

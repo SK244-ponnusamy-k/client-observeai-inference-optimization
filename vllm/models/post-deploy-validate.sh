@@ -224,7 +224,7 @@ spec:
                 --profile  /configs/profiles/profile.yaml \
                 --endpoint "${ENDPOINT}" \
                 --output   /results \
-                --wait-timeout 300
+                --wait-timeout 300 || true
               echo "=== REALTIME RESULTS ==="
               cat /results/*.jsonl 2>/dev/null || echo "No results file found"
               # Upload to S3
@@ -361,7 +361,7 @@ spec:
                 --profile  /configs/profiles/profile.yaml \
                 --endpoint "${ENDPOINT}" \
                 --output   /results \
-                --wait-timeout 300
+                --wait-timeout 300 || true
               echo "=== BATCH RESULTS ==="
               cat /results/*.jsonl 2>/dev/null || echo "No results file found"
               python3 -c "

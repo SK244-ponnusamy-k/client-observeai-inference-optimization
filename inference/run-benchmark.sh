@@ -6,12 +6,11 @@
 #
 # Usage:
 #   cd llm-inference-framework
-#   bash inference/run-benchmark.sh                          # defaults to gpt-oss-20b realtime
+#   bash inference/run-benchmark.sh                          # gpt-oss-20b realtime (default)
 #   bash inference/run-benchmark.sh --model qwen-0.5b
 #   bash inference/run-benchmark.sh --model gpt-oss-20b --profile batch
 #   bash inference/run-benchmark.sh --model gpt-oss-20b --profile realtime
 # ==============================================================================
-
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -57,17 +56,21 @@ TIMESTAMP=$(date +%Y%m%d-%H%M%S)
 JOB_NAME="oai-infopt-bench-${MODEL//\./-}-${PROFILE}-${TIMESTAMP}"
 
 echo ""
-echo "══════════════════════════════════════════════════"
+echo "======================================================"
 echo "  BENCHMARK JOB"
 echo "  Model   : ${MODEL}"
 echo "  Profile : ${PROFILE}"
 echo "  Endpoint: ${ENDPOINT}"
 echo "  Job     : ${JOB_NAME}"
 echo "  Results : s3://${RESULTS_BUCKET}/results/${TIMESTAMP}/"
-echo "══════════════════════════════════════════════════"
+echo "======================================================"
 echo ""
 
-# Step 1 — Create ConfigMaps
+cd "${FRAMEWORK_ROOT}"
+
+# ==============================================================================
+# Step 1 — Create / update ConfigMaps
+# ==============================================================================
 log_info "Creating ConfigMaps..."
 
 kubectl create configmap oai-infopt-benchmark-script \
@@ -82,9 +85,46 @@ kubectl create configmap "oai-infopt-benchmark-profile-${PROFILE}" \
     --from-file=profile.yaml="${FRAMEWORK_ROOT}/${PROFILE_FILE}" \
     -n "${BENCHMARK_NAMESPACE}" --dry-run=client -o yaml | kubectl apply -f - >/dev/null
 
+# Dataset — upload to S3 (ConfigMap limit is 3 MB; dataset exceeds that)
+DATASET_JSONL="${FRAMEWORK_ROOT}/configs/workload_profiles/datasets/qa_eval_v1.jsonl"
+DATASET_XLSX="${FRAMEWORK_ROOT}/configs/workload_profiles/datasets/qa_eval_v1.xlsx"
+DATASET_S3_KEY="datasets/qa_eval_v1.jsonl"
+
+if [[ ! -f "${DATASET_JSONL}" && -f "${DATASET_XLSX}" ]]; then
+    log_info "Exporting dataset from Excel..."
+    # cygpath converts /c/Users/... → C:\Users\... for Windows Python
+    WIN_XLSX=$(cygpath -w "${DATASET_XLSX}" 2>/dev/null || echo "${DATASET_XLSX}")
+    python "${FRAMEWORK_ROOT}/inference/validate_dataset.py" "${WIN_XLSX}" --export-jsonl
+fi
+if [[ -f "${DATASET_JSONL}" ]]; then
+    # Pure bash file size — avoids Git Bash MINGW path issues with python -c
+    DATASET_SIZE_BYTES=$(wc -c < "${DATASET_JSONL}")
+    DATASET_SIZE_MB=$(awk "BEGIN {printf \"%.1f\", ${DATASET_SIZE_BYTES}/1024/1024}")
+    # Only upload if file doesn't exist in S3 or checksum differs
+    LOCAL_MD5=$(md5sum "${DATASET_JSONL}" | awk '{print $1}')
+    REMOTE_ETAG=$(aws s3api head-object \
+        --bucket "${RESULTS_BUCKET}" \
+        --key "${DATASET_S3_KEY}" \
+        --region "${AWS_REGION}" \
+        --query 'ETag' --output text 2>/dev/null | tr -d '"' || echo "")
+    if [[ "${LOCAL_MD5}" == "${REMOTE_ETAG}" ]]; then
+        log_info "Dataset already up to date in S3 — skipping upload."
+    else
+        log_info "Uploading dataset (${DATASET_SIZE_MB} MB) to s3://${RESULTS_BUCKET}/${DATASET_S3_KEY} ..."
+        aws s3 cp "${DATASET_JSONL}" "s3://${RESULTS_BUCKET}/${DATASET_S3_KEY}" \
+            --region "${AWS_REGION}"
+        log_info "Dataset uploaded."
+    fi
+else
+    log_warn "Dataset JSONL not found — benchmark will use built-in fallback prompts."
+    DATASET_S3_KEY=""
+fi
+
 log_info "ConfigMaps ready."
 
+# ==============================================================================
 # Step 2 — Submit Job
+# ==============================================================================
 log_info "Submitting benchmark Job: ${JOB_NAME}..."
 
 cat <<EOF | kubectl apply -f -
@@ -105,6 +145,7 @@ spec:
   template:
     metadata:
       labels:
+        app.kubernetes.io/name: ${JOB_NAME}
         app.kubernetes.io/component: benchmark-runner
         project: observeai-inference-optimization
     spec:
@@ -142,18 +183,34 @@ spec:
                 "openai==1.57.0" \
                 pyyaml==6.0.1 \
                 boto3==1.34.0 \
-                "aiohttp==3.10.0"
+                "aiohttp==3.10.0" \
+                openpyxl==3.1.2
               export PYTHONPATH=/tmp/pip-packages
+
+              # Download dataset from S3 if a key was provided
+              DATASET_S3_KEY="${DATASET_S3_KEY}"
+              if [[ -n "\${DATASET_S3_KEY}" ]]; then
+                  echo "Downloading dataset from s3://${RESULTS_BUCKET}/\${DATASET_S3_KEY} ..."
+                  mkdir -p /tmp/datasets
+                  python -c "
+              import boto3, sys
+              sys.path.insert(0, '/tmp/pip-packages')
+              boto3.client('s3', region_name='${AWS_REGION}').download_file(
+                  '${RESULTS_BUCKET}', '\${DATASET_S3_KEY}', '/tmp/datasets/qa_eval_v1.jsonl')
+              print('Dataset downloaded: /tmp/datasets/qa_eval_v1.jsonl')
+              "
+              fi
               TEST_EXIT=0
-              python3 /app/load-test.py \
+              python /app/load-test.py \
                 --manifest /configs/manifests/manifest.yaml \
                 --profile  /configs/profiles/profile.yaml \
                 --endpoint "${ENDPOINT}" \
                 --output   /results \
                 --wait-timeout 300 || TEST_EXIT=\$?
               echo "=== Uploading results to S3 ==="
-              python3 -c "
-              import boto3, os, glob
+              python -c "
+              import boto3, os, glob, sys
+              sys.path.insert(0, '/tmp/pip-packages')
               s3 = boto3.client('s3', region_name='${AWS_REGION}')
               for f in glob.glob('/results/*.jsonl'):
                   key = 'results/${TIMESTAMP}/${PROFILE}/' + os.path.basename(f)
@@ -215,7 +272,9 @@ EOF
 
 log_info "Job submitted."
 
+# ==============================================================================
 # Step 3 — Wait for pod and stream logs
+# ==============================================================================
 log_info "Waiting for pod to start..."
 for i in $(seq 1 30); do
     POD=$(kubectl get pods -l "job-name=${JOB_NAME}" \
@@ -229,11 +288,14 @@ echo ""
 log_info "Pod: ${POD:-not found}"
 
 if [[ -n "${POD:-}" ]]; then
-    log_info "Streaming logs..."
+    log_info "Streaming logs (Ctrl+C detaches — job keeps running in cluster)..."
+    echo ""
     kubectl logs "${POD}" -n "${BENCHMARK_NAMESPACE}" -f 2>/dev/null || true
 fi
 
+# ==============================================================================
 # Step 4 — Wait for completion
+# ==============================================================================
 log_info "Waiting for job completion..."
 kubectl wait job "${JOB_NAME}" \
     --for=condition=complete \
@@ -241,15 +303,22 @@ kubectl wait job "${JOB_NAME}" \
     -n "${BENCHMARK_NAMESPACE}" && STATUS="PASSED" || STATUS="FAILED"
 
 echo ""
-echo "══════════════════════════════════════════════════"
+echo "======================================================"
 echo "  BENCHMARK ${STATUS}"
-echo "  Results: s3://${RESULTS_BUCKET}/results/${TIMESTAMP}/${PROFILE}/"
-echo "══════════════════════════════════════════════════"
+echo "  Results : s3://${RESULTS_BUCKET}/results/${TIMESTAMP}/${PROFILE}/"
+echo "======================================================"
 
+# ==============================================================================
 # Step 5 — Show S3 results
+# ==============================================================================
 log_info "S3 results:"
 aws s3 ls "s3://${RESULTS_BUCKET}/results/${TIMESTAMP}/" \
     --recursive --human-readable --region "${AWS_REGION}" 2>/dev/null || \
-    log_warn "No results found in S3 yet"
+    log_warn "No results found in S3 yet — may still be uploading"
+
+echo ""
+echo "  Grafana  : kubectl port-forward svc/kube-prometheus-stack-grafana 3000:80 -n monitoring"
+echo "  Download : aws s3 cp s3://${RESULTS_BUCKET}/results/${TIMESTAMP}/ results/ --recursive --region ${AWS_REGION}"
+echo ""
 
 [[ "${STATUS}" == "PASSED" ]] || exit 1

@@ -89,9 +89,11 @@ SLO = {
     "realtime": {
         "ttft_p95_ms": 500,
         "itl_p95_ms": 50,
+        "accuracy_min_pct": 90.0,
     },
     "batch": {
         "throughput_tokens_per_s": 500,
+        "accuracy_min_pct": 90.0,
     },
 }
 
@@ -246,13 +248,8 @@ def collect_gpu_metrics() -> dict[str, Any]:
     }
 
 
-# ---------------------------------------------------------------------------
-# vLLM metrics
-# ---------------------------------------------------------------------------
-
 def collect_vllm_metrics() -> dict[str, Any]:
     log.info("Collecting vLLM metrics...")
-
     window = f"{WINDOW_MINUTES}m"
 
     # Running / waiting requests per model
@@ -265,16 +262,16 @@ def collect_vllm_metrics() -> dict[str, Any]:
         "model_name",
     )
 
-    # Throughput: rate of tokens generated over the window
+    # Prompt / generation token throughput per model
     prompt_tps_by_model = scalar_by_label(
         query_instant(
-            f'rate(vllm:prompt_tokens_total{{namespace="oai-infopt"}}[{window}])'
+            f'sum by (model_name) (rate(vllm:prompt_tokens_total{{namespace="oai-infopt"}}[{window}]))'
         ),
         "model_name",
     )
     gen_tps_by_model = scalar_by_label(
         query_instant(
-            f'rate(vllm:generation_tokens_total{{namespace="oai-infopt"}}[{window}])'
+            f'sum by (model_name) (rate(vllm:generation_tokens_total{{namespace="oai-infopt"}}[{window}]))'
         ),
         "model_name",
     )
@@ -325,6 +322,12 @@ def collect_vllm_metrics() -> dict[str, Any]:
         "model_name",
     )
 
+    # Benchmark accuracy metric (if present in AMP / Prometheus)
+    accuracy_by_model = scalar_by_label(
+        query_instant('llm_benchmark_accuracy_pct{namespace="oai-infopt"} or vector(0)'),
+        "model_name",
+    )
+
     # Build per-model report
     all_models = set(running_by_model.keys()) | set(prompt_tps_by_model.keys())
     per_model = []
@@ -333,6 +336,7 @@ def collect_vllm_metrics() -> dict[str, Any]:
         gen_tps = round(gen_tps_by_model.get(model, 0.0), 2)
         ttft_p95_ms = round(ttft_p95.get(model, 0.0), 2)
         itl_p95_ms = round(itl_p95.get(model, 0.0), 2)
+        acc_pct = round(accuracy_by_model.get(model, 100.0), 1)
 
         per_model.append({
             "model": model,
@@ -341,6 +345,7 @@ def collect_vllm_metrics() -> dict[str, Any]:
             "prompt_tokens_per_s": prompt_tps,
             "generation_tokens_per_s": gen_tps,
             "total_tokens_per_s": round(prompt_tps + gen_tps, 2),
+            "accuracy_avg_pct": acc_pct,
             "ttft_ms": {
                 "p50": round(ttft_p50.get(model, 0.0), 2),
                 "p95": ttft_p95_ms,
@@ -419,14 +424,17 @@ def evaluate_slos(vllm: dict[str, Any]) -> dict[str, Any]:
         ttft_p95 = m["ttft_ms"]["p95"]
         itl_p95  = m["itl_ms"]["p95"]
         tps      = m["total_tokens_per_s"]
+        accuracy = m.get("accuracy_avg_pct", 100.0)
 
         realtime_pass = (
             ttft_p95 <= SLO["realtime"]["ttft_p95_ms"] and
-            itl_p95  <= SLO["realtime"]["itl_p95_ms"]
+            itl_p95  <= SLO["realtime"]["itl_p95_ms"] and
+            accuracy >= SLO["realtime"]["accuracy_min_pct"]
         ) if ttft_p95 > 0 else None  # None = no data
 
         batch_pass = (
-            tps >= SLO["batch"]["throughput_tokens_per_s"]
+            tps >= SLO["batch"]["throughput_tokens_per_s"] and
+            accuracy >= SLO["batch"]["accuracy_min_pct"]
         ) if tps > 0 else None
 
         results.append({
@@ -437,11 +445,15 @@ def evaluate_slos(vllm: dict[str, Any]) -> dict[str, Any]:
                 "ttft_target_ms": SLO["realtime"]["ttft_p95_ms"],
                 "itl_p95_ms": itl_p95,
                 "itl_target_ms": SLO["realtime"]["itl_p95_ms"],
+                "accuracy_pct": accuracy,
+                "accuracy_target": SLO["realtime"]["accuracy_min_pct"],
             },
             "batch_slo": {
                 "pass": batch_pass,
                 "throughput_tokens_per_s": tps,
                 "throughput_target": SLO["batch"]["throughput_tokens_per_s"],
+                "accuracy_pct": accuracy,
+                "accuracy_target": SLO["batch"]["accuracy_min_pct"],
             },
         })
 

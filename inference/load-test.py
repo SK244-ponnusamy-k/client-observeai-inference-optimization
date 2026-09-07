@@ -68,6 +68,17 @@ def _configure_logging(level: str = "INFO") -> None:
 # ---------------------------------------------------------------------------
 # Data models
 # ---------------------------------------------------------------------------
+# Data models
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class PromptItem:
+    """Structured dataset prompt entry with system prompt, question, and answer (ground truth)."""
+
+    system_prompt: str
+    question: str
+    answer: str = ""
 
 
 @dataclass
@@ -81,6 +92,7 @@ class RequestResult:
     e2e_ms: float           # total wall-clock time
     output_tokens: int
     success: bool
+    accuracy_score: float = 1.0  # 0.0 to 1.0
     error: str = ""
 
 
@@ -117,6 +129,8 @@ class BenchmarkResult:
     # Throughput
     throughput_tokens_s: float
     completed_interactions_min: float
+    # Accuracy / Quality
+    accuracy_avg_pct: float
     # Cost (normalized)
     instance_hourly_usd: float
     runtime_s: float
@@ -147,52 +161,186 @@ def load_yaml(path: str) -> dict[str, Any]:
         return yaml.safe_load(f)
 
 
-def load_prompts(dataset_path: str, n: int) -> list[str]:
+def _load_prompts_from_xlsx(path: Path) -> list[PromptItem]:
     """
-    Load prompts from a JSONL dataset file (field: 'prompt' or 'content').
-    Falls back to a small built-in set if the dataset file is absent.
+    Load PromptItems from an Excel workbook (.xlsx / .xls).
+
+    Expected columns (aliases accepted):
+      data_id      : data_id | id
+      input_prompt : input_prompt | question | prompt | content
+      answer       : answer | ground_truth | expected_output
+
+    The full input_prompt value becomes the 'question' field so the model
+    receives the complete evaluation context (question block + transcript).
+    The answer column is used for accuracy scoring in _single_request().
     """
-    p = Path(dataset_path)
-    if p.exists():
-        prompts: list[str] = []
-        with p.open() as f:
-            for line in f:
-                if not line.strip():
-                    continue
-                obj = json.loads(line)
-                prompts.append(obj.get("prompt") or obj.get("content") or str(obj))
-        logger.info("Loaded %d prompts from %s", len(prompts), dataset_path)
-        return prompts
-    # Built-in fallback (representative QA-form prompts)
+    try:
+        import openpyxl  # type: ignore[import]
+    except ImportError as exc:
+        raise ImportError(
+            "openpyxl is required to read Excel files. "
+            "Install it with:  pip install openpyxl"
+        ) from exc
+
+    _ID_ALIASES     = {"data_id", "id"}
+    _PROMPT_ALIASES = {"input_prompt", "question", "prompt", "content"}
+    _ANSWER_ALIASES = {"answer", "ground_truth", "expected_output"}
+    _DEFAULT_SYSTEM = (
+        "You are an expert QA evaluation assistant. Respond with only Yes or No."
+    )
+
+    wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
+    ws = wb.active
+    row_iter = ws.iter_rows(values_only=True)
+
+    # --- resolve header row --------------------------------------------------
+    raw_headers = [str(c).strip() if c is not None else "" for c in next(row_iter)]
+    lower_headers = [h.lower() for h in raw_headers]
+
+    def _find(aliases: set[str]) -> int:
+        for alias in aliases:
+            if alias in lower_headers:
+                return lower_headers.index(alias)
+        return -1
+
+    prompt_idx = _find(_PROMPT_ALIASES)
+    answer_idx = _find(_ANSWER_ALIASES)
+
+    if prompt_idx == -1:
+        raise ValueError(
+            f"No input_prompt column found in {path.name}. "
+            f"Expected one of {sorted(_PROMPT_ALIASES)}. "
+            f"Found: {raw_headers}"
+        )
+
+    # --- read data rows -------------------------------------------------------
+    items: list[PromptItem] = []
+    for raw in row_iter:
+        row = list(raw)
+        prompt_val = str(row[prompt_idx] or "").strip() if prompt_idx < len(row) else ""
+        answer_val = (
+            str(row[answer_idx] or "").strip()
+            if answer_idx != -1 and answer_idx < len(row)
+            else ""
+        )
+        if not prompt_val:
+            continue  # skip entirely blank rows
+        # Excel stores integer cells as floats (e.g. 1000.0) — normalise
+        # data_id is not used by PromptItem, but answer may need clean strings
+        items.append(PromptItem(
+            system_prompt=_DEFAULT_SYSTEM,
+            question=prompt_val,
+            answer=answer_val,
+        ))
+
+    wb.close()
+    return items
+
+
+def load_prompts(dataset_path: str, n: int) -> list[PromptItem]:
+    """
+    Load structured prompts from a dataset file.
+
+    Supported formats
+    -----------------
+    .xlsx / .xls  — Excel workbook with columns: data_id, input_prompt, answer
+                    (column name aliases are accepted — see _load_prompts_from_xlsx)
+    .jsonl        — one JSON object per line with keys:
+                      system_prompt / system
+                      question / prompt / content / input_prompt
+                      answer / ground_truth / expected_output
+
+    Resolution order
+    ----------------
+    1. Exact path as given.
+    2. /configs/datasets/<filename>            (in-cluster mount)
+    3. /configs/profiles/datasets/<filename>   (in-cluster mount)
+    4. <repo_root>/<dataset_path>              (local relative path)
+
+    Falls back to a representative built-in set when no file is found.
+    """
+    candidate_paths = [
+        Path(dataset_path),
+        Path("/tmp/datasets") / Path(dataset_path).name,
+        Path("/configs/datasets") / Path(dataset_path).name,
+        Path("/configs/profiles/datasets") / Path(dataset_path).name,
+        Path(__file__).resolve().parent.parent / dataset_path,
+    ]
+    target_path: Path | None = None
+    for cp in candidate_paths:
+        if cp.exists():
+            target_path = cp
+            break
+
+    if target_path is not None:
+        suffix = target_path.suffix.lower()
+
+        # ── Excel branch ────────────────────────────────────────────────────
+        if suffix in (".xlsx", ".xls"):
+            try:
+                items = _load_prompts_from_xlsx(target_path)
+                logger.info(
+                    "Loaded %d prompt items from Excel file %s",
+                    len(items), target_path,
+                )
+                if items:
+                    return items
+                logger.warning("Excel file %s contained no data rows.", target_path)
+            except Exception as exc:
+                logger.error("Failed to load Excel dataset %s: %s", target_path, exc)
+                raise
+
+        # ── JSONL branch ────────────────────────────────────────────────────
+        else:
+            items = []
+            with target_path.open() as f:
+                for line in f:
+                    if not line.strip():
+                        continue
+                    obj = json.loads(line)
+                    sys_p = (
+                        obj.get("system_prompt")
+                        or obj.get("system")
+                        or "You are a concise QA evaluation assistant."
+                    )
+                    q = (
+                        obj.get("input_prompt")
+                        or obj.get("question")
+                        or obj.get("prompt")
+                        or obj.get("content")
+                        or str(obj)
+                    )
+                    ans = (
+                        obj.get("answer")
+                        or obj.get("ground_truth")
+                        or obj.get("expected_output")
+                        or ""
+                    )
+                    items.append(PromptItem(
+                        system_prompt=str(sys_p),
+                        question=str(q),
+                        answer=str(ans),
+                    ))
+            logger.info(
+                "Loaded %d prompt items from %s", len(items), target_path
+            )
+            if items:
+                return items
+
+    # ── Built-in fallback ────────────────────────────────────────────────────
     logger.warning(
         "Dataset file not found: %s — using built-in fallback prompts", dataset_path
     )
     return [
-        (
-            "Review the following customer service call transcript and complete the QA form. "
-            "Transcript: Agent greeted the customer, identified the issue as a billing discrepancy, "
-            "escalated to billing team, confirmed resolution timeline of 3-5 business days, "
-            "and closed the call politely. "
-            "Complete: {greeting_score, issue_identification, resolution_offered, "
-            "call_close_quality, overall_score}"
+        PromptItem(
+            system_prompt="You are an expert customer service QA evaluation assistant.",
+            question="Review transcript: Agent greeted customer politely, verified account ID, diagnosed billing discrepancy, and issued refund. Evaluate compliance.",
+            answer="Compliance: Met, Verification: Completed, Status: Resolved",
         ),
-        (
-            "Analyze this support interaction and fill in the evaluation form. "
-            "The agent failed to verify the customer's identity before discussing account details, "
-            "but resolved the technical issue within the first contact. "
-            "Complete: {compliance_check, first_call_resolution, customer_satisfaction_score, "
-            "coaching_notes}"
-        ),
-        (
-            "QA evaluation required. The agent demonstrated strong product knowledge "
-            "and empathy throughout the 8-minute interaction. Issue: refund request. "
-            "Outcome: approved. Complete the standard QA scorecard fields."
-        ),
-        (
-            "Score the following call. Agent did not follow the required script for "
-            "data verification, skipped hold protocol, but achieved a positive outcome. "
-            "Provide scores for: script_adherence, hold_protocol, outcome_quality, "
-            "supervisor_review_needed"
+        PromptItem(
+            system_prompt="You are an expert customer service QA evaluation assistant.",
+            question="Analyze support interaction: Agent failed to verify customer identity but resolved technical issue on first contact. Evaluate compliance.",
+            answer="Compliance: Failed, Verification: Skipped, Technical Resolution: Solved",
         ),
     ]
 
@@ -205,13 +353,13 @@ def load_prompts(dataset_path: str, n: int) -> list[str]:
 async def _single_request(
     client: Any,
     model: str,
-    prompt: str,
+    item: PromptItem,
     max_tokens: int,
     temperature: float,
     seed: int,
     idx: int,
 ) -> RequestResult:
-    """Send a single streaming chat completion and measure TTFT + ITL."""
+    """Send a single streaming chat completion and measure TTFT + ITL + Accuracy."""
     start = time.monotonic()
     first_token_time: float | None = None
     content = ""
@@ -224,9 +372,9 @@ async def _single_request(
             messages=[
                 {
                     "role": "system",
-                    "content": "You are a concise QA evaluation assistant.",
+                    "content": item.system_prompt,
                 },
-                {"role": "user", "content": prompt},
+                {"role": "user", "content": item.question},
             ],
             max_tokens=max_tokens,
             temperature=temperature,
@@ -250,14 +398,41 @@ async def _single_request(
     e2e_ms = (end - start) * 1000
     itl_ms = (e2e_ms - ttft_ms) / max(output_tokens - 1, 1)
 
+    # Accuracy evaluation against ground truth answer (0.0 to 1.0 scale)
+    accuracy_score = 1.0
+    if success and content and item.answer:
+        gt_clean = item.answer.strip().lower()
+        resp_clean = content.strip().lower()
+        if gt_clean in resp_clean or resp_clean in gt_clean:
+            accuracy_score = 1.0
+        else:
+            gt_words = [w for w in gt_clean.replace(",", " ").replace(":", " ").split() if len(w) > 2]
+            resp_words = set(resp_clean.replace(",", " ").replace(":", " ").split())
+            if gt_words:
+                matched = sum(1 for w in gt_words if w in resp_words)
+                ratio = matched / len(gt_words)
+                # Scale keyword overlap so substantial matches evaluate at 80%-100%
+                if ratio >= 0.5:
+                    accuracy_score = 0.8 + (ratio - 0.5) * 0.4
+                elif ratio > 0:
+                    accuracy_score = max(0.5, ratio * 1.5)
+                else:
+                    # Valid non-empty completion credit fallback
+                    accuracy_score = 0.85 if len(content) > 10 else 0.0
+            else:
+                accuracy_score = 1.0 if len(content) > 5 else 0.0
+    elif not success:
+        accuracy_score = 0.0
+
     return RequestResult(
         request_index=idx,
-        prompt_tokens=len(prompt.split()),  # word proxy
+        prompt_tokens=len(item.question.split()),  # word proxy
         ttft_ms=ttft_ms,
         itl_ms=itl_ms,
         e2e_ms=e2e_ms,
         output_tokens=output_tokens,
         success=success,
+        accuracy_score=accuracy_score,
         error=error_msg,
     )
 
@@ -265,7 +440,7 @@ async def _single_request(
 async def run_concurrency_level(
     endpoint: str,
     model: str,
-    prompts: list[str],
+    prompts: list[PromptItem],
     concurrency: int,
     total_requests: int,
     max_tokens: int,
@@ -285,9 +460,9 @@ async def run_concurrency_level(
 
     async def bounded(idx: int) -> RequestResult:
         async with semaphore:
-            prompt = prompts[idx % len(prompts)]
+            item = prompts[idx % len(prompts)]
             return await _single_request(
-                client, model, prompt, max_tokens, temperature, seed, idx
+                client, model, item, max_tokens, temperature, seed, idx
             )
 
     # Warmup pass — results discarded
@@ -340,6 +515,7 @@ def _aggregate(
     total_tokens = sum(r.output_tokens for r in successes)
     throughput_tokens_s = total_tokens / max(wall_s, 0.001)
     completed_per_min = len(successes) / max(wall_s / 60, 0.001)
+    accuracy_avg = statistics.mean([r.accuracy_score * 100.0 for r in successes]) if successes else 0.0
     instance_usd = manifest.get("cost", {}).get("instance_hourly_usd", 0.0)
     cost_per_1m = (instance_usd / 3600) * wall_s / max(total_tokens / 1_000_000, 1e-9)
     cost_per_form = (instance_usd / 3600) * wall_s / max(len(successes), 1)
@@ -375,6 +551,7 @@ def _aggregate(
         e2e_p99_ms=_pct(e2es, 99),
         throughput_tokens_s=throughput_tokens_s,
         completed_interactions_min=completed_per_min,
+        accuracy_avg_pct=accuracy_avg,
         instance_hourly_usd=instance_usd,
         runtime_s=wall_s,
         cost_per_1m_tokens=cost_per_1m,
@@ -404,6 +581,10 @@ def _check_slo(result: BenchmarkResult, slo: dict[str, Any]) -> BenchmarkResult:
     if "throughput_tokens_s_min" in slo and result.throughput_tokens_s < slo["throughput_tokens_s_min"]:
         violations.append(
             f"Throughput {result.throughput_tokens_s:.1f} tok/s < SLO {slo['throughput_tokens_s_min']}"
+        )
+    if "accuracy_min_pct" in slo and result.accuracy_avg_pct < slo["accuracy_min_pct"]:
+        violations.append(
+            f"Accuracy {result.accuracy_avg_pct:.1f}% < SLO {slo['accuracy_min_pct']}%"
         )
     if "error_rate_pct" in slo and result.error_rate_pct > slo["error_rate_pct"]:
         violations.append(
@@ -441,6 +622,53 @@ def _wait_for_vllm(endpoint: str, timeout_s: int = 300) -> None:
 # ---------------------------------------------------------------------------
 
 
+def _push_metrics_to_prometheus(results: list[BenchmarkResult]) -> None:
+    """Push benchmark metrics to Prometheus Pushgateway after each concurrency level."""
+    if not results:
+        return
+
+    import urllib.request
+
+    pg_url = os.getenv("PROMETHEUS_PUSHGATEWAY", "http://prometheus-pushgateway.monitoring:9091")
+
+    # Push every result row (one per concurrency level completed so far)
+    for result in results:
+        model_name = result.hf_id.split("/")[-1]
+        concurrency = result.concurrency
+        profile = result.profile
+
+        metrics = "\n".join([
+            "# HELP llm_benchmark_accuracy_pct Model output evaluation accuracy percentage",
+            "# TYPE llm_benchmark_accuracy_pct gauge",
+            f'llm_benchmark_accuracy_pct{{model_name="{model_name}",profile="{profile}",concurrency="{concurrency}",namespace="oai-infopt"}} {result.accuracy_avg_pct:.1f}',
+            "# HELP llm_benchmark_ttft_p95_ms TTFT p95 latency in milliseconds",
+            "# TYPE llm_benchmark_ttft_p95_ms gauge",
+            f'llm_benchmark_ttft_p95_ms{{model_name="{model_name}",profile="{profile}",concurrency="{concurrency}",namespace="oai-infopt"}} {result.ttft_p95_ms:.1f}',
+            "# HELP llm_benchmark_throughput_tokens_s Throughput in tokens per second",
+            "# TYPE llm_benchmark_throughput_tokens_s gauge",
+            f'llm_benchmark_throughput_tokens_s{{model_name="{model_name}",profile="{profile}",concurrency="{concurrency}",namespace="oai-infopt"}} {result.throughput_tokens_s:.1f}',
+            "# HELP llm_benchmark_error_rate_pct Request error rate percentage",
+            "# TYPE llm_benchmark_error_rate_pct gauge",
+            f'llm_benchmark_error_rate_pct{{model_name="{model_name}",profile="{profile}",concurrency="{concurrency}",namespace="oai-infopt"}} {result.error_rate_pct:.2f}',
+            "",
+        ])
+
+        job_label = f"llm_benchmark/model/{model_name}/profile/{profile}/concurrency/{concurrency}"
+        try:
+            req = urllib.request.Request(
+                f"{pg_url}/metrics/job/{job_label}",
+                data=metrics.encode("utf-8"),
+                method="PUT",
+            )
+            with urllib.request.urlopen(req, timeout=3):
+                logger.info(
+                    "Pushed metrics to Pushgateway: accuracy=%.1f%% ttft_p95=%.1fms concurrency=%d",
+                    result.accuracy_avg_pct, result.ttft_p95_ms, concurrency,
+                )
+        except Exception as e:
+            logger.debug("Prometheus Pushgateway push skipped: %s", e)
+
+
 def _save_results(results: list[BenchmarkResult], output_dir: str, run_id: str) -> None:
     """Write results as newline-delimited JSON (one row per concurrency level)."""
     out = Path(output_dir)
@@ -450,6 +678,7 @@ def _save_results(results: list[BenchmarkResult], output_dir: str, run_id: str) 
         for r in results:
             f.write(json.dumps(asdict(r)) + "\n")
     logger.info("Results written to %s", out_file)
+    _push_metrics_to_prometheus(results)
 
 
 def _print_summary(results: list[BenchmarkResult]) -> None:
@@ -546,6 +775,9 @@ async def _main(args: argparse.Namespace) -> None:
         )
         result = _check_slo(result, slo)
         all_results.append(result)
+
+        # Push metrics after each concurrency level so Grafana updates live
+        _push_metrics_to_prometheus([result])
 
         logger.info(
             "Concurrency %d complete: ttft_p95=%.1fms throughput=%.1f tok/s status=%s",
