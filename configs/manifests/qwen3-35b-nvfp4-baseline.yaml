@@ -11,6 +11,7 @@ description: "nvidia/Qwen3.6-35B-A3B-NVFP4 NVFP4 baseline, g6e.12xlarge, TP=2"
 
 model:
   hf_id: nvidia/Qwen3.6-35B-A3B-NVFP4
+  served_name: qwen3-35b-nvfp4          # must match --served-model-name in deployment.yaml
   s3_prefix: Qwen3.6-35B-A3B-NVFP4/   # relative to MODEL_BUCKET
   source: eks_gpu
 

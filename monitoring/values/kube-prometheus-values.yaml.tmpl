@@ -75,10 +75,10 @@ prometheus:
           - source_labels: [__meta_kubernetes_pod_label_model]
             target_label: model
         metric_relabel_configs:
-          # Keep only vLLM metrics + standard go/process metrics
+          # Keep only vLLM metrics + benchmark metrics + standard go/process metrics
           - source_labels: [__name__]
             action: keep
-            regex: "vllm:.*|go_.*|process_.*"
+            regex: "vllm:.*|llm_benchmark.*|go_.*|process_.*"
 
 # ------------------------------------------------------------------------------
 # Prometheus Operator

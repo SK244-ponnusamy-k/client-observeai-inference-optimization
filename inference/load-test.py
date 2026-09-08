@@ -650,6 +650,18 @@ def _push_metrics_to_prometheus(results: list[BenchmarkResult]) -> None:
             "# HELP llm_benchmark_error_rate_pct Request error rate percentage",
             "# TYPE llm_benchmark_error_rate_pct gauge",
             f'llm_benchmark_error_rate_pct{{model_name="{model_name}",profile="{profile}",concurrency="{concurrency}",namespace="oai-infopt"}} {result.error_rate_pct:.2f}',
+            # ── Cost metrics ────────────────────────────────────────────────
+            # cost_per_1m_tokens: (instance_hourly_usd / 3600) * runtime_s / (total_tokens / 1M)
+            # Derived post-run; not available as a vLLM time-series so we push it here.
+            "# HELP llm_benchmark_cost_per_1m_tokens USD cost to process 1 million tokens",
+            "# TYPE llm_benchmark_cost_per_1m_tokens gauge",
+            f'llm_benchmark_cost_per_1m_tokens{{model_name="{model_name}",profile="{profile}",concurrency="{concurrency}",namespace="oai-infopt"}} {result.cost_per_1m_tokens:.6f}',
+            "# HELP llm_benchmark_cost_per_qa_form USD cost per individual QA form / request",
+            "# TYPE llm_benchmark_cost_per_qa_form gauge",
+            f'llm_benchmark_cost_per_qa_form{{model_name="{model_name}",profile="{profile}",concurrency="{concurrency}",namespace="oai-infopt"}} {result.cost_per_qa_form:.8f}',
+            "# HELP llm_benchmark_instance_hourly_usd Instance on-demand hourly cost in USD",
+            "# TYPE llm_benchmark_instance_hourly_usd gauge",
+            f'llm_benchmark_instance_hourly_usd{{model_name="{model_name}",profile="{profile}",concurrency="{concurrency}",namespace="oai-infopt"}} {result.instance_hourly_usd:.4f}',
             "",
         ])
 
@@ -662,8 +674,10 @@ def _push_metrics_to_prometheus(results: list[BenchmarkResult]) -> None:
             )
             with urllib.request.urlopen(req, timeout=3):
                 logger.info(
-                    "Pushed metrics to Pushgateway: accuracy=%.1f%% ttft_p95=%.1fms concurrency=%d",
-                    result.accuracy_avg_pct, result.ttft_p95_ms, concurrency,
+                    "Pushed metrics to Pushgateway: accuracy=%.1f%% ttft_p95=%.1fms "
+                    "cost_per_1m=$%.4f concurrency=%d",
+                    result.accuracy_avg_pct, result.ttft_p95_ms,
+                    result.cost_per_1m_tokens, concurrency,
                 )
         except Exception as e:
             logger.debug("Prometheus Pushgateway push skipped: %s", e)
@@ -743,7 +757,7 @@ async def _main(args: argparse.Namespace) -> None:
     # Use first optimization variant for local/simple runs; orchestrator loops all
     opt = manifest["optimization_variants"][0]
 
-    model_name = manifest["model"]["hf_id"].split("/")[-1]
+    model_name = manifest["model"].get("served_name") or manifest["model"]["hf_id"].split("/")[-1]
     endpoint = args.endpoint.rstrip("/")
 
     prompts = load_prompts(profile["input"]["dataset"], total_requests + warmup_requests)

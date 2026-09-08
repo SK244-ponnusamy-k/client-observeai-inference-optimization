@@ -6,8 +6,10 @@
 #
 # Usage:
 #   cd llm-inference-framework
-#   bash inference/run-benchmark.sh                          # gpt-oss-20b realtime (default)
+#   bash inference/run-benchmark.sh                               # gpt-oss-20b realtime (default)
 #   bash inference/run-benchmark.sh --model qwen-0.5b
+#   bash inference/run-benchmark.sh --model qwen3-35b-nvfp4 --profile realtime
+#   bash inference/run-benchmark.sh --model qwen3-35b-nvfp4 --profile batch
 #   bash inference/run-benchmark.sh --model gpt-oss-20b --profile batch
 #   bash inference/run-benchmark.sh --model gpt-oss-20b --profile realtime
 # ==============================================================================
@@ -46,8 +48,12 @@ case "${MODEL}" in
         MANIFEST="configs/manifests/qwen-2.5-0.5b-baseline.yaml"
         SVC="oai-infopt-vllm-qwen-0-5b"
         ;;
+    qwen3-35b-nvfp4|qwen3-35b)
+        MANIFEST="configs/manifests/qwen3-35b-nvfp4-baseline.yaml"
+        SVC="oai-infopt-vllm-qwen3-35b-nvfp4"
+        ;;
     *)
-        log_error "Unknown model: ${MODEL}. Use gpt-oss-20b or qwen-0.5b"
+        log_error "Unknown model: ${MODEL}. Use: gpt-oss-20b | qwen-0.5b | qwen3-35b-nvfp4"
         exit 1
         ;;
 esac
@@ -195,7 +201,7 @@ spec:
                 openpyxl==3.1.2
               export PYTHONPATH=/tmp/pip-packages
 
-              # Download dataset from S3 if a key was provided
+              # Download dataset from S3 if a key was provided — non-fatal if it fails
               DATASET_S3_KEY="${DATASET_S3_KEY}"
               if [[ -n "\${DATASET_S3_KEY}" ]]; then
                   echo "Downloading dataset from s3://${RESULTS_BUCKET}/\${DATASET_S3_KEY} ..."
@@ -206,7 +212,7 @@ spec:
               boto3.client('s3', region_name='${AWS_REGION}').download_file(
                   '${RESULTS_BUCKET}', '\${DATASET_S3_KEY}', '/tmp/datasets/qa_eval_v1.jsonl')
               print('Dataset downloaded: /tmp/datasets/qa_eval_v1.jsonl')
-              "
+              " || echo "WARNING: dataset download failed — using built-in fallback prompts"
               fi
               TEST_EXIT=0
               python /app/load-test.py \
@@ -306,6 +312,7 @@ fi
 # ==============================================================================
 log_info "Waiting for job completion..."
 # Wait for either Complete or Failed (SLO violations cause exit code 1 = Failed status)
+JOB_TIMEOUT=7200   # 2 h — matches activeDeadlineSeconds in the Job spec
 JOB_DONE="false"
 DEADLINE=$((SECONDS + JOB_TIMEOUT))
 while [[ ${SECONDS} -lt ${DEADLINE} ]]; do
