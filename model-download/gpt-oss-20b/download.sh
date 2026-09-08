@@ -100,7 +100,11 @@ fi
 # ------------------------------------------------------------------------------
 log_info "Applying download job..."
 export MODEL_BUCKET AWS_REGION SERVICE_ACCOUNT NAMESPACE
-envsubst < "${SCRIPT_DIR}/job.yaml" | kubectl apply -f -
+# Explicit variable list — only substitute the 4 runtime vars.
+# All other ${VAR} references inside the pod script (MODEL_ID, MODEL_FOLDER,
+# LOCAL_DIR) are intentionally left for bash to resolve inside the container.
+envsubst '${MODEL_BUCKET} ${AWS_REGION} ${DOWNLOAD_SERVICE_ACCOUNT} ${BENCHMARK_NAMESPACE}' \
+    < "${SCRIPT_DIR}/job.yaml" | kubectl apply -f -
 log_info "Job '${JOB_NAME}' created. (~13GB — expect 20-60 minutes)"
 
 # ------------------------------------------------------------------------------

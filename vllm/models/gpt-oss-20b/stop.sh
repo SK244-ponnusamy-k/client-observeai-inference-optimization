@@ -6,15 +6,15 @@
 #
 # What this does:
 #   1. Deletes the vLLM deployment + service + PVC
-#   2. Deletes ALL GPU node claims (nodeclaims) — stops billing immediately
-#   3. Deletes GPU nodes by any known label/nodepool name
-#   4. Cleans up leftover benchmark jobs in oai-infopt namespace
-#   5. Confirms nothing expensive is left running
+#   2. Deletes the GPU node this model was running on — stops billing
+#   3. Cleans up benchmark jobs for THIS model only
+#   4. Confirms nothing expensive is left running
 #
 # What this does NOT touch:
 #   - S3 model weights (safe, no change)
 #   - Monitoring stack (Grafana/Prometheus on cheap CPU nodes — ~$0.15/hr)
 #   - CPU system nodes (needed for monitoring)
+#   - Other models' deployments or download jobs
 #
 # Usage:
 #   cd llm-inference-framework
@@ -44,8 +44,8 @@ echo "════════════════════════�
 echo ""
 echo "  This will:"
 echo "    • Delete vLLM deployment, service, PVC"
-echo "    • Terminate ALL GPU nodes (stops billing)"
-echo "    • Clean up benchmark jobs"
+echo "    • Terminate GPU node for this model (stops billing)"
+echo "    • Clean up benchmark jobs for this model only"
 echo "    • Leave monitoring stack running (~\$0.15/hr)"
 echo ""
 
@@ -92,19 +92,12 @@ kubectl delete pvc "${PVC_NAME}" \
 # Only deletes that specific node — leaves qwen's node untouched if running.
 terminate_model_gpu_node "${DEPLOYMENT_NAME}" "${BENCHMARK_NAMESPACE}" "${MODEL_NODE:-}"
 
-# ── Step 3: Clean up benchmark jobs ─────────────────────────────────────────
-log_info "Cleaning up benchmark jobs in ${BENCHMARK_NAMESPACE}..."
+# ── Step 3: Clean up THIS model's benchmark jobs only ───────────────────────
+# Scoped to model label — does NOT touch download jobs or other models' jobs.
+log_info "Cleaning up benchmark jobs for model '${MODEL_ID}'..."
 kubectl delete jobs -n "${BENCHMARK_NAMESPACE}" \
-    -l "app.kubernetes.io/component=benchmark-runner" \
+    -l "app.kubernetes.io/component=benchmark-runner,model=${MODEL_ID}" \
     --ignore-not-found=true 2>/dev/null || true
-
-STALE_JOBS=$(kubectl get jobs -n "${BENCHMARK_NAMESPACE}" \
-    --no-headers 2>/dev/null | awk '{print $1}' || true)
-if [[ -n "${STALE_JOBS}" ]]; then
-    log_info "Deleting remaining jobs in ${BENCHMARK_NAMESPACE}..."
-    echo "${STALE_JOBS}" | xargs -r kubectl delete job \
-        -n "${BENCHMARK_NAMESPACE}" --ignore-not-found=true
-fi
 
 # ── Step 4: Final status ─────────────────────────────────────────────────────
 print_stop_summary "${MODEL_ID}" "${BENCHMARK_NAMESPACE}"

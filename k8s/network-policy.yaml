@@ -152,7 +152,32 @@ spec:
           port: 53
 
 ---
-# 6. Allow Prometheus (kube-prometheus-stack) to scrape vLLM /metrics
+# 7. Allow model-download jobs outbound to HuggingFace (HTTPS 443) + S3 + DNS
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-download-egress
+  namespace: oai-infopt
+  labels:
+    app.kubernetes.io/component: network-policy
+    project: observeai-inference-optimization
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/component: model-download
+  policyTypes:
+    - Egress
+  egress:
+    # HuggingFace (huggingface.co) + S3 + ECR — all HTTPS
+    - ports:
+        - protocol: TCP
+          port: 443
+    # DNS
+    - ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
 #    Prometheus runs in the monitoring namespace — adjust namespace label if different.
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy

@@ -1,24 +1,23 @@
 #!/bin/bash
 # ==============================================================================
-# vllm/models/qwen-2.5-0.5b/stop.sh
+# vllm/models/qwen3-35b-nvfp4/stop.sh
 #
 # Full teardown — run this and close your laptop. Everything stops.
 #
 # What this does:
 #   1. Deletes the vLLM deployment + service + PVC
 #   2. Deletes the GPU node this model was running on — stops billing
-#   3. Cleans up benchmark jobs for THIS model only
+#   3. Cleans up leftover benchmark jobs in oai-infopt namespace
 #   4. Confirms nothing expensive is left running
 #
 # What this does NOT touch:
 #   - S3 model weights (safe, no change)
 #   - Monitoring stack (Grafana/Prometheus on cheap CPU nodes — ~$0.15/hr)
-#   - CPU system nodes (needed for monitoring)
-#   - Other models' deployments or download jobs
+#   - Other model deployments (qwen-2.5-0.5b, gpt-oss-20b)
 #
 # Usage:
 #   cd llm-inference-framework
-#   bash vllm/models/qwen-2.5-0.5b/stop.sh
+#   bash vllm/models/qwen3-35b-nvfp4/stop.sh
 # ==============================================================================
 
 set -euo pipefail
@@ -34,7 +33,6 @@ source "${FRAMEWORK_ROOT}/vllm/lib/gpu-terminate.sh"
 GREEN='\033[0;32m'; YELLOW='\033[1;33m'; RED='\033[0;31m'; NC='\033[0m'
 log_info()  { echo -e "${GREEN}[INFO]  $(date +'%H:%M:%S')${NC} $1"; }
 log_warn()  { echo -e "${YELLOW}[WARN]  $(date +'%H:%M:%S')${NC} $1"; }
-log_done()  { echo -e "${GREEN}[DONE]  $(date +'%H:%M:%S')${NC} $1"; }
 
 echo ""
 echo "══════════════════════════════════════════════════"
@@ -45,8 +43,8 @@ echo "════════════════════════�
 echo ""
 echo "  This will:"
 echo "    • Delete vLLM deployment, service, PVC"
-echo "    • Terminate GPU node for this model (stops billing)"
-echo "    • Clean up benchmark jobs for this model only"
+echo "    • Terminate GPU node (g6e.2xlarge — stops billing ~\$2.17/hr)"
+echo "    • Clean up benchmark jobs"
 echo "    • Leave monitoring stack running (~\$0.15/hr)"
 echo ""
 
@@ -86,15 +84,15 @@ log_info "Deleting PVC: ${PVC_NAME}..."
 kubectl delete pvc "${PVC_NAME}" \
     -n "${BENCHMARK_NAMESPACE}" --ignore-not-found=true 2>/dev/null || true
 
-# ── Step 3: Terminate THIS model's GPU node ──────────────────────────────────
+# ── Step 3: Terminate this model's GPU node ──────────────────────────────────
 terminate_model_gpu_node "${DEPLOYMENT_NAME}" "${BENCHMARK_NAMESPACE}" "${MODEL_NODE:-}"
 
-# ── Step 3: Clean up THIS model's benchmark jobs only ───────────────────────
+# ── Step 4: Clean up THIS model's benchmark jobs only ───────────────────────
 # Scoped to model label — does NOT touch download jobs or other models' jobs.
 log_info "Cleaning up benchmark jobs for model '${MODEL_ID}'..."
 kubectl delete jobs -n "${BENCHMARK_NAMESPACE}" \
     -l "app.kubernetes.io/component=benchmark-runner,model=${MODEL_ID}" \
     --ignore-not-found=true 2>/dev/null || true
 
-# ── Step 4: Final status ─────────────────────────────────────────────────────
+# ── Step 5: Final status ─────────────────────────────────────────────────────
 print_stop_summary "${MODEL_ID}" "${BENCHMARK_NAMESPACE}"

@@ -91,7 +91,10 @@ spec:
               echo "Token  : sourced from Secrets Manager via ESO"
 
               echo "Installing dependencies..."
-              pip install --quiet --no-cache-dir huggingface_hub==0.24.7 boto3==1.34.0
+              pip install --quiet --no-cache-dir \
+                  --target /tmp/pip-packages \
+                  huggingface_hub==0.24.7 boto3==1.34.0
+              export PYTHONPATH="/tmp/pip-packages:${PYTHONPATH:-}"
 
               echo "Downloading from HuggingFace (gated model — token required)..."
               python3 -c "
