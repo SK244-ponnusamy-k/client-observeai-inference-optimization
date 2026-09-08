@@ -26,34 +26,39 @@ log_error() { echo -e "${RED}[ERROR] $(date +'%H:%M:%S')${NC} $1"; }
 # Reads a top-level scalar value from a YAML file.
 yaml_field() {
     local file="$1" key="$2"
-    grep -m1 "^${key}:" "${file}" | sed "s/^${key}:[[:space:]]*//" | tr -d "'\""
+    grep -m1 "^${key}:" "${file}" | sed "s/^${key}:[[:space:]]*//" | sed 's/[[:space:]]*#.*//' | tr -d "'\"" | xargs
 }
 
 # Reads a serving sub-key (indented under "serving:")
 yaml_serving() {
     local file="$1" key="$2"
-    awk "/^serving:/{found=1} found && /^  ${key}:/{gsub(/^  ${key}:[[:space:]]*/,\"\"); gsub(/['\"]*/,\"\"); print; exit}" "${file}"
+    awk "/^serving:/{found=1} found && /^  ${key}:/{gsub(/^  ${key}:[[:space:]]*/,\"\"); sub(/[[:space:]]*#.*/,\"\"); gsub(/['\"]*/,\"\"); print; exit}" "${file}" | xargs
 }
 
 # Reads a resources sub-key
 yaml_resources() {
     local file="$1" key="$2"
-    awk "/^resources:/{found=1} found && /^  ${key}:/{gsub(/^  ${key}:[[:space:]]*/,\"\"); gsub(/['\"]*/,\"\"); print; exit}" "${file}"
+    awk "/^resources:/{found=1} found && /^  ${key}:/{gsub(/^  ${key}:[[:space:]]*/,\"\"); sub(/[[:space:]]*#.*/,\"\"); gsub(/['\"]*/,\"\"); print; exit}" "${file}" | xargs
 }
 
 # Reads a probes sub-key
 yaml_probes() {
     local file="$1" key="$2"
-    awk "/^probes:/{found=1} found && /^  ${key}:/{gsub(/^  ${key}:[[:space:]]*/,\"\"); gsub(/['\"]*/,\"\"); print; exit}" "${file}"
+    awk "/^probes:/{found=1} found && /^  ${key}:/{gsub(/^  ${key}:[[:space:]]*/,\"\"); sub(/[[:space:]]*#.*/,\"\"); gsub(/['\"]*/,\"\"); print; exit}" "${file}" | xargs
 }
 
 # ── Parse args ────────────────────────────────────────────────────────────────
 MODEL=""
 VALIDATE="false"
+RUN_BENCHMARK="false"
+PROFILE="realtime"
+
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --model)    MODEL="$2";       shift 2 ;;
-        --validate) VALIDATE="true";  shift ;;
+        --model)     MODEL="$2";          shift 2 ;;
+        --validate)  VALIDATE="true";     shift ;;
+        --benchmark) RUN_BENCHMARK="true"; shift ;;
+        --profile)   PROFILE="$2";        shift 2 ;;
         *) log_error "Unknown argument: $1"; exit 1 ;;
     esac
 done
@@ -359,5 +364,19 @@ echo "    kubectl port-forward svc/${SERVICE_NAME} ${PORT_FORWARD_PORT}:8000 -n 
 echo "    curl http://localhost:${PORT_FORWARD_PORT}/health"
 echo ""
 echo "  Benchmark:"
-echo "    bash inference/run-benchmark.sh --model ${MODEL} --profile realtime"
+echo "    bash inference/run-benchmark.sh --model ${MODEL} --profile ${PROFILE}"
 echo "══════════════════════════════════════════════════"
+
+# ── Optional automatic benchmark trigger ─────────────────────────────────────
+if [[ "${RUN_BENCHMARK}" == "true" ]]; then
+    log_info "Deployment ready — automatically launching benchmark (${PROFILE} profile)..."
+    bash "${FRAMEWORK_ROOT}/inference/run-benchmark.sh" --model "${MODEL}" --profile "${PROFILE}"
+fi
+
+if [[ "${VALIDATE}" == "true" ]]; then
+    log_info "Running post-deploy validation pipeline..."
+    bash "${FRAMEWORK_ROOT}/scripts/post-deploy-validate.sh" \
+        --model "${MODEL_SERVED_NAME}" \
+        --manifest "${BENCHMARK_MANIFEST}" \
+        --endpoint "http://${SERVICE_NAME}:8000"
+fi

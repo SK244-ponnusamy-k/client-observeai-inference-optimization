@@ -144,6 +144,13 @@ class BenchmarkResult:
     started_at: str
     ended_at: str
     status: str             # passed | failed_slo | error
+    # Infrastructure & GPU Metrics
+    gpu_utilization_pct: float = 0.0
+    gpu_memory_used_mib: float = 0.0
+    gpu_memory_total_mib: float = 0.0
+    gpu_temp_c: float = 0.0
+    gpu_power_w: float = 0.0
+    gpu_cache_usage_pct: float = 0.0
     slo_violations: list[str] = field(default_factory=list)
 
 
@@ -497,6 +504,99 @@ def _pct(sorted_vals: list[float], p: float) -> float:
     return sorted_vals[idx]
 
 
+def _fetch_gpu_and_vllm_metrics(endpoint: str) -> dict[str, float]:
+    """Fetch GPU (DCGM exporter) and vLLM engine metrics inside the cluster."""
+    metrics = {
+        "gpu_utilization_pct": 0.0,
+        "gpu_memory_used_mib": 0.0,
+        "gpu_memory_total_mib": 0.0,
+        "gpu_temp_c": 0.0,
+        "gpu_power_w": 0.0,
+        "gpu_cache_usage_pct": 0.0,
+    }
+
+    import urllib.request
+
+    # 1. Direct vLLM /metrics query (KV Cache Usage %)
+    try:
+        resp = urllib.request.urlopen(f"{endpoint}/metrics", timeout=5)
+        text = resp.read().decode("utf-8")
+        for line in text.splitlines():
+            if line.startswith("#") or not line.strip():
+                continue
+            if "vllm:gpu_cache_usage_perc" in line:
+                try:
+                    val = float(line.split()[-1])
+                    metrics["gpu_cache_usage_pct"] = round(val * 100, 1) if val <= 1.0 else round(val, 1)
+                except ValueError:
+                    pass
+    except Exception as e:
+        logger.debug("vLLM /metrics query skipped: %s", e)
+
+    # 2. Query DCGM Exporter endpoints directly in cluster
+    dcgm_urls = [
+        os.getenv("DCGM_EXPORTER_URL", "http://dcgm-exporter.monitoring.svc.cluster.local:9400/metrics"),
+        "http://dcgm-exporter.monitoring:9400/metrics",
+        "http://dcgm-exporter.oai-infopt:9400/metrics",
+    ]
+
+    for d_url in dcgm_urls:
+        if not d_url:
+            continue
+        try:
+            resp = urllib.request.urlopen(d_url, timeout=4)
+            content = resp.read().decode("utf-8")
+
+            utils, mem_used, mem_free, temps, powers = [], [], [], [], []
+            for line in content.splitlines():
+                if line.startswith("#") or not line.strip():
+                    continue
+                parts = line.split()
+                if len(parts) < 2:
+                    continue
+                metric_name = parts[0]
+                val_str = parts[-1]
+                try:
+                    val = float(val_str)
+                except ValueError:
+                    continue
+
+                if metric_name.startswith("DCGM_FI_DEV_GPU_UTIL"):
+                    utils.append(val)
+                elif metric_name.startswith("DCGM_FI_DEV_FB_USED"):
+                    mem_used.append(val)
+                elif metric_name.startswith("DCGM_FI_DEV_FB_FREE"):
+                    mem_free.append(val)
+                elif metric_name.startswith("DCGM_FI_DEV_GPU_TEMP"):
+                    temps.append(val)
+                elif metric_name.startswith("DCGM_FI_DEV_POWER_USAGE"):
+                    powers.append(val)
+
+            if utils:
+                metrics["gpu_utilization_pct"] = round(sum(utils) / len(utils), 1)
+            if mem_used:
+                metrics["gpu_memory_used_mib"] = round(sum(mem_used) / len(mem_used), 1)
+            if mem_free and mem_used:
+                total = sum(mem_used) + sum(mem_free)
+                metrics["gpu_memory_total_mib"] = round(total / len(mem_used), 1)
+            if temps:
+                metrics["gpu_temp_c"] = round(sum(temps) / len(temps), 1)
+            if powers:
+                metrics["gpu_power_w"] = round(sum(powers) / len(powers), 1)
+
+            if utils or mem_used:
+                logger.info(
+                    "Captured live DCGM GPU metrics: util=%.1f%%, mem=%.0fMiB, temp=%.1fC, power=%.1fW",
+                    metrics["gpu_utilization_pct"], metrics["gpu_memory_used_mib"],
+                    metrics["gpu_temp_c"], metrics["gpu_power_w"],
+                )
+                break
+        except Exception as e:
+            logger.debug("DCGM query at %s skipped: %s", d_url, e)
+
+    return metrics
+
+
 def _aggregate(
     results: list[RequestResult],
     wall_s: float,
@@ -507,6 +607,7 @@ def _aggregate(
     correlation_id: str,
     started_at: str,
     ended_at: str,
+    endpoint: str = "http://localhost:8080",
 ) -> BenchmarkResult:
     successes = [r for r in results if r.success]
     ttfts = sorted(r.ttft_ms for r in successes)
@@ -522,6 +623,7 @@ def _aggregate(
     error_rate = (len(results) - len(successes)) / max(len(results), 1) * 100
 
     git_sha = os.popen("git rev-parse --short HEAD 2>/dev/null").read().strip() or "unknown"
+    gpu_infra = _fetch_gpu_and_vllm_metrics(endpoint)
 
     return BenchmarkResult(
         run_id=manifest["run_id"],
@@ -556,6 +658,12 @@ def _aggregate(
         runtime_s=wall_s,
         cost_per_1m_tokens=cost_per_1m,
         cost_per_qa_form=cost_per_form,
+        gpu_utilization_pct=gpu_infra.get("gpu_utilization_pct", 0.0),
+        gpu_memory_used_mib=gpu_infra.get("gpu_memory_used_mib", 0.0),
+        gpu_memory_total_mib=gpu_infra.get("gpu_memory_total_mib", 0.0),
+        gpu_temp_c=gpu_infra.get("gpu_temp_c", 0.0),
+        gpu_power_w=gpu_infra.get("gpu_power_w", 0.0),
+        gpu_cache_usage_pct=gpu_infra.get("gpu_cache_usage_pct", 0.0),
         total_requests=len(results),
         successful_requests=len(successes),
         error_rate_pct=error_rate,
@@ -662,6 +770,12 @@ def _push_metrics_to_prometheus(results: list[BenchmarkResult]) -> None:
             "# HELP llm_benchmark_instance_hourly_usd Instance on-demand hourly cost in USD",
             "# TYPE llm_benchmark_instance_hourly_usd gauge",
             f'llm_benchmark_instance_hourly_usd{{model_name="{model_name}",profile="{profile}",concurrency="{concurrency}",namespace="oai-infopt"}} {result.instance_hourly_usd:.4f}',
+            "# HELP llm_benchmark_gpu_utilization_pct GPU utilization percentage",
+            "# TYPE llm_benchmark_gpu_utilization_pct gauge",
+            f'llm_benchmark_gpu_utilization_pct{{model_name="{model_name}",profile="{profile}",concurrency="{concurrency}",namespace="oai-infopt"}} {result.gpu_utilization_pct:.1f}',
+            "# HELP llm_benchmark_gpu_cache_usage_pct vLLM GPU KV cache usage percentage",
+            "# TYPE llm_benchmark_gpu_cache_usage_pct gauge",
+            f'llm_benchmark_gpu_cache_usage_pct{{model_name="{model_name}",profile="{profile}",concurrency="{concurrency}",namespace="oai-infopt"}} {result.gpu_cache_usage_pct:.1f}',
             "",
         ])
 
@@ -684,14 +798,40 @@ def _push_metrics_to_prometheus(results: list[BenchmarkResult]) -> None:
 
 
 def _save_results(results: list[BenchmarkResult], output_dir: str, run_id: str) -> None:
-    """Write results as newline-delimited JSON (one row per concurrency level)."""
+    """Write results as newline-delimited JSON and Excel (.xlsx) workbook."""
     out = Path(output_dir)
     out.mkdir(parents=True, exist_ok=True)
-    out_file = out / f"{run_id}.jsonl"
-    with out_file.open("w") as f:
+
+    # 1. Write JSONL file
+    jsonl_file = out / f"{run_id}.jsonl"
+    with jsonl_file.open("w") as f:
         for r in results:
             f.write(json.dumps(asdict(r)) + "\n")
-    logger.info("Results written to %s", out_file)
+    logger.info("JSONL results written to %s", jsonl_file)
+
+    # 2. Write Excel (.xlsx) file
+    xlsx_file = out / f"{run_id}.xlsx"
+    try:
+        import openpyxl
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.title = "Benchmark Results"
+        if results:
+            headers = list(asdict(results[0]).keys())
+            ws.append(headers)
+            for r in results:
+                row_vals = []
+                for k, v in asdict(r).items():
+                    if isinstance(v, (list, dict)):
+                        row_vals.append(json.dumps(v))
+                    else:
+                        row_vals.append(v)
+                ws.append(row_vals)
+        wb.save(xlsx_file)
+        logger.info("Excel report written to %s", xlsx_file)
+    except Exception as ex:
+        logger.warning("Failed to save Excel report: %s", ex)
+
     _push_metrics_to_prometheus(results)
 
 

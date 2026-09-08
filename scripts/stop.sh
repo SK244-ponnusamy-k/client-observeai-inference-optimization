@@ -28,7 +28,7 @@ log_error() { echo -e "${RED}[ERROR] $(date +'%H:%M:%S')${NC} $1"; }
 # Reads a top-level scalar value from a YAML file using grep + sed.
 yaml_field() {
     local file="$1" key="$2"
-    grep -m1 "^${key}:" "${file}" | sed "s/^${key}:[[:space:]]*//" | tr -d "'\""
+    grep -m1 "^${key}:" "${file}" | sed "s/^${key}:[[:space:]]*//" | sed 's/[[:space:]]*#.*//' | tr -d "'\"" | xargs
 }
 
 # ── Parse args ────────────────────────────────────────────────────────────────

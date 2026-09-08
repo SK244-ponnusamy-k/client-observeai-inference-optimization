@@ -203,6 +203,7 @@ S3 model weights and IAM roles are retained.
 | Model | S3 Prefix | Size | GPU | VRAM |
 |---|---|---|---|---|
 | Qwen2.5-0.5B-Instruct | `models/Qwen2.5-0.5B-Instruct/` | ~950 MB | g6e.xlarge | ~2 GB |
+| Qwen/Qwen3.5-4B | `models/Qwen3.5-4B/` | ~8 GB | g6e.2xlarge | ~8 GB |
 | openai/gpt-oss-20b | `models/gpt-oss-20b/` | ~13 GB | g6e.2xlarge | ~16 GB |
 
 ## Security Posture

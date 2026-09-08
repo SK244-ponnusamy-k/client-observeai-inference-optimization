@@ -42,7 +42,7 @@ done
 # ── Pure-bash YAML field reader — no Python needed ────────────────────────────
 yaml_field() {
     local file="$1" key="$2"
-    grep -m1 "^${key}:" "${file}" | sed "s/^${key}:[[:space:]]*//" | tr -d "'\""
+    grep -m1 "^${key}:" "${file}" | sed "s/^${key}:[[:space:]]*//" | sed 's/[[:space:]]*#.*//' | tr -d "'\"" | xargs
 }
 
 # ── Resolve model config from models/ registry ────────────────────────────────
@@ -240,7 +240,8 @@ spec:
               import boto3, os, glob, sys
               sys.path.insert(0, '/tmp/pip-packages')
               s3 = boto3.client('s3', region_name='${AWS_REGION}')
-              for f in glob.glob('/results/*.jsonl'):
+              for f in glob.glob('/results/*'):
+                  if not os.path.isfile(f): continue
                   key = 'results/${TIMESTAMP}/${PROFILE}/' + os.path.basename(f)
                   s3.upload_file(f, '${RESULTS_BUCKET}', key)
                   print('Uploaded: s3://${RESULTS_BUCKET}/' + key)
@@ -249,6 +250,8 @@ spec:
           env:
             - name: AWS_DEFAULT_REGION
               value: "${AWS_REGION}"
+            - name: DCGM_EXPORTER_URL
+              value: "http://dcgm-exporter.monitoring.svc.cluster.local:9400/metrics"
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true

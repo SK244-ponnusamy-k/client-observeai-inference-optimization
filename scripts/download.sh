@@ -25,11 +25,11 @@ log_error() { echo -e "${RED}[ERROR] $(date +'%H:%M:%S')${NC} $1"; }
 # ── Pure-bash YAML field reader — no Python needed ────────────────────────────
 yaml_field() {
     local file="$1" key="$2"
-    grep -m1 "^${key}:" "${file}" | sed "s/^${key}:[[:space:]]*//" | tr -d "'\""
+    grep -m1 "^${key}:" "${file}" | sed "s/^${key}:[[:space:]]*//" | sed 's/[[:space:]]*#.*//' | tr -d "'\"" | xargs
 }
 yaml_download() {
     local file="$1" key="$2"
-    awk "/^download:/{found=1} found && /^  ${key}:/{gsub(/^  ${key}:[[:space:]]*/,\"\"); gsub(/['\"]*/,\"\"); print; exit}" "${file}"
+    awk "/^download:/{found=1} found && /^  ${key}:/{gsub(/^  ${key}:[[:space:]]*/,\"\"); sub(/[[:space:]]*#.*/,\"\"); gsub(/['\"]*/,\"\"); print; exit}" "${file}" | xargs
 }
 
 # ── Parse args ────────────────────────────────────────────────────────────────
@@ -133,17 +133,12 @@ if [[ "${IS_GATED}" == "true" ]]; then
           secret:
             secretName: hf-token
             defaultMode: 0440"
-    HF_TOKEN_READ="
-              try:
-                  with open('/var/secrets/hf/token') as f:
-                      token = f.read().strip()
-              except FileNotFoundError:
-                  raise RuntimeError('HF token not found — check ExternalSecret sync')"
+    HF_TOKEN_READ="token = open('/var/secrets/hf/token').read().strip() if os.path.exists('/var/secrets/hf/token') else None"
 else
     HF_TOKEN_ENV=""
     HF_TOKEN_VOLUME_MOUNT=""
     HF_TOKEN_VOLUME=""
-    HF_TOKEN_READ="              token = None"
+    HF_TOKEN_READ="token = None"
 fi
 
 # ── Submit download Job ───────────────────────────────────────────────────────
@@ -204,19 +199,7 @@ spec:
                 huggingface_hub==0.24.7 boto3==1.34.0
               export PYTHONPATH="/tmp/pip-packages:\${PYTHONPATH:-}"
 
-              python3 -c "
-              import os, sys
-              sys.path.insert(0, '/tmp/pip-packages')
-              from huggingface_hub import snapshot_download
-              ${HF_TOKEN_READ}
-              snapshot_download(
-                  repo_id='\${HF_ID}',
-                  local_dir='\${LOCAL_DIR}',
-                  token=token,
-                  ignore_patterns=['*.msgpack','*.h5','flax_*','tf_*','rust_*'],
-              )
-              print('Download complete.')
-              "
+              python3 -c "import os, sys; sys.path.insert(0, '/tmp/pip-packages'); from huggingface_hub import snapshot_download; ${HF_TOKEN_READ}; snapshot_download(repo_id='${MODEL_HF_ID}', local_dir='/tmp/${MODEL_S3_FOLDER}', token=token, ignore_patterns=['*.msgpack','*.h5','flax_*','tf_*','rust_*']); print('Download complete.')"
 
               echo 'Uploading to S3...'
               python3 << 'PYEOF'
