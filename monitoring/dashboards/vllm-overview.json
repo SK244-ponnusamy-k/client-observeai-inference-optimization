@@ -999,7 +999,7 @@
                       "group": "grafana-amazonprometheus-datasource",
                       "kind": "DataQuery",
                       "spec": {
-                        "expr": "DCGM_FI_DEV_GPU_UTIL{exported_namespace=\"oai-infopt\"}",
+                        "expr": "topk(1, DCGM_FI_DEV_GPU_UTIL)",
                         "legendFormat": "{{modelName}}",
                         "instant": true
                       },

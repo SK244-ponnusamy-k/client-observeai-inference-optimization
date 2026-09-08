@@ -328,6 +328,12 @@ def collect_vllm_metrics() -> dict[str, Any]:
         "model_name",
     )
 
+    # Hourly instance cost rate metric
+    instance_usd_by_model = scalar_by_label(
+        query_instant('llm_benchmark_instance_hourly_usd{namespace="oai-infopt"} or vector(0)'),
+        "model_name",
+    )
+
     # Build per-model report
     all_models = set(running_by_model.keys()) | set(prompt_tps_by_model.keys())
     per_model = []
@@ -337,6 +343,14 @@ def collect_vllm_metrics() -> dict[str, Any]:
         ttft_p95_ms = round(ttft_p95.get(model, 0.0), 2)
         itl_p95_ms = round(itl_p95.get(model, 0.0), 2)
         acc_pct = round(accuracy_by_model.get(model, 100.0), 1)
+        instance_usd = instance_usd_by_model.get(model, 0.0)
+
+        # Live Cost / 1M Tokens derived directly from vLLM vllm:generation_tokens_total rate
+        cost_per_1m_live = (
+            round((instance_usd / 3600 * 1_000_000) / gen_tps, 4)
+            if gen_tps > 0 and instance_usd > 0
+            else 0.0
+        )
 
         per_model.append({
             "model": model,
@@ -346,6 +360,7 @@ def collect_vllm_metrics() -> dict[str, Any]:
             "generation_tokens_per_s": gen_tps,
             "total_tokens_per_s": round(prompt_tps + gen_tps, 2),
             "accuracy_avg_pct": acc_pct,
+            "cost_per_1m_tokens_live": cost_per_1m_live,
             "ttft_ms": {
                 "p50": round(ttft_p50.get(model, 0.0), 2),
                 "p95": ttft_p95_ms,

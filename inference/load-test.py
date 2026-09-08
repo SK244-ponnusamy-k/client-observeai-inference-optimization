@@ -372,6 +372,8 @@ async def _single_request(
     content = ""
     error_msg = ""
     success = True
+    vllm_prompt_tokens = 0
+    vllm_completion_tokens = 0
 
     try:
         stream = await client.chat.completions.create(
@@ -387,8 +389,13 @@ async def _single_request(
             temperature=temperature,
             seed=seed,
             stream=True,
+            stream_options={"include_usage": True},
         )
         async for chunk in stream:
+            if hasattr(chunk, "usage") and chunk.usage:
+                vllm_prompt_tokens = getattr(chunk.usage, "prompt_tokens", 0) or 0
+                vllm_completion_tokens = getattr(chunk.usage, "completion_tokens", 0) or 0
+
             delta = chunk.choices[0].delta.content if chunk.choices else None
             if delta:
                 if first_token_time is None:
@@ -400,7 +407,8 @@ async def _single_request(
         logger.warning("Request %d failed: %s", idx, error_msg)
 
     end = time.monotonic()
-    output_tokens = len(content.split())  # word-count proxy; replace with tiktoken if needed
+    output_tokens = vllm_completion_tokens if vllm_completion_tokens > 0 else len(content.split())
+    prompt_tokens = vllm_prompt_tokens if vllm_prompt_tokens > 0 else len(item.question.split())
     ttft_ms = ((first_token_time or end) - start) * 1000
     e2e_ms = (end - start) * 1000
     itl_ms = (e2e_ms - ttft_ms) / max(output_tokens - 1, 1)
@@ -433,7 +441,7 @@ async def _single_request(
 
     return RequestResult(
         request_index=idx,
-        prompt_tokens=len(item.question.split()),  # word proxy
+        prompt_tokens=prompt_tokens,
         ttft_ms=ttft_ms,
         itl_ms=itl_ms,
         e2e_ms=e2e_ms,
