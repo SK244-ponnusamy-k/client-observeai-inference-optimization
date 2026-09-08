@@ -43,7 +43,7 @@ def sync_results_from_s3(bucket: str, local_dir: Path) -> None:
     """Sync all benchmark results from S3 bucket into local results/ directory."""
     import subprocess
 
-    cmd = f"aws s3 sync s3://{bucket}/results/ {local_dir}/ --exclude '*' --include '*.jsonl' --include '*.xlsx'"
+    cmd = f"aws s3 sync s3://{bucket}/results/ {local_dir}/"
     print(f"Syncing benchmark results from S3 (s3://{bucket}/results/) ...")
     try:
         subprocess.run(cmd, shell=True, check=True)
