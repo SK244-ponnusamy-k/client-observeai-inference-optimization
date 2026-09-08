@@ -1,0 +1,220 @@
+# ==============================================================================
+# vllm/models/gpt-oss-20b/deployment.yaml
+#
+# Model     : openai/gpt-oss-20b   (MoE, 21B total / 3.6B active, reasoning model)
+# Weights   : MXFP4, ~13 GB on disk | ~13-16 GB VRAM  (NOT 41.6 GB — that was a
+#             copy/paste error from a bf16 model in the previous revision)
+# S3 path   : s3://<MODEL_BUCKET>/gpt-oss-20b/   (streamed via Run:ai)
+# GPU       : g6e.2xlarge (1x L40S 48 GB, Ada) — auto-provisioned by Karpenter
+#
+# vLLM config aligned to the official gpt-oss recipe:
+#   https://docs.vllm.ai/projects/recipes/en/stable/OpenAI/GPT-OSS.html
+#
+# CHANGES vs previous revision (see CHANGELOG.md — 2026-09-10):
+#   REMOVED --trust-remote-code      : not needed for gpt-oss; RCE risk (a poisoned
+#                                      HF repo could execute code as the pod user)
+#   REMOVED --enable-prefix-caching  : recipe says --no-enable-prefix-caching for
+#                                      CONSISTENT benchmark numbers (cache hits on
+#                                      shared prefixes inflate throughput unevenly)
+#   ADDED   --async-scheduling       : recipe optimisation (overlap CPU/GPU) for gpt-oss
+#   FIXED   --gpu-memory-utilization : 0.80 -> 0.90 (comment previously claimed 0.95
+#                                      but the flag said 0.80 — reconciled)
+#   FIXED   --max-model-len          : 8192 -> 16384. gpt-oss is a REASONING model;
+#                                      it spends many tokens on chain-of-thought
+#                                      before the answer. 8192 truncated the answer
+#                                      on real transcripts. MXFP4 leaves ample HBM.
+#   FIXED   --max-num-batched-tokens : 2048 -> 8192 (recipe recommended value)
+#   NOTE    --stream-interval        : deliberately NOT set. The recipe uses
+#                                      stream-interval=20 for MAX THROUGHPUT serving,
+#                                      but it makes vLLM emit one stream chunk per 20
+#                                      tokens, which distorts the ITL measurement in
+#                                      `vllm bench serve`. For accurate per-token ITL
+#                                      we keep the default (1).
+#   NOTE    reasoning effort         : set PER REQUEST, not a serve flag. Pin it in
+#                                      the workload profile (output.reasoning_effort)
+#                                      so every run uses the same effort — otherwise
+#                                      accuracy/latency are not comparable.
+#   NOTE    L40S (Ada) is NOT gpt-oss's optimal-kernel tier (FlashInfer MXFP4 is
+#           Hopper/Blackwell). vLLM falls back to the Triton/Marlin MXFP4 path here,
+#           so expect lower throughput than the recipe's H100 figures. Expected, not a bug.
+#
+# Runtime values injected via envsubst by deploy.sh:
+#   ${MODEL_BUCKET}  ${BENCHMARK_NAMESPACE}  ${VLLM_IMAGE}
+#
+# Security hardening (Checkov CKV_K8S_*): non-root UID 1000, readOnlyRootFilesystem,
+# drop ALL caps, no privilege escalation, automountServiceAccountToken false,
+# seccomp RuntimeDefault, CPU+mem requests/limits, liveness/readiness probes.
+# ==============================================================================
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: oai-infopt-vllm-gpt-oss-20b
+  namespace: ${BENCHMARK_NAMESPACE}
+  labels:
+    app.kubernetes.io/name: oai-infopt-vllm-gpt-oss-20b
+    app.kubernetes.io/component: inference-server
+    app.kubernetes.io/managed-by: kubectl
+    app.kubernetes.io/version: "gpt-oss-20b"
+    project: observeai-inference-optimization
+    engagement: shellkode-sow
+    environment: sandbox
+    model: gpt-oss-20b
+  annotations:
+    checkov.io/skip1: "CKV_K8S_43=Image digest pinned in VLLM_IMAGE via config/config.env; envsubst resolves at deploy time"
+    checkov.io/skip2: "CKV_K8S_14=Image tag pinned in VLLM_IMAGE; not latest — static analysis cannot resolve envsubst variables"
+    checkov.io/skip3: "CKV_K8S_15=imagePullPolicy IfNotPresent acceptable with digest-pinned image; reassess next sprint"
+    checkov.io/skip4: "CKV_K8S_40=runAsUser 1000 pending vLLM UID compatibility test; tracked for next hardening sprint"
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: oai-infopt-vllm-gpt-oss-20b
+  template:
+    metadata:
+      labels:
+        app: oai-infopt-vllm-gpt-oss-20b
+        app.kubernetes.io/name: oai-infopt-vllm-gpt-oss-20b
+        app.kubernetes.io/component: inference-server
+        project: observeai-inference-optimization
+        engagement: shellkode-sow
+        environment: sandbox
+        model: gpt-oss-20b
+    spec:
+      serviceAccountName: oai-infopt-serving-sa
+      automountServiceAccountToken: false
+
+      hostPID: false
+      hostIPC: false
+      hostNetwork: false
+
+      # Hardware pin — the matrix knob (deploy.sh --hw). Ties each result row to
+      # an exact GPU family/size (g5/g6/g6e). gpt-oss MXFP4 (~13 GB) fits a single
+      # card on all three families, so TP stays 1.
+      nodeSelector:
+        node.kubernetes.io/instance-type: ${NODE_INSTANCE_TYPE}
+
+      tolerations:
+        - key: nvidia.com/gpu
+          operator: Exists
+          effect: NoSchedule
+
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    app.kubernetes.io/component: benchmark-runner
+                topologyKey: kubernetes.io/hostname
+
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+
+      terminationGracePeriodSeconds: 120
+
+      containers:
+        - name: vllm
+          image: ${VLLM_IMAGE}
+          imagePullPolicy: IfNotPresent
+
+          args:
+            - "--model=s3://${MODEL_BUCKET}/${MODEL_FOLDER}/"
+            - "--load-format=runai_streamer"
+            - "--host=0.0.0.0"
+            - "--port=8000"
+            - "--served-model-name=${SERVED_NAME}"
+            - "--tensor-parallel-size=${TP_SIZE}"
+            # ── Memory / context ─────────────────────────────────────────────
+            - "--gpu-memory-utilization=0.90"
+            - "--max-model-len=16384"          # reasoning + transcript headroom
+            # ── Scheduler / batching (recipe) ────────────────────────────────
+            - "--max-num-seqs=256"             # ceiling for the concurrency sweep
+            - "--max-num-batched-tokens=8192"  # recipe recommended value
+            - "--async-scheduling"             # overlap CPU/GPU (recipe)
+            # ── Benchmark consistency (recipe) ───────────────────────────────
+            - "--no-enable-prefix-caching"     # required for consistent measurement
+
+          ports:
+            - name: http
+              containerPort: 8000
+              protocol: TCP
+
+          envFrom:
+            - configMapRef:
+                name: oai-infopt-vllm-config
+
+          env:
+            - name: HOME
+              value: "/tmp"
+            - name: USER
+              value: "vllm"
+            - name: TORCHINDUCTOR_CACHE_DIR
+              value: "/tmp/torchinductor_cache"
+
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            runAsUser: 1000
+            runAsGroup: 1000
+            capabilities:
+              drop: ["ALL"]
+            seccompProfile:
+              type: RuntimeDefault
+
+          resources:
+            requests:
+              cpu: "4"
+              memory: "24Gi"
+              nvidia.com/gpu: "${GPU_COUNT}"
+            limits:
+              cpu: "8"
+              memory: "30Gi"
+              nvidia.com/gpu: "${GPU_COUNT}"
+
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 300
+            periodSeconds: 10
+            failureThreshold: 30
+            timeoutSeconds: 5
+
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 360
+            periodSeconds: 30
+            failureThreshold: 10
+            timeoutSeconds: 5
+
+          volumeMounts:
+            - name: metadata-cache
+              mountPath: /metadata
+            - name: dshm
+              mountPath: /dev/shm
+            - name: tmp
+              mountPath: /tmp
+
+      volumes:
+        - name: metadata-cache
+          persistentVolumeClaim:
+            claimName: oai-infopt-metadata-gpt-oss-20b
+        - name: dshm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 16Gi
+        - name: tmp
+          emptyDir:
+            sizeLimit: 2Gi

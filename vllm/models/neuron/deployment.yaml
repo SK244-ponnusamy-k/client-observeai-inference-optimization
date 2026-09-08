@@ -1,0 +1,148 @@
+# ==============================================================================
+# vllm/models/neuron/deployment.yaml  — Flow B SERVE stage (SCAFFOLD)
+#
+# Serves a Neuron-compiled model via vLLM-Neuron on a Trainium node, exposing the
+# same OpenAI API on :8000 so the SHARED benchmark harness works unchanged.
+#
+# ⚠ SCAFFOLD — validate per model (README.md). Serving on Neuron differs from GPU:
+#   - Different image (${NEURON_VLLM_IMAGE}, NOT the GPU DLC).
+#   - Device resource aws.amazon.com/neuron (not nvidia.com/gpu).
+#   - --device neuron; tensor-parallel = NEURON_CORES; batch/seq must match the
+#     buckets the NEFF was compiled for (see compile-job.yaml).
+#
+# Runtime values injected via envsubst:
+#   ${BENCHMARK_NAMESPACE} ${NEURON_VLLM_IMAGE} ${MODEL_BUCKET}
+#   ${MODEL_FOLDER} ${SERVED_NAME} ${NEURON_CORES}
+#
+# Security hardening mirrors the GPU deployments.
+# ==============================================================================
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: oai-infopt-vllm-neuron
+  namespace: ${BENCHMARK_NAMESPACE}
+  labels:
+    app.kubernetes.io/name: oai-infopt-vllm-neuron
+    app.kubernetes.io/component: inference-server
+    app.kubernetes.io/managed-by: kubectl
+    project: observeai-inference-optimization
+    engagement: shellkode-sow
+    environment: sandbox
+    source: neuron
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: oai-infopt-vllm-neuron
+  template:
+    metadata:
+      labels:
+        app: oai-infopt-vllm-neuron
+        app.kubernetes.io/name: oai-infopt-vllm-neuron
+        app.kubernetes.io/component: inference-server
+        project: observeai-inference-optimization
+        engagement: shellkode-sow
+        environment: sandbox
+        source: neuron
+    spec:
+      serviceAccountName: oai-infopt-serving-sa
+      automountServiceAccountToken: false
+      hostPID: false
+      hostIPC: false
+      hostNetwork: false
+
+      nodeSelector:
+        eks.amazonaws.com/instance-family: trn2
+      tolerations:
+        - key: aws.amazon.com/neuron
+          operator: Exists
+          effect: NoSchedule
+
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+
+      terminationGracePeriodSeconds: 120
+
+      containers:
+        - name: vllm-neuron
+          image: ${NEURON_VLLM_IMAGE}
+          imagePullPolicy: IfNotPresent
+          args:
+            # Point at the compiled NEFF cache in S3 (see compile-job.yaml).
+            - "--model=s3://${MODEL_BUCKET}/${MODEL_FOLDER}/"
+            - "--served-model-name=${SERVED_NAME}"
+            - "--device=neuron"
+            - "--tensor-parallel-size=${NEURON_CORES}"
+            - "--host=0.0.0.0"
+            - "--port=8000"
+            - "--max-model-len=16384"
+            # max-num-seqs MUST match a compiled batch bucket.
+            - "--max-num-seqs=8"
+          ports:
+            - name: http
+              containerPort: 8000
+              protocol: TCP
+          envFrom:
+            - configMapRef:
+                name: oai-infopt-vllm-config
+          env:
+            - name: HOME
+              value: "/tmp"
+            - name: USER
+              value: "vllm"
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            runAsUser: 1000
+            runAsGroup: 1000
+            capabilities:
+              drop: ["ALL"]
+            seccompProfile:
+              type: RuntimeDefault
+          resources:
+            requests:
+              cpu: "8"
+              memory: "32Gi"
+              aws.amazon.com/neuron: "1"
+            limits:
+              cpu: "16"
+              memory: "64Gi"
+              aws.amazon.com/neuron: "1"
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 300
+            periodSeconds: 10
+            failureThreshold: 60
+            timeoutSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 420
+            periodSeconds: 30
+            failureThreshold: 10
+            timeoutSeconds: 5
+          volumeMounts:
+            - name: dshm
+              mountPath: /dev/shm
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: dshm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 16Gi
+        - name: tmp
+          emptyDir:
+            sizeLimit: 8Gi

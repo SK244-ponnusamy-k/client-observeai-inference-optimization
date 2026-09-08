@@ -1,0 +1,46 @@
+# ==============================================================================
+# configs/manifests/gemma-4-26b-a4b-g5-w4a16.yaml
+# Matrix cell: Gemma-4-26B-A4B × g5 (A10G 24GB) × 4-bit W4A16 (single GPU)
+# MoE 3.8B active; 4-bit ~14.4GB fits 24GB with ~7GB KV. Text path.
+# Deploy: bash vllm/models/gemma-4-26b-a4b-it/deploy.sh --hw g5.2xlarge
+# ==============================================================================
+run_id: oai-infopt-2026-08-20-gemma-4-26b-a4b-g5-w4a16-001
+description: "google/gemma-4-26B-A4B-it 4-bit W4A16, g5.2xlarge (1x A10G 24GB), single GPU"
+
+model:
+  hf_id: google/gemma-4-26B-A4B-it
+  served_name: Gemma-4-26B-A4B-it
+  tokenizer: google/gemma-4-26B-A4B-it
+  s3_prefix: Gemma-4-26B-A4B-it-w4a16/
+  source: eks_gpu
+
+serving:
+  image: public.ecr.aws/deep-learning-containers/vllm:0.26.0-gpu-py312-cu130-ubuntu22.04-ec2-v1.0-soci@sha256:e70d649d964dd0b568669453df523e764d23933987ea378d0f423cbe4ae56b81
+  nodepool: gpu-inf
+  instance_type: g5.2xlarge
+
+optimization_variants:
+  - label: w4a16-g5
+    quantization: w4a16
+    tensor_parallel_size: 1
+    max_num_seqs: 256
+    max_num_batched_tokens: 8192
+    max_model_len: 16384
+    kv_cache_dtype: auto
+
+benchmark:
+  workload_profiles:
+    - configs/workload_profiles/realtime_v1.yaml
+    - configs/workload_profiles/batch_v1.yaml
+
+cost:
+  instance_hourly_usd: 1.21    # g5.2xlarge on-demand us-east-2 — VERIFY before run
+
+tags:
+  Project: observeai-inference-optimization
+  Engagement: shellkode-sow
+  Environment: sandbox
+  ManagedBy: benchmark-runner
+  Owner: TBD
+  CostCenter: TBD
+  RunId: oai-infopt-2026-08-20-gemma-4-26b-a4b-g5-w4a16-001

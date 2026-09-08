@@ -1,0 +1,53 @@
+# ==============================================================================
+# configs/manifests/gemma-4-26b-a4b-g6e-fp8.yaml
+# OPTIONAL higher-precision cell: Gemma-4-26B-A4B × g6e (L40S 48GB) × fp8 (single GPU)
+#
+# fp8 weights (~25 GB) fit ONE L40S 48GB with room for KV — no TP needed. This is
+# the "quality ceiling that still fits one card". It does NOT fit 24GB (g5/g6);
+# those would require TP=4 (see docs/benchmark-matrix.md — not the baseline).
+#
+# To deploy this variant, point the model dir at the fp8 checkpoint:
+#   MODEL_FOLDER=Gemma-4-26B-A4B-it-fp8 SERVED_NAME=Gemma-4-26B-A4B-it \
+#     bash vllm/models/gemma-4-26b-a4b-it/deploy.sh --hw g6e.2xlarge
+# (fp8 is a different checkpoint than the w4a16 baseline — download it first.)
+# ==============================================================================
+run_id: oai-infopt-2026-08-20-gemma-4-26b-a4b-g6e-fp8-001
+description: "google/gemma-4-26B-A4B-it fp8, g6e.2xlarge (1x L40S 48GB), single GPU"
+
+model:
+  hf_id: google/gemma-4-26B-A4B-it
+  served_name: Gemma-4-26B-A4B-it
+  tokenizer: google/gemma-4-26B-A4B-it
+  s3_prefix: Gemma-4-26B-A4B-it-fp8/
+  source: eks_gpu
+
+serving:
+  image: public.ecr.aws/deep-learning-containers/vllm:0.26.0-gpu-py312-cu130-ubuntu22.04-ec2-v1.0-soci@sha256:e70d649d964dd0b568669453df523e764d23933987ea378d0f423cbe4ae56b81
+  nodepool: gpu-inf
+  instance_type: g6e.2xlarge
+
+optimization_variants:
+  - label: fp8-g6e
+    quantization: fp8
+    tensor_parallel_size: 1
+    max_num_seqs: 128            # tighter KV budget at fp8 (~25GB weights on 48GB)
+    max_num_batched_tokens: 8192
+    max_model_len: 16384
+    kv_cache_dtype: auto
+
+benchmark:
+  workload_profiles:
+    - configs/workload_profiles/realtime_v1.yaml
+    - configs/workload_profiles/batch_v1.yaml
+
+cost:
+  instance_hourly_usd: 2.24    # g6e.2xlarge on-demand us-east-2 — VERIFY before run
+
+tags:
+  Project: observeai-inference-optimization
+  Engagement: shellkode-sow
+  Environment: sandbox
+  ManagedBy: benchmark-runner
+  Owner: TBD
+  CostCenter: TBD
+  RunId: oai-infopt-2026-08-20-gemma-4-26b-a4b-g6e-fp8-001

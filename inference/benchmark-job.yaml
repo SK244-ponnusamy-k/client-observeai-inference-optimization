@@ -1,0 +1,227 @@
+# ==============================================================================
+# inference/benchmark-job.yaml
+#
+# In-cluster benchmark Job — profile-driven, runs on a SEPARATE CPU node
+# from the GPU inference pod to avoid co-location latency contamination.
+#
+# It runs the orchestrator (load-test.py), which shells out to `vllm bench serve`
+# (the official, tokenizer-accurate load generator) for TTFT/TPOT/ITL/E2E +
+# throughput, scrapes vLLM /metrics for KV-cache/queue, and derives cost.
+#
+# IMPORTANT — image choice:
+#   The Job runs the vLLM DLC image (${VLLM_IMAGE}) because `vllm bench serve`
+#   requires the vllm package + tokenizers. It runs CPU-only (NO GPU request);
+#   only the HTTP client + tokenizer are used. Rendered via envsubst by a runner
+#   (or `envsubst < benchmark-job.yaml | kubectl apply -f -`) so ${VLLM_IMAGE}
+#   and ${RESULTS_BUCKET} resolve from config/config.env.
+#
+# All run parameters come from ConfigMaps — no inline edits to the Job spec.
+#   - oai-infopt-benchmark-script    → load-test.py               (mounted /app)
+#   - oai-infopt-benchmark-manifest  → run manifest YAML          (/configs/manifests)
+#   - oai-infopt-benchmark-profile   → workload profile YAML      (/configs/profiles)
+#   - oai-infopt-benchmark-dataset   → optional custom dataset    (/configs/profiles/datasets)
+#
+# Create the script ConfigMap from the repo file:
+#   kubectl create configmap oai-infopt-benchmark-script \
+#     --from-file=load-test.py=inference/load-test.py -n oai-infopt
+#
+# Security hardening (Checkov): non-root (65534), readOnlyRootFilesystem,
+# drop ALL caps, no privilege escalation, automountServiceAccountToken false,
+# seccomp RuntimeDefault, CPU/mem requests+limits, podAntiAffinity off GPU node.
+#
+# Apply:
+#   envsubst < inference/benchmark-job.yaml | kubectl apply -f -
+#   kubectl logs -n oai-infopt job/oai-infopt-benchmark -f
+#   kubectl delete -n oai-infopt job/oai-infopt-benchmark
+# ==============================================================================
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: oai-infopt-benchmark-config
+  namespace: oai-infopt
+  labels:
+    app.kubernetes.io/name: oai-infopt-benchmark-config
+    app.kubernetes.io/component: benchmark-config
+    project: observeai-inference-optimization
+    engagement: shellkode-sow
+    environment: sandbox
+data:
+  # ── EDIT before applying ─────────────────────────────────────────────────────
+  # MODEL_NAME: short slug → builds the service name  oai-infopt-vllm-<MODEL_NAME>
+  #   gpt-oss-20b | qwen-0-5b | qwen3-5-4b | gemma-4-26b-a4b
+  MODEL_NAME: "gpt-oss-20b"
+  # Leave VLLM_ENDPOINT empty to derive it from MODEL_NAME.
+  VLLM_ENDPOINT: ""
+  MANIFEST_PATH: "/configs/manifests/manifest.yaml"
+  PROFILE_PATH: "/configs/profiles/profile.yaml"
+  RESULTS_DIR: "/results"
+  LOG_LEVEL: "INFO"
+  WAIT_TIMEOUT: "600"
+  AWS_DEFAULT_REGION: "us-east-2"
+  RESULTS_BUCKET: "${RESULTS_BUCKET}"
+  # Optional: DCGM-exporter / Prometheus-federate URL exposing DCGM_FI_DEV_* for
+  # the GPU node under test. Leave empty to source GPU util from Grafana/AMP post-hoc.
+  DCGM_METRICS_URL: ""
+  PROMETHEUS_PUSHGATEWAY: "http://prometheus-pushgateway.monitoring:9091"
+  # ─────────────────────────────────────────────────────────────────────────────
+
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: oai-infopt-benchmark
+  namespace: oai-infopt
+  labels:
+    app.kubernetes.io/name: oai-infopt-benchmark
+    app.kubernetes.io/component: benchmark-runner
+    app.kubernetes.io/managed-by: kubectl
+    project: observeai-inference-optimization
+    engagement: shellkode-sow
+    environment: sandbox
+spec:
+  backoffLimit: 1
+  ttlSecondsAfterFinished: 3600
+  activeDeadlineSeconds: 10800   # 3 h hard cap (concurrency sweep can be long)
+
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: oai-infopt-benchmark
+        app.kubernetes.io/component: benchmark-runner
+        project: observeai-inference-optimization
+        engagement: shellkode-sow
+        environment: sandbox
+    spec:
+      restartPolicy: Never
+      serviceAccountName: oai-infopt-benchmark-sa
+      automountServiceAccountToken: false
+
+      hostPID: false
+      hostIPC: false
+      hostNetwork: false
+
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65534
+        runAsGroup: 65534
+        fsGroup: 65534
+        seccompProfile:
+          type: RuntimeDefault
+
+      # Runner MUST NOT co-locate on the GPU node (contaminates latency), and
+      # must NOT tolerate the GPU taint → lands on a CPU node in the same VPC/AZ.
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels:
+                  app.kubernetes.io/component: inference-server
+              topologyKey: kubernetes.io/hostname
+      tolerations: []
+
+      containers:
+        - name: benchmark
+          # vLLM DLC — provides `vllm bench serve` + tokenizers. CPU-only here.
+          image: ${VLLM_IMAGE}
+          imagePullPolicy: IfNotPresent
+
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              set -euo pipefail
+
+              # boto3 for the S3 upload (not in the DLC by default). Installed to
+              # a writable path since the root FS is read-only.
+              export PYTHONPATH="/tmp/pypackages:${PYTHONPATH:-}"
+              pip install --quiet --no-cache-dir --target /tmp/pypackages boto3==1.34.0 || true
+
+              if [ -z "${VLLM_ENDPOINT:-}" ]; then
+                export VLLM_ENDPOINT="http://oai-infopt-vllm-${MODEL_NAME}:8000"
+              fi
+              echo "Target endpoint: ${VLLM_ENDPOINT}"
+
+              python3 /app/load-test.py \
+                --manifest "${MANIFEST_PATH}" \
+                --profile  "${PROFILE_PATH}" \
+                --endpoint "${VLLM_ENDPOINT}" \
+                --output   "${RESULTS_DIR}" \
+                --wait-timeout "${WAIT_TIMEOUT}"
+
+              echo "Uploading results to s3://${RESULTS_BUCKET}/results/ ..."
+              python3 -c "
+              import boto3, os, glob
+              bucket = os.environ.get('RESULTS_BUCKET','')
+              if not bucket:
+                  print('RESULTS_BUCKET not set — skipping upload'); raise SystemExit(0)
+              s3 = boto3.client('s3', region_name=os.environ.get('AWS_DEFAULT_REGION','us-east-2'))
+              for f in glob.glob('/results/*.jsonl'):
+                  key = 'results/' + os.path.basename(f)
+                  s3.upload_file(f, bucket, key); print('Uploaded', key)
+              " || echo "S3 upload skipped"
+
+          envFrom:
+            - configMapRef:
+                name: oai-infopt-benchmark-config
+
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            runAsUser: 65534
+            runAsGroup: 65534
+            capabilities:
+              drop: ["ALL"]
+            seccompProfile:
+              type: RuntimeDefault
+
+          resources:
+            requests:
+              cpu: "2"
+              memory: "4Gi"
+            limits:
+              cpu: "4"
+              memory: "8Gi"
+
+          volumeMounts:
+            - name: app-code
+              mountPath: /app
+              readOnly: true
+            - name: manifest-volume
+              mountPath: /configs/manifests
+              readOnly: true
+            - name: profile-volume
+              mountPath: /configs/profiles
+              readOnly: true
+            - name: dataset-volume
+              mountPath: /configs/profiles/datasets
+              readOnly: true
+            - name: results
+              mountPath: /results
+            - name: tmp
+              mountPath: /tmp
+
+      volumes:
+        - name: app-code
+          configMap:
+            name: oai-infopt-benchmark-script
+            optional: true
+        - name: manifest-volume
+          configMap:
+            name: oai-infopt-benchmark-manifest
+            optional: true
+        - name: profile-volume
+          configMap:
+            name: oai-infopt-benchmark-profile
+            optional: true
+        - name: dataset-volume
+          configMap:
+            name: oai-infopt-benchmark-dataset
+            optional: true
+        - name: results
+          emptyDir:
+            sizeLimit: 1Gi
+        - name: tmp
+          emptyDir:
+            sizeLimit: 2Gi

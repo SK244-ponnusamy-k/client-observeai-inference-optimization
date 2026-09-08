@@ -1,0 +1,197 @@
+# ==============================================================================
+# model-download/gpt-oss-20b/job.yaml
+#
+# Kubernetes Job: downloads openai/gpt-oss-20b from HuggingFace → S3.
+# Gated model — HF token required. Token is pulled from Secrets Manager
+# via ExternalSecret (k8s/download/hf-token-external-secret.yaml).
+#
+# Runtime values injected via envsubst by download.sh:
+#   ${MODEL_BUCKET}  ${AWS_REGION}  ${DOWNLOAD_SERVICE_ACCOUNT}  ${BENCHMARK_NAMESPACE}
+#
+# Security hardening (Checkov CKV_K8S_*):
+#   - Non-root user (UID 65534 / nobody)            [CKV_K8S_6,  CKV_K8S_40]
+#   - readOnlyRootFilesystem: true                  [CKV_K8S_22]
+#   - allowPrivilegeEscalation: false               [CKV_K8S_20]
+#   - Capabilities: drop ALL, add none              [CKV_K8S_25, CKV_K8S_28]
+#   - automountServiceAccountToken: false           [CKV_K8S_43]
+#   - CPU + memory requests and limits set          [CKV_K8S_10, CKV_K8S_11]
+#   - No hostPath, hostPID, hostIPC, hostNetwork    [CKV_K8S_14-19]
+#   - HF token mounted as Secret volume (NOT env var)  [CKV_K8S_35]
+#     Mounted read-only at /var/secrets/hf/token
+#     Secret created by ESO from AWS Secrets Manager (hf-token-external-secret.yaml)
+#   - /tmp writable emptyDir (pip + HF cache + ~13 GB model staging)
+#
+# Security fix (2026-09-03): HF_TOKEN moved from secretKeyRef env var to a
+#   read-only Secret volume mount. Env vars are visible in kubectl describe pod
+#   output and /proc/<pid>/environ; file mounts are not. Fixes CKV_K8S_35.
+# ==============================================================================
+
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: oai-infopt-download-gpt-oss-20b
+  namespace: ${BENCHMARK_NAMESPACE}
+  labels:
+    app.kubernetes.io/name: oai-infopt-download-gpt-oss-20b
+    app.kubernetes.io/component: model-download
+    app.kubernetes.io/managed-by: kubectl
+    project: observeai-inference-optimization
+    engagement: shellkode-sow
+    environment: sandbox
+    model: gpt-oss-20b
+spec:
+  backoffLimit: 2
+  activeDeadlineSeconds: 86400     # 24 h — model is ~13 GB
+  ttlSecondsAfterFinished: 3600
+
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: oai-infopt-download-gpt-oss-20b
+        app.kubernetes.io/component: model-download
+        project: observeai-inference-optimization
+        engagement: shellkode-sow
+        environment: sandbox
+        model: gpt-oss-20b
+    spec:
+      restartPolicy: Never
+      serviceAccountName: ${DOWNLOAD_SERVICE_ACCOUNT}
+      automountServiceAccountToken: false
+
+      hostPID: false
+      hostIPC: false
+      hostNetwork: false
+
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65534       # nobody
+        runAsGroup: 65534
+        fsGroup: 65534
+        seccompProfile:
+          type: RuntimeDefault
+
+      containers:
+        - name: downloader
+          # Image digest pinned 2026-09-03 — linux/amd64, resolves CKV_K8S_43.
+          # Re-pin: python -c "import urllib.request,json,ssl; ctx=ssl.create_default_context(); r=urllib.request.urlopen('https://auth.docker.io/token?service=registry.docker.io&scope=repository:library/python:pull',context=ctx); tok=json.loads(r.read())['token']; req=urllib.request.Request('https://registry-1.docker.io/v2/library/python/manifests/3.11-slim',headers={'Authorization':'Bearer '+tok,'Accept':'application/vnd.docker.distribution.manifest.list.v2+json'}); r2=urllib.request.urlopen(req,context=ctx); body=json.loads(r2.read()); [print(m['digest']) for m in body['manifests'] if m['platform']['os']=='linux' and m['platform']['architecture']=='amd64']"
+          image: python:3.11-slim@sha256:d1053354624536b044162aaab1e418bd000ea35184fb1ae098ab3166b1072e72
+          imagePullPolicy: IfNotPresent
+
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              set -euo pipefail
+
+              MODEL_ID="openai/gpt-oss-20b"
+              MODEL_FOLDER="gpt-oss-20b"
+              LOCAL_DIR="/tmp/${MODEL_FOLDER}"
+
+              echo "Model  : ${MODEL_ID}"
+              echo "Bucket : s3://${MODEL_BUCKET}/${MODEL_FOLDER}/"
+              echo "Token  : sourced from Secrets Manager via ESO"
+
+              echo "Installing dependencies..."
+              pip install --quiet --no-cache-dir \
+                  --target /tmp/pip-packages \
+                  huggingface_hub==0.24.7 boto3==1.34.0
+              export PYTHONPATH="/tmp/pip-packages:${PYTHONPATH:-}"
+
+              echo "Downloading from HuggingFace (gated model — token required)..."
+              python3 -c "
+              import os
+              from huggingface_hub import snapshot_download
+              try:
+                  with open('/var/secrets/hf/token') as f:
+                      token = f.read().strip()
+              except FileNotFoundError:
+                  raise RuntimeError('HF token file not found at /var/secrets/hf/token — check ExternalSecret sync status')
+              if not token:
+                  raise RuntimeError('HF token file is empty — check ExternalSecret sync status')
+              snapshot_download(
+                  repo_id='${MODEL_ID}',
+                  local_dir='${LOCAL_DIR}',
+                  token=token,
+                  ignore_patterns=['*.msgpack','*.h5','flax_*','tf_*','rust_*'],
+              )
+              print('HF download complete.')
+              "
+
+              echo "Files downloaded:"
+              ls -lah "${LOCAL_DIR}/"
+
+              echo "Uploading to s3://${MODEL_BUCKET}/${MODEL_FOLDER}/ ..."
+              python3 << 'PYEOF'
+              import boto3
+              import os
+              from pathlib import Path
+
+              s3 = boto3.client("s3", region_name=os.environ["AWS_DEFAULT_REGION"])
+              bucket = os.environ["MODEL_BUCKET"]
+              folder = "gpt-oss-20b"
+              local_dir = Path(f"/tmp/{folder}")
+
+              files = [f for f in local_dir.rglob("*")
+                       if f.is_file() and ".cache" not in f.parts]
+              print(f"Uploading {len(files)} files...")
+              for i, f in enumerate(files, 1):
+                  key = f"{folder}/" + str(f.relative_to(local_dir))
+                  size_mb = f.stat().st_size / 1_048_576
+                  print(f"[{i}/{len(files)}] {f.name} ({size_mb:.1f} MB)")
+                  s3.upload_file(str(f), bucket, key)
+              print("Upload complete.")
+              PYEOF
+
+          env:
+            - name: AWS_DEFAULT_REGION
+              value: "${AWS_REGION}"
+            - name: MODEL_BUCKET
+              value: "${MODEL_BUCKET}"
+            - name: HF_HUB_DISABLE_TELEMETRY
+              value: "1"
+            - name: TRANSFORMERS_CACHE
+              value: "/tmp/hf-cache"
+            - name: HF_HOME
+              value: "/tmp/hf-home"
+            - name: PIP_NO_CACHE_DIR
+              value: "1"
+
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            runAsUser: 65534
+            runAsGroup: 65534
+            capabilities:
+              drop: ["ALL"]
+            seccompProfile:
+              type: RuntimeDefault
+
+          resources:
+            requests:
+              cpu: "4"
+              memory: "16Gi"
+            limits:
+              cpu: "8"
+              memory: "32Gi"
+
+          volumeMounts:
+            - name: tmp-workspace
+              mountPath: /tmp
+            # HF token mounted read-only from Secret (ESO-synced from Secrets Manager).
+            # Avoids env-var exposure in kubectl describe / /proc/<pid>/environ.
+            # Fixes CKV_K8S_35.
+            - name: hf-token-vol
+              mountPath: /var/secrets/hf
+              readOnly: true
+
+      volumes:
+        # /tmp for pip, HF cache, and ~13 GB model staging before S3 upload
+        - name: tmp-workspace
+          emptyDir:
+            sizeLimit: 30Gi
+        # HF token Secret volume (created by ExternalSecret from Secrets Manager)
+        # Apply k8s/download/hf-token-external-secret.yaml before running this Job.
+        - name: hf-token-vol
+          secret:
+            secretName: hf-token
+            defaultMode: 0440   # read-only for owner+group; no world read

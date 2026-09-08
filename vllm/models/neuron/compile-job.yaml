@@ -1,0 +1,127 @@
+# ==============================================================================
+# vllm/models/neuron/compile-job.yaml  — Flow B COMPILE stage (SCAFFOLD)
+#
+# Compiles a bf16 model to Neuron NEFF artifacts and caches them in S3 so that
+# serving (and benchmark sweeps) do not recompile every run.
+#
+# ⚠ SCAFFOLD — validate per model before relying on it (see README.md status table).
+#   - Set NEURON_COMPILE_IMAGE in config/config.env (a Neuron SDK / optimum-neuron image).
+#   - Set MODEL_HF_ID, MODEL_FOLDER, NEURON_CORES, SEQ_LEN, BATCH below.
+#   - The compile command differs by architecture; the optimum-neuron path is shown
+#     as the common case. Some models need weight conversion first.
+#
+# Runtime values injected via envsubst:
+#   ${BENCHMARK_NAMESPACE} ${DOWNLOAD_SERVICE_ACCOUNT} ${MODEL_BUCKET} ${AWS_REGION}
+#   ${NEURON_COMPILE_IMAGE}
+#
+# Security hardening: non-root, readOnlyRootFilesystem, drop ALL caps, no priv-esc,
+# automountServiceAccountToken false, seccomp RuntimeDefault, CPU/mem requests+limits.
+# ==============================================================================
+
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: oai-infopt-neuron-compile
+  namespace: ${BENCHMARK_NAMESPACE}
+  labels:
+    app.kubernetes.io/name: oai-infopt-neuron-compile
+    app.kubernetes.io/component: neuron-compile
+    app.kubernetes.io/managed-by: kubectl
+    project: observeai-inference-optimization
+    engagement: shellkode-sow
+    environment: sandbox
+spec:
+  backoffLimit: 1
+  activeDeadlineSeconds: 43200
+  ttlSecondsAfterFinished: 3600
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: oai-infopt-neuron-compile
+        app.kubernetes.io/component: neuron-compile
+        project: observeai-inference-optimization
+        engagement: shellkode-sow
+        environment: sandbox
+    spec:
+      restartPolicy: Never
+      serviceAccountName: ${DOWNLOAD_SERVICE_ACCOUNT}
+      automountServiceAccountToken: false
+      hostPID: false
+      hostIPC: false
+      hostNetwork: false
+      # Compilation runs on a Trainium node (needs the Neuron device to trace/compile).
+      nodeSelector:
+        eks.amazonaws.com/instance-family: trn2
+      tolerations:
+        - key: aws.amazon.com/neuron
+          operator: Exists
+          effect: NoSchedule
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: neuron-compile
+          image: ${NEURON_COMPILE_IMAGE}
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              set -euo pipefail
+              # ---- EDIT THESE per model -------------------------------------
+              MODEL_HF_ID="openai/gpt-oss-20b"        # bf16 source (see README status)
+              MODEL_FOLDER="gpt-oss-20b"              # S3 source folder (bf16 weights)
+              NEFF_FOLDER="${MODEL_FOLDER}-neuron"    # S3 dest for compiled NEFF
+              NEURON_CORES="${NEURON_CORES:-8}"       # = tensor-parallel degree
+              SEQ_LEN="16384"
+              BATCH="8"
+              # ---------------------------------------------------------------
+              echo "Compiling ${MODEL_HF_ID} → NEFF (cores=${NEURON_CORES}, seq=${SEQ_LEN}, batch=${BATCH})"
+              echo "NOTE: exact compile command is architecture-specific — validate per README."
+              #
+              # Common path (optimum-neuron). Uncomment + adapt once support is confirmed:
+              #   optimum-cli export neuron \
+              #     --model "s3://${MODEL_BUCKET}/${MODEL_FOLDER}/" \
+              #     --sequence_length "${SEQ_LEN}" --batch_size "${BATCH}" \
+              #     --num_cores "${NEURON_CORES}" --auto_cast_type bf16 \
+              #     /tmp/neff
+              #   aws s3 sync /tmp/neff "s3://${MODEL_BUCKET}/${NEFF_FOLDER}/"
+              #
+              echo "SCAFFOLD: no compile executed. Wire the command above after validation."
+              exit 1
+          env:
+            - name: AWS_DEFAULT_REGION
+              value: "${AWS_REGION}"
+            - name: MODEL_BUCKET
+              value: "${MODEL_BUCKET}"
+            - name: HOME
+              value: "/tmp"
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            runAsUser: 1000
+            runAsGroup: 1000
+            capabilities:
+              drop: ["ALL"]
+            seccompProfile:
+              type: RuntimeDefault
+          resources:
+            requests:
+              cpu: "8"
+              memory: "32Gi"
+              aws.amazon.com/neuron: "1"
+            limits:
+              cpu: "16"
+              memory: "64Gi"
+              aws.amazon.com/neuron: "1"
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir:
+            sizeLimit: 100Gi

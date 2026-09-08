@@ -1,0 +1,71 @@
+# ==============================================================================
+# .gitignore — llm-inference-framework
+# ==============================================================================
+
+# --- Secrets & credentials (NEVER commit these) ---
+*.pem
+*.key
+*.p12
+*.pfx
+.env
+.env.*
+config/.env
+credentials
+*credentials*
+*secret*
+*.token
+kubeconfig
+kubeconfig-*
+*_rsa
+*_rsa.pub
+*_dsa
+*_ecdsa
+*_ed25519
+
+# --- AWS ---
+.aws/
+aws-exports.js
+terraform.tfstate
+terraform.tfstate.*
+*.tfvars
+.terraform/
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+env/
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.coverage
+.coverage
+htmlcov/
+
+# --- Node (if any tooling added later) ---
+node_modules/
+
+# --- OS ---
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+
+# --- Editor ---
+.vscode/
+.idea/
+*.iml
+
+# --- Benchmark output (local runs) ---
+results/
+*.jsonl
+*.json.tmp
+
+# --- Logs ---
+*.log
+logs/

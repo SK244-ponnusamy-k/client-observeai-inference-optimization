@@ -1,0 +1,210 @@
+# ==============================================================================
+# vllm/models/qwen3.5-4b/deployment.yaml
+#
+# Model     : Qwen/Qwen3.5-4B   (dense multimodal VLM, ~4B params)
+# Weights   : bf16, ~8-9 GB | fits a single GPU on EVERY target family
+# S3 path   : s3://<MODEL_BUCKET>/<MODEL_FOLDER>/   (streamed via Run:ai)
+# Default GPU: g6e.2xlarge (1x L40S) — overridden per run by deploy.sh --hw
+#
+# BENCHMARK MATRIX ROLE: the "small dense" model. Memory is trivial on 24 GB
+# cards, so it runs single-GPU on g5 / g6 / g6e unchanged (only NODE_INSTANCE_TYPE
+# changes per run). See docs/benchmark-matrix.md.
+#
+# ⚠ VALIDATE BEFORE RUN (Qwen3.5 specifics):
+#   - Qwen3.5-4B is MULTIMODAL (vision+text) with a HYBRID attention stack
+#     (Gated DeltaNet + Gated Attention). Confirm the pinned vLLM DLC (0.26.0)
+#     implements the Qwen3.5 architecture; if not, bump the image or use the
+#     Transformers backend. This is the top risk for this model, not memory.
+#   - We benchmark the TEXT path only (Observe.AI transcript QA). Image inputs
+#     are not exercised; keep prompts text-only.
+#   - Hybrid/linear-attention layers change KV-cache behaviour — treat KV-cache
+#     % and max-num-seqs headroom as model-specific, not comparable 1:1 to the
+#     pure-attention models.
+#
+# Config rationale:
+#   NO --quantization    bf16 native (fits everywhere; nothing to quantize)
+#   NO --trust-remote-code  Qwen3.5 is native in Transformers (added 2026-02) — RCE risk avoided
+#   NO --stream-interval    keep per-token ITL accurate for `vllm bench serve`
+#   --no-enable-prefix-caching  consistent benchmark numbers
+#   --async-scheduling      overlap CPU/GPU
+#
+# envsubst-injected (deploy.sh):
+#   ${MODEL_BUCKET} ${BENCHMARK_NAMESPACE} ${VLLM_IMAGE}
+#   ${MODEL_FOLDER} ${SERVED_NAME} ${NODE_INSTANCE_TYPE} ${TP_SIZE} ${GPU_COUNT}
+#
+# Security hardening (Checkov CKV_K8S_*): non-root UID 1000, readOnlyRootFilesystem,
+# drop ALL caps, no privilege escalation, automountServiceAccountToken false,
+# seccomp RuntimeDefault, CPU+mem requests/limits, liveness/readiness probes.
+# ==============================================================================
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: oai-infopt-vllm-qwen3-5-4b
+  namespace: ${BENCHMARK_NAMESPACE}
+  labels:
+    app.kubernetes.io/name: oai-infopt-vllm-qwen3-5-4b
+    app.kubernetes.io/component: inference-server
+    app.kubernetes.io/managed-by: kubectl
+    app.kubernetes.io/version: "qwen3.5-4b"
+    project: observeai-inference-optimization
+    engagement: shellkode-sow
+    environment: sandbox
+    model: qwen3-5-4b
+  annotations:
+    checkov.io/skip1: "CKV_K8S_43=Image digest pinned in VLLM_IMAGE via config/config.env; envsubst resolves at deploy time"
+    checkov.io/skip2: "CKV_K8S_14=Image tag pinned in VLLM_IMAGE; not latest — static analysis cannot resolve envsubst variables"
+    checkov.io/skip3: "CKV_K8S_15=imagePullPolicy IfNotPresent acceptable with digest-pinned image; reassess next sprint"
+    checkov.io/skip4: "CKV_K8S_40=runAsUser 1000 pending vLLM UID compatibility test; tracked for next hardening sprint"
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: oai-infopt-vllm-qwen3-5-4b
+  template:
+    metadata:
+      labels:
+        app: oai-infopt-vllm-qwen3-5-4b
+        app.kubernetes.io/name: oai-infopt-vllm-qwen3-5-4b
+        app.kubernetes.io/component: inference-server
+        project: observeai-inference-optimization
+        engagement: shellkode-sow
+        environment: sandbox
+        model: qwen3-5-4b
+    spec:
+      serviceAccountName: oai-infopt-serving-sa
+      automountServiceAccountToken: false
+
+      hostPID: false
+      hostIPC: false
+      hostNetwork: false
+
+      # Hardware pin — the matrix knob. deploy.sh --hw sets the instance type so
+      # each result row is tied to an exact GPU family (g5/g6/g6e + size).
+      nodeSelector:
+        node.kubernetes.io/instance-type: ${NODE_INSTANCE_TYPE}
+
+      tolerations:
+        - key: nvidia.com/gpu
+          operator: Exists
+          effect: NoSchedule
+
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    app.kubernetes.io/component: benchmark-runner
+                topologyKey: kubernetes.io/hostname
+
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+
+      terminationGracePeriodSeconds: 90
+
+      containers:
+        - name: vllm
+          image: ${VLLM_IMAGE}
+          imagePullPolicy: IfNotPresent
+
+          args:
+            - "--model=s3://${MODEL_BUCKET}/${MODEL_FOLDER}/"
+            - "--load-format=runai_streamer"
+            - "--host=0.0.0.0"
+            - "--port=8000"
+            - "--served-model-name=${SERVED_NAME}"
+            - "--tensor-parallel-size=${TP_SIZE}"
+            # ── Memory / context ─────────────────────────────────────────────
+            - "--gpu-memory-utilization=0.90"
+            - "--max-model-len=16384"
+            # ── Scheduler / batching ─────────────────────────────────────────
+            - "--max-num-seqs=256"
+            - "--max-num-batched-tokens=8192"
+            - "--async-scheduling"
+            # ── Benchmark consistency ────────────────────────────────────────
+            - "--no-enable-prefix-caching"
+
+          ports:
+            - name: http
+              containerPort: 8000
+              protocol: TCP
+
+          envFrom:
+            - configMapRef:
+                name: oai-infopt-vllm-config
+
+          env:
+            - name: HOME
+              value: "/tmp"
+            - name: USER
+              value: "vllm"
+            - name: TORCHINDUCTOR_CACHE_DIR
+              value: "/tmp/torchinductor_cache"
+
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            runAsUser: 1000
+            runAsGroup: 1000
+            capabilities:
+              drop: ["ALL"]
+            seccompProfile:
+              type: RuntimeDefault
+
+          resources:
+            requests:
+              cpu: "4"
+              memory: "16Gi"
+              nvidia.com/gpu: "${GPU_COUNT}"
+            limits:
+              cpu: "8"
+              memory: "24Gi"
+              nvidia.com/gpu: "${GPU_COUNT}"
+
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 120
+            periodSeconds: 10
+            failureThreshold: 24
+            timeoutSeconds: 5
+
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 180
+            periodSeconds: 30
+            failureThreshold: 8
+            timeoutSeconds: 5
+
+          volumeMounts:
+            - name: metadata-cache
+              mountPath: /metadata
+            - name: dshm
+              mountPath: /dev/shm
+            - name: tmp
+              mountPath: /tmp
+
+      volumes:
+        - name: metadata-cache
+          persistentVolumeClaim:
+            claimName: oai-infopt-metadata-qwen3-5-4b
+        - name: dshm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 16Gi
+        - name: tmp
+          emptyDir:
+            sizeLimit: 2Gi

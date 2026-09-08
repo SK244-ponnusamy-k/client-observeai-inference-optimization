@@ -1,0 +1,66 @@
+# ==============================================================================
+# configs/workload_profiles/batch_v1.yaml
+#
+# Frozen workload profile — BATCH
+# Profile version: v1  |  Status: FROZEN (semantics fixed; do not change token
+#                                          lengths / concurrency / SLO — make a v2)
+#
+# Purpose: Throughput-bound benchmark simulating bulk QA form processing.
+#          High concurrency, measures completed interactions/min and tokens/s.
+#
+# 2026-09-10 — SCHEMA ALIGNED to the `vllm bench serve` orchestrator (see
+#   CHANGELOG.md). Keys the harness reads are marked [ACTIVE]. Workload SEMANTICS
+#   unchanged from the original v1.
+#
+# Per ml-pipeline-standards.md: freeze this profile BEFORE benchmarking.
+# ==============================================================================
+
+profile_id: batch_v1             # [ACTIVE]
+profile_type: batch
+description: >
+  High-concurrency throughput-bound profile for bulk QA form processing.
+  Simulates a queue of conversations processed concurrently.
+  Measures output_throughput_tokens_s, completed_interactions_min, KV-cache use.
+
+# -- Input distribution -------------------------------------------------------
+input:
+  dataset_name: random           # [ACTIVE] built-in synthetic dataset (no PII)
+  random_input_len: 1024         # [ACTIVE] ~transcript p95 in tokens
+  ignore_eos: true               # [ACTIVE] fixed output length for stable throughput
+  # --- descriptive (documentation only) --------------------------------------
+  token_distribution:
+    p50_tokens: 512
+    p95_tokens: 1024
+    max_tokens: 2048
+  guided_decoding: true
+  output_schema: configs/workload_profiles/schemas/qa_form_v1.json
+
+# -- Output target ------------------------------------------------------------
+output:
+  max_new_tokens: 512            # [ACTIVE]
+  seed: 42                       # [ACTIVE]
+  reasoning_effort: medium       # [ACTIVE]
+  temperature: 0.0               # (documentation)
+
+# -- Concurrency + sample sizing ----------------------------------------------
+concurrency_levels: [16, 32, 64, 128]   # [ACTIVE]
+num_prompts_factor: 20           # [ACTIVE]  conc*20 (e.g. 128→2560)
+min_prompts: 200                 # [ACTIVE]  floor for the lowest level
+warmup_requests: 20              # (documentation)
+duration_s: 300                  # (documentation)
+
+# -- Throughput SLO -----------------------------------------------------------
+# Key read by the harness: throughput_tokens_s_min.
+slo:
+  throughput_tokens_s_min: 500   # [ACTIVE] minimum acceptable output tokens/s
+  completed_interactions_min: 20 # (documentation) target QA forms/min
+  error_rate_pct: 2.0            # (documentation)
+
+# -- Extra passthrough flags to `vllm bench serve` ----------------------------
+bench_extra_args:                # [ACTIVE]
+  - "--random-range-ratio"
+  - "0.5"
+
+# -- Runner (documentation) ---------------------------------------------------
+runner: vllm_bench_serve
+endpoint_path: /v1/chat/completions

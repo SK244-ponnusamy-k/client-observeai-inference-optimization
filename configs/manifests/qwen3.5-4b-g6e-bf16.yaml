@@ -1,0 +1,47 @@
+# ==============================================================================
+# configs/manifests/qwen3.5-4b-g6e-bf16.yaml
+# Matrix cell: Qwen3.5-4B × g6e (L40S 48GB) × bf16 (single GPU)
+# NOTE: multimodal VLM w/ hybrid attention — benchmark TEXT path; confirm vLLM
+#       0.26 supports the Qwen3.5 architecture (see deployment.yaml warnings).
+# Deploy: bash vllm/models/qwen3.5-4b/deploy.sh --hw g6e.2xlarge
+# ==============================================================================
+run_id: oai-infopt-2026-08-20-qwen3.5-4b-g6e-bf16-001
+description: "Qwen/Qwen3.5-4B bf16, g6e.2xlarge (1x L40S), single GPU, text path"
+
+model:
+  hf_id: Qwen/Qwen3.5-4B
+  served_name: Qwen3.5-4B
+  tokenizer: Qwen/Qwen3.5-4B
+  s3_prefix: Qwen3.5-4B/
+  source: eks_gpu
+
+serving:
+  image: public.ecr.aws/deep-learning-containers/vllm:0.26.0-gpu-py312-cu130-ubuntu22.04-ec2-v1.0-soci@sha256:e70d649d964dd0b568669453df523e764d23933987ea378d0f423cbe4ae56b81
+  nodepool: gpu-inf
+  instance_type: g6e.2xlarge
+
+optimization_variants:
+  - label: bf16-g6e
+    quantization: none
+    tensor_parallel_size: 1
+    max_num_seqs: 256
+    max_num_batched_tokens: 8192
+    max_model_len: 16384
+    kv_cache_dtype: auto
+
+benchmark:
+  workload_profiles:
+    - configs/workload_profiles/realtime_v1.yaml
+    - configs/workload_profiles/batch_v1.yaml
+
+cost:
+  instance_hourly_usd: 2.24    # g6e.2xlarge on-demand us-east-2 — VERIFY before run
+
+tags:
+  Project: observeai-inference-optimization
+  Engagement: shellkode-sow
+  Environment: sandbox
+  ManagedBy: benchmark-runner
+  Owner: TBD
+  CostCenter: TBD
+  RunId: oai-infopt-2026-08-20-qwen3.5-4b-g6e-bf16-001

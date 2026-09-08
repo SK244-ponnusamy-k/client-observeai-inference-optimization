@@ -1,0 +1,35 @@
+# ==============================================================================
+# vllm/service/service-private.yaml
+#
+# ClusterIP service — internal cluster access only.
+# Use this for in-cluster benchmark runner → vLLM communication.
+# Use kubectl port-forward for local laptop testing.
+#
+# Apply:
+#   kubectl apply -f vllm/service/service-private.yaml
+#
+# Port-forward for local testing:
+#   kubectl port-forward -n oai-infopt svc/oai-infopt-vllm-inference 8080:8000 &
+#   curl http://localhost:8080/v1/models
+# ==============================================================================
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: oai-infopt-vllm-inference
+  namespace: oai-infopt
+  labels:
+    app.kubernetes.io/name: oai-infopt-vllm-inference
+    app.kubernetes.io/component: inference-server
+    project: observeai-inference-optimization
+    engagement: shellkode-sow
+    environment: sandbox
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/component: inference-server
+  ports:
+    - name: http
+      port: 8000
+      targetPort: 8000
+      protocol: TCP

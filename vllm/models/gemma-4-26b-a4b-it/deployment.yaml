@@ -1,0 +1,214 @@
+# ==============================================================================
+# vllm/models/gemma-4-26b-a4b-it/deployment.yaml
+#
+# Model     : google/gemma-4-26B-A4B-it   (MoE: 25.2B total / ~3.8B active)
+# Weights   : 4-bit W4A16 (compressed-tensors), ~14-15 GB
+# S3 path   : s3://<MODEL_BUCKET>/<MODEL_FOLDER>/   (streamed via Run:ai)
+# Default GPU: g6e.2xlarge (1x L40S) — overridden per run by deploy.sh --hw
+#
+# BENCHMARK MATRIX ROLE: the "large" model that STILL FITS ONE GPU on every
+# family. Because it is MoE with only ~3.8B active params, at 4-bit (~14.4 GB) it
+# leaves ~7 GB for KV even on a 24 GB card (g5/g6) — real concurrency, not just
+# boot. And MoE-3.8B-active decodes fast, so it is the natural peer to gpt-oss-20b
+# (also MoE). This is WHY we chose 26B-A4B over the 31B dense: the dense model
+# needs TP=4 (no NVLink on L40S/A10G/L4 → poor scaling) for bf16/fp8.
+# See docs/benchmark-matrix.md.
+#
+# ⚠ VALIDATE BEFORE RUN (Gemma-4 / 4-bit specifics):
+#   - QUANT CHECKPOINT: this expects a vLLM-loadable 4-bit checkpoint. Preferred =
+#     compressed-tensors W4A16 (vLLM AUTO-DETECTS from the checkpoint config, so
+#     NO --quantization flag). If you instead use an AWQ checkpoint, add
+#     "--quantization=awq" and point MODEL_FOLDER at that checkpoint. Confirm a
+#     4-bit MoE checkpoint exists / quantize with llm-compressor if not.
+#   - MULTIMODAL: Gemma-4 handles text/image/video. We benchmark the TEXT path.
+#     The vision tower still loads and consumes some VRAM; if you hit OOM on 24 GB
+#     cards, cap it with "--limit-mm-per-prompt image=0,video=0" (verify flag on 0.26).
+#   - Gemma uses interleaved sliding-window + global attention and attention
+#     logit soft-capping — supported in recent vLLM; confirm on the pinned DLC.
+#
+# Config rationale:
+#   NO --quantization    4-bit is self-describing via compressed-tensors config
+#   NO --trust-remote-code  Gemma-4 is native in Transformers — RCE risk avoided
+#   NO --stream-interval    keep per-token ITL accurate for `vllm bench serve`
+#   --no-enable-prefix-caching  consistent benchmark numbers
+#   --async-scheduling      overlap CPU/GPU
+#
+# envsubst-injected (deploy.sh):
+#   ${MODEL_BUCKET} ${BENCHMARK_NAMESPACE} ${VLLM_IMAGE}
+#   ${MODEL_FOLDER} ${SERVED_NAME} ${NODE_INSTANCE_TYPE} ${TP_SIZE} ${GPU_COUNT}
+#
+# Security hardening (Checkov CKV_K8S_*): non-root UID 1000, readOnlyRootFilesystem,
+# drop ALL caps, no privilege escalation, automountServiceAccountToken false,
+# seccomp RuntimeDefault, CPU+mem requests/limits, liveness/readiness probes.
+# ==============================================================================
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: oai-infopt-vllm-gemma-4-26b-a4b
+  namespace: ${BENCHMARK_NAMESPACE}
+  labels:
+    app.kubernetes.io/name: oai-infopt-vllm-gemma-4-26b-a4b
+    app.kubernetes.io/component: inference-server
+    app.kubernetes.io/managed-by: kubectl
+    app.kubernetes.io/version: "gemma-4-26b-a4b-it-w4a16"
+    project: observeai-inference-optimization
+    engagement: shellkode-sow
+    environment: sandbox
+    model: gemma-4-26b-a4b
+  annotations:
+    checkov.io/skip1: "CKV_K8S_43=Image digest pinned in VLLM_IMAGE via config/config.env; envsubst resolves at deploy time"
+    checkov.io/skip2: "CKV_K8S_14=Image tag pinned in VLLM_IMAGE; not latest — static analysis cannot resolve envsubst variables"
+    checkov.io/skip3: "CKV_K8S_15=imagePullPolicy IfNotPresent acceptable with digest-pinned image; reassess next sprint"
+    checkov.io/skip4: "CKV_K8S_40=runAsUser 1000 pending vLLM UID compatibility test; tracked for next hardening sprint"
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: oai-infopt-vllm-gemma-4-26b-a4b
+  template:
+    metadata:
+      labels:
+        app: oai-infopt-vllm-gemma-4-26b-a4b
+        app.kubernetes.io/name: oai-infopt-vllm-gemma-4-26b-a4b
+        app.kubernetes.io/component: inference-server
+        project: observeai-inference-optimization
+        engagement: shellkode-sow
+        environment: sandbox
+        model: gemma-4-26b-a4b
+    spec:
+      serviceAccountName: oai-infopt-serving-sa
+      automountServiceAccountToken: false
+
+      hostPID: false
+      hostIPC: false
+      hostNetwork: false
+
+      # Hardware pin — the matrix knob (deploy.sh --hw).
+      nodeSelector:
+        node.kubernetes.io/instance-type: ${NODE_INSTANCE_TYPE}
+
+      tolerations:
+        - key: nvidia.com/gpu
+          operator: Exists
+          effect: NoSchedule
+
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    app.kubernetes.io/component: benchmark-runner
+                topologyKey: kubernetes.io/hostname
+
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+
+      terminationGracePeriodSeconds: 120
+
+      containers:
+        - name: vllm
+          image: ${VLLM_IMAGE}
+          imagePullPolicy: IfNotPresent
+
+          args:
+            - "--model=s3://${MODEL_BUCKET}/${MODEL_FOLDER}/"
+            - "--load-format=runai_streamer"
+            - "--host=0.0.0.0"
+            - "--port=8000"
+            - "--served-model-name=${SERVED_NAME}"
+            - "--tensor-parallel-size=${TP_SIZE}"
+            # ── Memory / context ─────────────────────────────────────────────
+            - "--gpu-memory-utilization=0.90"
+            - "--max-model-len=16384"
+            # ── Scheduler / batching (MoE; KV-bound on 24 GB cards) ──────────
+            - "--max-num-seqs=256"
+            - "--max-num-batched-tokens=8192"
+            - "--async-scheduling"
+            # ── Benchmark consistency ────────────────────────────────────────
+            - "--no-enable-prefix-caching"
+
+          ports:
+            - name: http
+              containerPort: 8000
+              protocol: TCP
+
+          envFrom:
+            - configMapRef:
+                name: oai-infopt-vllm-config
+
+          env:
+            - name: HOME
+              value: "/tmp"
+            - name: USER
+              value: "vllm"
+            - name: TORCHINDUCTOR_CACHE_DIR
+              value: "/tmp/torchinductor_cache"
+
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            runAsUser: 1000
+            runAsGroup: 1000
+            capabilities:
+              drop: ["ALL"]
+            seccompProfile:
+              type: RuntimeDefault
+
+          resources:
+            requests:
+              cpu: "4"
+              memory: "24Gi"
+              nvidia.com/gpu: "${GPU_COUNT}"
+            limits:
+              cpu: "8"
+              memory: "32Gi"
+              nvidia.com/gpu: "${GPU_COUNT}"
+
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 300
+            periodSeconds: 10
+            failureThreshold: 36
+            timeoutSeconds: 5
+
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 360
+            periodSeconds: 30
+            failureThreshold: 10
+            timeoutSeconds: 5
+
+          volumeMounts:
+            - name: metadata-cache
+              mountPath: /metadata
+            - name: dshm
+              mountPath: /dev/shm
+            - name: tmp
+              mountPath: /tmp
+
+      volumes:
+        - name: metadata-cache
+          persistentVolumeClaim:
+            claimName: oai-infopt-metadata-gemma-4-26b-a4b
+        - name: dshm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 16Gi
+        - name: tmp
+          emptyDir:
+            sizeLimit: 4Gi
