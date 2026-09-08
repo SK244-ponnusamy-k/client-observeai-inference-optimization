@@ -1,0 +1,55 @@
+# ==============================================================================
+# models/qwen-2.5-0.5b.yaml
+#
+# Single source of truth for the Qwen2.5-0.5B-Instruct model.
+# Used by: scripts/download.sh  scripts/deploy.sh  scripts/stop.sh
+#          inference/run-benchmark.sh
+#
+# To onboard this model:
+#   bash scripts/download.sh --model qwen-2.5-0.5b
+#   bash scripts/deploy.sh   --model qwen-2.5-0.5b
+#   bash inference/run-benchmark.sh --model qwen-2.5-0.5b --profile realtime
+#   bash scripts/stop.sh     --model qwen-2.5-0.5b
+# ==============================================================================
+
+# ── Identity ──────────────────────────────────────────────────────────────────
+model_id: qwen-0-5b                           # slug used in all k8s names (no dots)
+model_alias: qwen-2.5-0.5b                    # friendly name for --model argument
+hf_id: Qwen/Qwen2.5-0.5B-Instruct            # HuggingFace repo
+s3_folder: Qwen2.5-0.5B-Instruct             # folder inside MODEL_BUCKET
+served_name: Qwen2.5-0.5B-Instruct           # --served-model-name passed to vLLM
+port_forward_port: "8080"                     # local port for kubectl port-forward
+benchmark_manifest: configs/manifests/qwen-2.5-0.5b-baseline.yaml
+
+# ── Download ──────────────────────────────────────────────────────────────────
+download:
+  size_gb: 1
+  tmp_size_gi: 30                             # emptyDir for staging before S3 upload
+  gated: false                                # public model, no HF token required
+
+# ── Serving ───────────────────────────────────────────────────────────────────
+serving:
+  gpu_memory_utilization: "0.90"
+  max_model_len: "4096"
+  max_num_seqs: ""                            # use vLLM default
+  max_num_batched_tokens: ""                  # use vLLM default
+  quantization: ""                            # no quantization
+  load_format: "runai_streamer"
+  extra_args: []
+
+# ── Kubernetes resources ───────────────────────────────────────────────────────
+resources:
+  cpu_request: "2"
+  cpu_limit: "4"
+  memory_request: "8Gi"
+  memory_limit: "14Gi"
+  gpu: "1"
+  pvc_storage: "5Gi"
+  tmp_size: "2Gi"
+  dshm_size: "16Gi"
+
+# ── Probes ────────────────────────────────────────────────────────────────────
+probes:
+  readiness_initial_delay_s: 60
+  liveness_initial_delay_s: 90
+  termination_grace_period_s: 60

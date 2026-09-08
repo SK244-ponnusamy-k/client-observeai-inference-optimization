@@ -1,0 +1,57 @@
+# ==============================================================================
+# models/gpt-oss-20b.yaml
+#
+# Single source of truth for the gpt-oss-20b model.
+# Used by: scripts/download.sh  scripts/deploy.sh  scripts/stop.sh
+#          inference/run-benchmark.sh
+#
+# To onboard this model:
+#   bash scripts/download.sh --model gpt-oss-20b
+#   bash scripts/deploy.sh   --model gpt-oss-20b
+#   bash inference/run-benchmark.sh --model gpt-oss-20b --profile realtime
+#   bash scripts/stop.sh     --model gpt-oss-20b
+# ==============================================================================
+
+# ── Identity ──────────────────────────────────────────────────────────────────
+model_id: gpt-oss-20b                         # slug used in all k8s names
+hf_id: openai/gpt-oss-20b                     # HuggingFace repo
+s3_folder: gpt-oss-20b                        # folder inside MODEL_BUCKET
+served_name: gpt-oss-20b                      # --served-model-name passed to vLLM
+port_forward_port: "8081"                     # local port for kubectl port-forward
+benchmark_manifest: configs/manifests/gpt-oss-20b-baseline.yaml
+
+# ── Download ──────────────────────────────────────────────────────────────────
+download:
+  size_gb: 13
+  tmp_size_gi: 30                             # emptyDir for staging before S3 upload
+  gated: true                                 # requires HF token
+
+# ── Serving ───────────────────────────────────────────────────────────────────
+serving:
+  gpu_memory_utilization: "0.80"
+  max_model_len: "8192"
+  max_num_seqs: "256"
+  max_num_batched_tokens: "2048"
+  quantization: "mxfp4"                       # empty string = no --quantization flag
+  load_format: "runai_streamer"
+  extra_args:
+    - "--trust-remote-code"
+    - "--enable-chunked-prefill"
+    - "--enable-prefix-caching"
+
+# ── Kubernetes resources ───────────────────────────────────────────────────────
+resources:
+  cpu_request: "4"
+  cpu_limit: "8"
+  memory_request: "24Gi"
+  memory_limit: "30Gi"
+  gpu: "1"
+  pvc_storage: "5Gi"
+  tmp_size: "2Gi"
+  dshm_size: "16Gi"
+
+# ── Probes ────────────────────────────────────────────────────────────────────
+probes:
+  readiness_initial_delay_s: 300
+  liveness_initial_delay_s: 360
+  termination_grace_period_s: 120

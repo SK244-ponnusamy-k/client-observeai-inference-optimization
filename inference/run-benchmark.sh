@@ -3,15 +3,16 @@
 # inference/run-benchmark.sh
 #
 # One command to run a benchmark Job inside the cluster and upload results to S3.
+# Model config is read from models/<model-id>.yaml — no hardcoded values here.
 #
 # Usage:
-#   cd llm-inference-framework
-#   bash inference/run-benchmark.sh                               # gpt-oss-20b realtime (default)
-#   bash inference/run-benchmark.sh --model qwen-0.5b
+#   bash inference/run-benchmark.sh --model gpt-oss-20b --profile realtime
+#   bash inference/run-benchmark.sh --model gpt-oss-20b --profile batch
+#   bash inference/run-benchmark.sh --model qwen-2.5-0.5b --profile realtime
 #   bash inference/run-benchmark.sh --model qwen3-35b-nvfp4 --profile realtime
 #   bash inference/run-benchmark.sh --model qwen3-35b-nvfp4 --profile batch
-#   bash inference/run-benchmark.sh --model gpt-oss-20b --profile batch
-#   bash inference/run-benchmark.sh --model gpt-oss-20b --profile realtime
+#
+# To add a new model: create models/<id>.yaml — no changes needed here.
 # ==============================================================================
 set -euo pipefail
 
@@ -27,7 +28,7 @@ log_error() { echo -e "${RED}[ERROR] $(date +'%H:%M:%S')${NC} $1"; }
 # Defaults
 MODEL="gpt-oss-20b"
 PROFILE="realtime"
-DATASET_XLSX=""   # optional override; defaults to qa_eval_v1.xlsx
+DATASET_XLSX=""
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -38,25 +39,38 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-# Resolve manifest and endpoint from model name
-case "${MODEL}" in
-    gpt-oss-20b)
-        MANIFEST="configs/manifests/gpt-oss-20b-baseline.yaml"
-        SVC="oai-infopt-vllm-gpt-oss-20b"
-        ;;
-    qwen-0.5b|qwen-0-5b|qwen)
-        MANIFEST="configs/manifests/qwen-2.5-0.5b-baseline.yaml"
-        SVC="oai-infopt-vllm-qwen-0-5b"
-        ;;
-    qwen3-35b-nvfp4|qwen3-35b)
-        MANIFEST="configs/manifests/qwen3-35b-nvfp4-baseline.yaml"
-        SVC="oai-infopt-vllm-qwen3-35b-nvfp4"
-        ;;
-    *)
-        log_error "Unknown model: ${MODEL}. Use: gpt-oss-20b | qwen-0.5b | qwen3-35b-nvfp4"
+# ── Pure-bash YAML field reader — no Python needed ────────────────────────────
+yaml_field() {
+    local file="$1" key="$2"
+    grep -m1 "^${key}:" "${file}" | sed "s/^${key}:[[:space:]]*//" | tr -d "'\""
+}
+
+# ── Resolve model config from models/ registry ────────────────────────────────
+MODEL_FILE="${FRAMEWORK_ROOT}/models/${MODEL}.yaml"
+if [[ ! -f "${MODEL_FILE}" ]]; then
+    # Try alias match
+    FOUND=""
+    for f in "${FRAMEWORK_ROOT}/models/"*.yaml; do
+        ALIAS=$(yaml_field "${f}" "model_alias")
+        if [[ "${ALIAS}" == "${MODEL}" ]]; then FOUND="${f}"; break; fi
+    done
+    if [[ -n "${FOUND}" ]]; then
+        MODEL_FILE="${FOUND}"
+    else
+        log_error "Unknown model: '${MODEL}'"
+        log_error "Available models:"
+        ls "${FRAMEWORK_ROOT}/models/"*.yaml 2>/dev/null | xargs -I{} basename {} .yaml | sed 's/^/  /'
         exit 1
-        ;;
-esac
+    fi
+fi
+
+MODEL_ID=$(yaml_field "${MODEL_FILE}" "model_id")
+MANIFEST=$(yaml_field "${MODEL_FILE}" "benchmark_manifest")
+SVC="oai-infopt-vllm-${MODEL_ID}"
+
+if [[ -z "${MODEL_ID}" ]]; then
+    log_error "Could not read model_id from ${MODEL_FILE}"; exit 1
+fi
 
 PROFILE_FILE="configs/workload_profiles/${PROFILE}_v1.yaml"
 ENDPOINT="http://${SVC}:8000"
