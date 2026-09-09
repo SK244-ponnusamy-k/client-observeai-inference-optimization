@@ -33,18 +33,10 @@ log_info()  { echo -e "${GREEN}[INFO]  $(date +'%H:%M:%S')${NC} $1"; }
 log_warn()  { echo -e "${YELLOW}[WARN]  $(date +'%H:%M:%S')${NC} $1"; }
 log_error() { echo -e "${RED}[ERROR] $(date +'%H:%M:%S')${NC} $1"; }
 
-# The 4-bit checkpoint repo — MUST be provided (no safe default).
-QUANT_HF_ID="${QUANT_HF_ID:-REPLACE_WITH_4BIT_CHECKPOINT_REPO}"
+# The target checkpoint repo — defaults to google/gemma-4-26B-A4B-it
+QUANT_HF_ID="${QUANT_HF_ID:-google/gemma-4-26B-A4B-it}"
 MODEL_FOLDER="Gemma-4-26B-A4B-it-w4a16"
 JOB_NAME="oai-infopt-download-gemma-4-26b-a4b"
-
-if [[ "${QUANT_HF_ID}" == "REPLACE_WITH_4BIT_CHECKPOINT_REPO" ]]; then
-    log_error "QUANT_HF_ID is not set. Provide the 4-bit (W4A16/AWQ) checkpoint repo, e.g.:"
-    log_error "  QUANT_HF_ID=<org>/gemma-4-26B-A4B-it-W4A16 bash model-download/gemma-4-26b-a4b-it/download.sh"
-    log_error "If none exists, quantize google/gemma-4-26B-A4B-it offline (llm-compressor W4A16)"
-    log_error "and upload to s3://${MODEL_BUCKET}/${MODEL_FOLDER}/ directly."
-    exit 1
-fi
 
 echo ""
 echo "══════════════════════════════════════════════════"
