@@ -330,27 +330,29 @@ def _g(d: dict[str, Any], *keys: str, default: float = 0.0) -> float:
 def _derive_cost(
     instance_usd: float,
     runtime_s: float,
+    total_tokens: int,
     total_output_tokens: int,
     successful: int,
     gpu_power_watts: float | None,
 ) -> dict[str, float | None]:
-    """Derive cost/efficiency. Returns None (not garbage) when tokens are ~0."""
-    if total_output_tokens < 1 or runtime_s <= 0 or instance_usd <= 0:
+    """Derive cost/efficiency based on total tokens processed (input + output)."""
+    tokens_to_use = total_tokens if total_tokens > 0 else total_output_tokens
+    if tokens_to_use < 1 or runtime_s <= 0 or instance_usd <= 0:
         logger.warning(
             "Cost not derivable: tokens=%s runtime=%.2fs usd/hr=%.4f -> emitting null",
-            total_output_tokens, runtime_s, instance_usd,
+            tokens_to_use, runtime_s, instance_usd,
         )
         return {"cost_per_1m_tokens": None, "cost_per_qa_form": None,
                 "tokens_per_usd": None, "energy_per_1m_tokens_wh": None}
 
     run_cost = (instance_usd / 3600.0) * runtime_s
-    cost_per_1m = run_cost / (total_output_tokens / 1_000_000)
+    cost_per_1m = run_cost / (tokens_to_use / 1_000_000)
     cost_per_form = run_cost / max(successful, 1)
-    tokens_per_usd = total_output_tokens / run_cost if run_cost > 0 else None
+    tokens_per_usd = tokens_to_use / run_cost if run_cost > 0 else None
     energy_per_1m = None
     if gpu_power_watts and gpu_power_watts > 0:
         wh = gpu_power_watts * (runtime_s / 3600.0)
-        energy_per_1m = wh / (total_output_tokens / 1_000_000)
+        energy_per_1m = wh / (tokens_to_use / 1_000_000)
     return {
         "cost_per_1m_tokens": round(cost_per_1m, 6),
         "cost_per_qa_form": round(cost_per_form, 8),
@@ -380,11 +382,12 @@ def _build_result(
     runtime_s = _g(bench, "duration")
     total_out = int(_g(bench, "total_output_tokens"))
     total_in = int(_g(bench, "total_input_tokens"))
+    total_tokens = total_in + total_out
     completed = int(_g(bench, "completed", "num_prompts"))
     completed_per_min = completed / max(runtime_s / 60.0, 1e-9)
     instance_usd = float(manifest.get("cost", {}).get("instance_hourly_usd", 0.0))
 
-    cost = _derive_cost(instance_usd, runtime_s, total_out, completed,
+    cost = _derive_cost(instance_usd, runtime_s, total_tokens, total_out, completed,
                         gpu.get("gpu_power_watts"))
 
     git_sha = os.popen("git rev-parse --short HEAD 2>/dev/null").read().strip() or "unknown"  # noqa: S605
