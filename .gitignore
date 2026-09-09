@@ -69,3 +69,9 @@ results/
 # --- Logs ---
 *.log
 logs/
+# --- Quality-eval datasets (customer-shared data — NEVER commit; lives in S3) ---
+configs/quality/datasets/
+*autoqa*.csv
+*autoqa*.jsonl
+*synthetic_autoqa*
+*transcripts*.csv

@@ -1,0 +1,47 @@
+# ==============================================================================
+# configs/quality/autoqa_v1.yaml
+#
+# Frozen QUALITY-eval config — Observe.AI AutoQA rubric (binary Yes/No).
+# Consumed by inference/quality-eval.py. This is a QUALITY benchmark (accuracy /
+# precision / recall / F1), separate from the performance harness.
+#
+# Dataset: customer-shared SYNTHETIC AutoQA transcripts (1200 rows, 600 Yes /
+# 600 No, 6 QA questions). The dataset itself is NOT committed to git — it is
+# staged to S3 and pulled into the pod at run time by run-quality.sh.
+#
+# Accuracy is HARDWARE-INDEPENDENT — run this once per (model, quantization),
+# NOT per GPU family. Quantization can shift quality, so eval each quant variant.
+# ==============================================================================
+
+eval_id: autoqa_v1
+task_type: binary_classification
+
+dataset:
+  version: autoqa_v1
+  format: csv                 # csv | jsonl
+  text_field: input_prompt    # the ready-made prompt column
+  label_field: answer         # ground-truth column (Yes/No)
+  question_field: question    # used for per-criterion F1 breakdown
+
+labels: ["Yes", "No"]
+positive_label: "Yes"
+
+decoding:
+  # guided_choice: constrain output to exactly one label (clean, fair, exact
+  #   parsing) — RECOMMENDED default; every model is constrained identically.
+  # free_parse: let reasoning models think, then parse the final Yes/No. Use to
+  #   measure "with reasoning"; compare against guided_choice.
+  mode: guided_choice
+  temperature: 0.0            # deterministic
+  seed: 42
+  max_tokens: 8               # guided_choice needs only a few tokens
+  reasoning_max_tokens: 1024  # used only in free_parse mode
+
+model:
+  served_name: gpt-oss-20b    # must match --served-model-name / manifest served_name
+  reasoning_effort: ""        # gpt-oss only: "low"|"medium"|"high"; "" = omit. Pin for comparability.
+  system_prompt: ""           # optional extra instruction; keep frozen if set
+
+run:
+  max_samples: 0              # 0 = all 1200
+  concurrency: 8              # correctness run; modest parallelism to finish faster
