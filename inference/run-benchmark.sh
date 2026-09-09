@@ -40,6 +40,7 @@ PROFILE="realtime"
 HW="g6e"                 # matrix cell suffix: g5 | g6 | g6e
 MANIFEST_OVERRIDE=""     # optional explicit manifest path
 DATASET_OVERRIDE=""      # optional explicit dataset path / S3 key
+IMAGE_OVERRIDE=""        # optional explicit benchmark runner image
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -48,9 +49,12 @@ while [[ $# -gt 0 ]]; do
         --hw)       HW="$2";       shift 2 ;;
         --manifest) MANIFEST_OVERRIDE="$2"; shift 2 ;;
         --dataset)  DATASET_OVERRIDE="$2";  shift 2 ;;
+        --image)    IMAGE_OVERRIDE="$2";    shift 2 ;;
         *) log_error "Unknown: $1"; exit 1 ;;
     esac
 done
+
+BENCHMARK_RUNNER_IMAGE="${IMAGE_OVERRIDE:-${BENCHMARK_IMAGE:-$VLLM_IMAGE}}"
 
 # Resolve service name + default quantization (→ manifest cell) from model name.
 case "${MODEL}" in
@@ -96,7 +100,7 @@ echo "  Hardware : ${HW}"
 echo "  Manifest : ${MANIFEST}"
 echo "  Profile  : ${PROFILE}"
 echo "  Endpoint : ${ENDPOINT}"
-echo "  Image    : ${VLLM_IMAGE}"
+echo "  Image    : ${BENCHMARK_RUNNER_IMAGE}"
 echo "  Job      : ${JOB_NAME}"
 echo "  Results  : s3://${RESULTS_BUCKET}/results/${TIMESTAMP}/${PROFILE}/"
 echo "======================================================"
@@ -214,16 +218,17 @@ spec:
       tolerations: []
       containers:
         - name: benchmark
-          image: ${VLLM_IMAGE}
+          image: ${BENCHMARK_RUNNER_IMAGE}
           imagePullPolicy: IfNotPresent
           command: ["/bin/bash", "-c"]
           args:
             - |
               set -euo pipefail
               export HOME=/tmp
-              # boto3 for the S3 upload (not in the DLC). vllm/pyyaml/tokenizers already present.
               export PYTHONPATH="/tmp/pip-packages:\${PYTHONPATH:-}"
-              pip install --quiet --no-cache-dir --target=/tmp/pip-packages boto3==1.34.0 || true
+              # Install required runner packages if not already present in the image
+              python3 -c "import boto3, vllm, yaml" 2>/dev/null || \
+                pip install --quiet --no-cache-dir --target=/tmp/pip-packages boto3==1.34.0 pyyaml vllm || true
 
               TEST_EXIT=0
               python3 /app/load-test.py \
