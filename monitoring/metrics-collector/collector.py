@@ -262,16 +262,16 @@ def collect_vllm_metrics() -> dict[str, Any]:
         "model_name",
     )
 
-    # Prompt / generation token throughput per model
+    # Prompt / generation token throughput directly from vLLM native metrics
     prompt_tps_by_model = scalar_by_label(
         query_instant(
-            f'sum by (model_name) (rate(vllm:prompt_tokens_total{{namespace="oai-infopt"}}[{window}]))'
+            'vllm:avg_prompt_throughput_toks_per_s{namespace="oai-infopt"} or sum by (model_name) (rate(vllm:prompt_tokens_total{namespace="oai-infopt"}[5m]))'
         ),
         "model_name",
     )
     gen_tps_by_model = scalar_by_label(
         query_instant(
-            f'sum by (model_name) (rate(vllm:generation_tokens_total{{namespace="oai-infopt"}}[{window}]))'
+            'vllm:avg_generation_throughput_toks_per_s{namespace="oai-infopt"} or sum by (model_name) (rate(vllm:generation_tokens_total{namespace="oai-infopt"}[5m]))'
         ),
         "model_name",
     )

@@ -552,7 +552,7 @@
                       "group": "grafana-amazonprometheus-datasource",
                       "kind": "DataQuery",
                       "spec": {
-                        "expr": "rate(vllm:generation_tokens_total{namespace=\"oai-infopt\",model_name=~\"$model\"}[5m])",
+                        "expr": "vllm:avg_generation_throughput_toks_per_s{namespace=\"oai-infopt\",model_name=~\"$model\"} or rate(vllm:generation_tokens_total{namespace=\"oai-infopt\",model_name=~\"$model\"}[5m])",
                         "legendFormat": "{{model_name}} gen tok/s"
                       },
                       "version": "v0"
@@ -916,7 +916,7 @@
                       "group": "grafana-amazonprometheus-datasource",
                       "kind": "DataQuery",
                       "spec": {
-                        "expr": "rate(vllm:generation_tokens_total{namespace=\"oai-infopt\",model_name=~\"$model\"}[5m])",
+                        "expr": "vllm:avg_generation_throughput_toks_per_s{namespace=\"oai-infopt\",model_name=~\"$model\"} or rate(vllm:generation_tokens_total{namespace=\"oai-infopt\",model_name=~\"$model\"}[5m])",
                         "legendFormat": "{{model_name}}"
                       },
                       "version": "v0"
