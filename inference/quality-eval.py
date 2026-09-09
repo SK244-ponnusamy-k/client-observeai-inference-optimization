@@ -182,7 +182,14 @@ def _classify_one(
         body["max_tokens"] = int(dcfg.get("reasoning_max_tokens", 1024))
 
     out = _post_chat(endpoint, body)
-    content = (out["choices"][0]["message"].get("content") or "").strip()
+    msg = out["choices"][0]["message"]
+    # gpt-oss / reasoning models: the final verdict is in `content`; the
+    # chain-of-thought is in `reasoning` (vLLM 0.26) or `reasoning_content`.
+    # Prefer content; fall back to the reasoning text (its last Yes/No is the
+    # conclusion). Field name confirmed via a raw /v1/chat/completions probe.
+    content = (msg.get("content") or "").strip()
+    if not content:
+        content = (msg.get("reasoning") or msg.get("reasoning_content") or "").strip()
     return _parse_label(content, labels)
 
 

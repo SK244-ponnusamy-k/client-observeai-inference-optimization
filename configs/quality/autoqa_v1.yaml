@@ -27,20 +27,26 @@ labels: ["Yes", "No"]
 positive_label: "Yes"
 
 decoding:
-  # guided_choice: constrain output to exactly one label (clean, fair, exact
-  #   parsing) — RECOMMENDED default; every model is constrained identically.
-  # free_parse: let reasoning models think, then parse the final Yes/No. Use to
-  #   measure "with reasoning"; compare against guided_choice.
-  mode: guided_choice
+  # free_parse: let the model generate (reasoning models think first), then we
+  #   parse the final Yes/No from `content` (falling back to `reasoning`).
+  #   REQUIRED for reasoning models like gpt-oss — guided_choice with a tiny
+  #   max_tokens truncates them mid-thought (finish_reason=length, content=null),
+  #   which is exactly why the first run scored 0.
+  # guided_choice: constrain output to exactly one label — clean/exact, and fine
+  #   for NON-reasoning models (Qwen dense, Gemma). If used with a reasoning
+  #   model, give it a large max_tokens so reasoning + the final choice both fit.
+  mode: free_parse
   temperature: 0.0            # deterministic
   seed: 42
-  max_tokens: 8               # guided_choice needs only a few tokens
-  reasoning_max_tokens: 1024  # used only in free_parse mode
+  max_tokens: 8               # guided_choice mode only (non-reasoning models)
+  reasoning_max_tokens: 2048  # free_parse budget — enough for CoT + the verdict
 
 model:
   served_name: gpt-oss-20b    # must match --served-model-name / manifest served_name
-  reasoning_effort: ""        # gpt-oss only: "low"|"medium"|"high"; "" = omit. Pin for comparability.
-  system_prompt: ""           # optional extra instruction; keep frozen if set
+  reasoning_effort: "low"     # gpt-oss: keep CoT short/cheap for a Yes/No verdict; "" = omit
+  # Nudge a clean one-word verdict at the end (the dataset prompt asks to evaluate;
+  # this keeps the FINAL answer parseable). Keep frozen for comparability.
+  system_prompt: "You are grading a call transcript against a single QA question. Think briefly, then end your reply with exactly one word on its own line: Yes or No."
 
 run:
   max_samples: 0              # 0 = all 1200
