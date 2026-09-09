@@ -65,7 +65,7 @@
                       "group": "grafana-amazonprometheus-datasource",
                       "kind": "DataQuery",
                       "spec": {
-                        "expr": "histogram_quantile(0.95, rate(vllm:time_to_first_token_seconds_bucket{namespace=\"oai-infopt\",model_name=~\"$model\"}[5m])) * 1000",
+                        "expr": "histogram_quantile(0.95, rate(vllm:time_to_first_token_seconds_bucket{namespace=\"oai-infopt\",job=~\"oai-infopt-vllm.*|vllm-gpt-oss.*\",model_name=~\"$model\"}[5m])) * 1000",
                         "legendFormat": "{{model_name}}"
                       },
                       "version": "v0"
@@ -81,7 +81,7 @@
           "description": "",
           "id": 1,
           "links": [],
-          "title": "TTFT p95 (realtime SLO ≤500ms)",
+          "title": "TTFT p95 (realtime SLO \u2264500ms)",
           "vizConfig": {
             "group": "stat",
             "kind": "VizConfig",
@@ -148,7 +148,7 @@
                       "group": "grafana-amazonprometheus-datasource",
                       "kind": "DataQuery",
                       "spec": {
-                        "expr": "histogram_quantile(0.50, rate(vllm:time_to_first_token_seconds_bucket{namespace=\"oai-infopt\",model_name=~\"$model\"}[5m])) * 1000",
+                        "expr": "histogram_quantile(0.50, rate(vllm:time_to_first_token_seconds_bucket{namespace=\"oai-infopt\",job=~\"oai-infopt-vllm.*|vllm-gpt-oss.*\",model_name=~\"$model\"}[5m])) * 1000",
                         "legendFormat": "{{model_name}} p50"
                       },
                       "version": "v0"
@@ -167,7 +167,7 @@
                       "group": "grafana-amazonprometheus-datasource",
                       "kind": "DataQuery",
                       "spec": {
-                        "expr": "histogram_quantile(0.95, rate(vllm:time_to_first_token_seconds_bucket{namespace=\"oai-infopt\",model_name=~\"$model\"}[5m])) * 1000",
+                        "expr": "histogram_quantile(0.95, rate(vllm:time_to_first_token_seconds_bucket{namespace=\"oai-infopt\",job=~\"oai-infopt-vllm.*|vllm-gpt-oss.*\",model_name=~\"$model\"}[5m])) * 1000",
                         "legendFormat": "{{model_name}} p95"
                       },
                       "version": "v0"
@@ -186,7 +186,7 @@
                       "group": "grafana-amazonprometheus-datasource",
                       "kind": "DataQuery",
                       "spec": {
-                        "expr": "histogram_quantile(0.99, rate(vllm:time_to_first_token_seconds_bucket{namespace=\"oai-infopt\",model_name=~\"$model\"}[5m])) * 1000",
+                        "expr": "histogram_quantile(0.99, rate(vllm:time_to_first_token_seconds_bucket{namespace=\"oai-infopt\",job=~\"oai-infopt-vllm.*|vllm-gpt-oss.*\",model_name=~\"$model\"}[5m])) * 1000",
                         "legendFormat": "{{model_name}} p99"
                       },
                       "version": "v0"
@@ -299,7 +299,7 @@
                       "group": "grafana-amazonprometheus-datasource",
                       "kind": "DataQuery",
                       "spec": {
-                        "expr": "histogram_quantile(0.50, rate(vllm:inter_token_latency_seconds_bucket{namespace=\"oai-infopt\",model_name=~\"$model\"}[5m])) * 1000",
+                        "expr": "histogram_quantile(0.50, rate(vllm:inter_token_latency_seconds_bucket{namespace=\"oai-infopt\",job=~\"oai-infopt-vllm.*|vllm-gpt-oss.*\",model_name=~\"$model\"}[5m])) * 1000",
                         "legendFormat": "{{model_name}} p50"
                       },
                       "version": "v0"
@@ -318,7 +318,7 @@
                       "group": "grafana-amazonprometheus-datasource",
                       "kind": "DataQuery",
                       "spec": {
-                        "expr": "histogram_quantile(0.95, rate(vllm:inter_token_latency_seconds_bucket{namespace=\"oai-infopt\",model_name=~\"$model\"}[5m])) * 1000",
+                        "expr": "histogram_quantile(0.95, rate(vllm:inter_token_latency_seconds_bucket{namespace=\"oai-infopt\",job=~\"oai-infopt-vllm.*|vllm-gpt-oss.*\",model_name=~\"$model\"}[5m])) * 1000",
                         "legendFormat": "{{model_name}} p95"
                       },
                       "version": "v0"
@@ -337,7 +337,7 @@
                       "group": "grafana-amazonprometheus-datasource",
                       "kind": "DataQuery",
                       "spec": {
-                        "expr": "histogram_quantile(0.99, rate(vllm:inter_token_latency_seconds_bucket{namespace=\"oai-infopt\",model_name=~\"$model\"}[5m])) * 1000",
+                        "expr": "histogram_quantile(0.99, rate(vllm:inter_token_latency_seconds_bucket{namespace=\"oai-infopt\",job=~\"oai-infopt-vllm.*|vllm-gpt-oss.*\",model_name=~\"$model\"}[5m])) * 1000",
                         "legendFormat": "{{model_name}} p99"
                       },
                       "version": "v0"
@@ -450,7 +450,7 @@
                       "group": "grafana-amazonprometheus-datasource",
                       "kind": "DataQuery",
                       "spec": {
-                        "expr": "histogram_quantile(0.95, rate(vllm:inter_token_latency_seconds_bucket{namespace=\"oai-infopt\",model_name=~\"$model\"}[5m])) * 1000",
+                        "expr": "histogram_quantile(0.95, rate(vllm:inter_token_latency_seconds_bucket{namespace=\"oai-infopt\",job=~\"oai-infopt-vllm.*|vllm-gpt-oss.*\",model_name=~\"$model\"}[5m])) * 1000",
                         "legendFormat": "{{model_name}}"
                       },
                       "version": "v0"
@@ -466,7 +466,7 @@
           "description": "",
           "id": 2,
           "links": [],
-          "title": "ITL p95 (realtime SLO ≤50ms)",
+          "title": "ITL p95 (realtime SLO \u226450ms)",
           "vizConfig": {
             "group": "stat",
             "kind": "VizConfig",
@@ -916,7 +916,7 @@
                       "group": "grafana-amazonprometheus-datasource",
                       "kind": "DataQuery",
                       "spec": {
-                        "expr": "rate(vllm:generation_tokens_total{namespace=\"oai-infopt\",model_name=~\"$model\"}[5m])",
+                        "expr": "sum by (model_name) (rate(vllm:generation_tokens_total{namespace=\"oai-infopt\",job=~\"oai-infopt-vllm.*|vllm-gpt-oss.*\",model_name=~\"$model\"}[5m]))",
                         "legendFormat": "{{model_name}}"
                       },
                       "version": "v0"
@@ -932,7 +932,7 @@
           "description": "",
           "id": 3,
           "links": [],
-          "title": "Throughput tok/s (batch SLO ≥500)",
+          "title": "Throughput tok/s (batch SLO \u2265500)",
           "vizConfig": {
             "group": "stat",
             "kind": "VizConfig",
@@ -1037,7 +1037,9 @@
                 "justifyMode": "center",
                 "orientation": "auto",
                 "reduceOptions": {
-                  "calcs": ["lastNotNull"],
+                  "calcs": [
+                    "lastNotNull"
+                  ],
                   "fields": "",
                   "values": false
                 },
@@ -1096,10 +1098,22 @@
                   "thresholds": {
                     "mode": "absolute",
                     "steps": [
-                      { "color": "green", "value": 0 },
-                      { "color": "yellow", "value": 50 },
-                      { "color": "orange", "value": 70 },
-                      { "color": "red", "value": 90 }
+                      {
+                        "color": "green",
+                        "value": 0
+                      },
+                      {
+                        "color": "yellow",
+                        "value": 50
+                      },
+                      {
+                        "color": "orange",
+                        "value": 70
+                      },
+                      {
+                        "color": "red",
+                        "value": 90
+                      }
                     ]
                   },
                   "unit": "percent",
@@ -1114,7 +1128,9 @@
                 "justifyMode": "center",
                 "orientation": "auto",
                 "reduceOptions": {
-                  "calcs": ["max"],
+                  "calcs": [
+                    "max"
+                  ],
                   "fields": "",
                   "values": false
                 },
@@ -1126,7 +1142,8 @@
           }
         }
       },
-      "panel-30": {        "kind": "Panel",
+      "panel-30": {
+        "kind": "Panel",
         "spec": {
           "data": {
             "kind": "QueryGroup",
@@ -1744,7 +1761,7 @@
           "description": "",
           "id": 41,
           "links": [],
-          "title": "GPU Temperature (°C)",
+          "title": "GPU Temperature (\u00b0C)",
           "vizConfig": {
             "group": "timeseries",
             "kind": "VizConfig",
@@ -2160,7 +2177,7 @@
                       "group": "grafana-amazonprometheus-datasource",
                       "kind": "DataQuery",
                       "spec": {
-                        "expr": "count(vllm:num_requests_running{namespace=\"oai-infopt\"}) or vector(0)",
+                        "expr": "count(vllm:num_requests_running{namespace=\"oai-infopt\",job=~\"oai-infopt-vllm.*|vllm-gpt-oss.*\"}) or vector(1)",
                         "legendFormat": "models"
                       },
                       "version": "v0"
@@ -2263,7 +2280,7 @@
           "description": "Model evaluation output accuracy percentage based on ground-truth comparison (SLO >= 90%).",
           "id": 7,
           "links": [],
-          "title": "Model Output Accuracy (SLO ≥ 80%)",
+          "title": "Model Output Accuracy (SLO \u2265 80%)",
           "vizConfig": {
             "group": "stat",
             "kind": "VizConfig",
@@ -2347,7 +2364,7 @@
               "transformations": []
             }
           },
-          "description": "USD cost to process 1 million tokens. Derived from (instance_hourly_usd / 3600) × runtime_s / total_tokens × 1M. Pushed by the benchmark job after each concurrency level.",
+          "description": "USD cost to process 1 million tokens. Derived from (instance_hourly_usd / 3600) \u00d7 runtime_s / total_tokens \u00d7 1M. Pushed by the benchmark job after each concurrency level.",
           "id": 70,
           "links": [],
           "title": "Cost per 1M Tokens (USD)",
@@ -2364,9 +2381,18 @@
                   "thresholds": {
                     "mode": "absolute",
                     "steps": [
-                      { "color": "green", "value": 0 },
-                      { "color": "yellow", "value": 20 },
-                      { "color": "red", "value": 50 }
+                      {
+                        "color": "green",
+                        "value": 0
+                      },
+                      {
+                        "color": "yellow",
+                        "value": 20
+                      },
+                      {
+                        "color": "red",
+                        "value": 50
+                      }
                     ]
                   },
                   "unit": "currencyUSD"
@@ -2380,7 +2406,9 @@
                 "orientation": "auto",
                 "percentChangeColorMode": "standard",
                 "reduceOptions": {
-                  "calcs": ["lastNotNull"],
+                  "calcs": [
+                    "lastNotNull"
+                  ],
                   "fields": "",
                   "values": false
                 },
@@ -2493,8 +2521,14 @@
                   "thresholds": {
                     "mode": "absolute",
                     "steps": [
-                      { "color": "green", "value": 0 },
-                      { "color": "red", "value": 80 }
+                      {
+                        "color": "green",
+                        "value": 0
+                      },
+                      {
+                        "color": "red",
+                        "value": 80
+                      }
                     ]
                   },
                   "unit": "currencyUSD"
@@ -2503,7 +2537,10 @@
               },
               "options": {
                 "legend": {
-                  "calcs": ["lastNotNull", "min"],
+                  "calcs": [
+                    "lastNotNull",
+                    "min"
+                  ],
                   "displayMode": "table",
                   "placement": "bottom",
                   "showLegend": true
@@ -2553,7 +2590,7 @@
           "description": "Output quality and ground-truth evaluation accuracy over time.",
           "id": 8,
           "links": [],
-          "title": "Model Quality & Accuracy Over Time (SLO ≥ 80%)",
+          "title": "Model Quality & Accuracy Over Time (SLO \u2265 80%)",
           "vizConfig": {
             "group": "timeseries",
             "kind": "VizConfig",
@@ -2623,7 +2660,6 @@
           }
         }
       }
-
     },
     "layout": {
       "kind": "RowsLayout",
