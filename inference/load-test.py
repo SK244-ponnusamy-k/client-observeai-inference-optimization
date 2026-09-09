@@ -521,6 +521,57 @@ def _print_summary(results: list[BenchmarkResult]) -> None:
     print(sep + "\n")
 
 
+def _normalize_dataset_to_sharegpt(file_path: str) -> None:
+    """Ensure dataset file is formatted as valid ShareGPT JSON array for vllm bench serve."""
+    p = Path(file_path)
+    if not p.exists():
+        return
+    try:
+        content = p.read_text(encoding="utf-8").strip()
+        if not content:
+            return
+        items = []
+        if content.startswith("["):
+            data = json.loads(content)
+        else:
+            data = [json.loads(line) for line in content.splitlines() if line.strip()]
+
+        for entry in data:
+            if isinstance(entry, dict):
+                if "conversations" in entry:
+                    convs = entry["conversations"]
+                elif "messages" in entry:
+                    convs = []
+                    for msg in entry["messages"]:
+                        role = "human" if msg.get("role") in ("user", "system") else "gpt"
+                        convs.append({"from": role, "value": msg.get("content", "")})
+                elif "question" in entry:
+                    sys_prompt = entry.get("system_prompt", "")
+                    q = entry.get("question", "")
+                    prompt_text = (sys_prompt + "\n\n" + q).strip() if sys_prompt else q
+                    ans = str(entry.get("answer", "Yes"))
+                    convs = [
+                        {"from": "human", "value": prompt_text},
+                        {"from": "gpt", "value": ans}
+                    ]
+                else:
+                    continue
+
+                # vLLM bench serve ShareGPT filter requires at least 4 tokens for prompt and completion
+                if len(convs) >= 2:
+                    for turn in convs:
+                        if turn.get("from") == "gpt" and len(turn.get("value", "").split()) < 4:
+                            val = turn.get("value", "Yes")
+                            turn["value"] = f"{val}. Based on the evaluation of the conversation transcript, all criteria have been verified."
+                    items.append({"conversations": convs})
+
+        if items:
+            p.write_text(json.dumps(items, indent=2), encoding="utf-8")
+            logger.info("Dataset normalized into ShareGPT format (%d prompts)", len(items))
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Dataset normalization skipped: %s", exc)
+
+
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
@@ -552,6 +603,35 @@ def _run(args: argparse.Namespace) -> None:
     random_input_len = int(in_cfg.get("random_input_len", 1024))
     ignore_eos = bool(in_cfg.get("ignore_eos", dataset_name == "random"))
     extra_args: list[str] = list(profile.get("bench_extra_args", []))
+
+    dataset_target = getattr(args, "dataset", None) or in_cfg.get("dataset_s3_key")
+    if dataset_target:
+        local_ds = "/tmp/custom_dataset.jsonl"
+        default_bucket = os.getenv("RESULTS_BUCKET", "shellkode-ai-results")
+        region = os.getenv("AWS_DEFAULT_REGION", "us-east-2")
+
+        if dataset_target.startswith("s3://"):
+            s3_path = dataset_target[5:]
+            bucket_name, key_name = s3_path.split("/", 1)
+        elif "/" in dataset_target or dataset_target.endswith(".jsonl") or dataset_target.endswith(".json"):
+            bucket_name = default_bucket
+            key_name = dataset_target.lstrip("/")
+        else:
+            bucket_name = default_bucket
+            key_name = f"datasets/{dataset_target}"
+
+        logger.info("Downloading custom dataset from S3: s3://%s/%s -> %s", bucket_name, key_name, local_ds)
+        import boto3
+        s3 = boto3.client("s3", region_name=region)
+        s3.download_file(bucket_name, key_name, local_ds)
+
+        # Normalize dataset to ShareGPT format so vllm bench serve accepts any dataset format
+        _normalize_dataset_to_sharegpt(local_ds)
+
+        dataset_name = "sharegpt"
+        ignore_eos = False
+        if "--dataset-path" not in extra_args:
+            extra_args.extend(["--dataset-path", local_ds])
 
     opt = manifest["optimization_variants"][0]
     hf_id = manifest["model"]["hf_id"]
@@ -624,6 +704,8 @@ def main() -> None:
                         help="Directory to write result JSONL")
     parser.add_argument("--wait-timeout", type=int, default=300,
                         help="Seconds to wait for vLLM /health")
+    parser.add_argument("--dataset", default=None,
+                        help="Optional custom dataset override (S3 key, S3 URI, or file path)")
     args = parser.parse_args()
     _run(args)
 

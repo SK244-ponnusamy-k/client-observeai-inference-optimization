@@ -39,6 +39,7 @@ MODEL="gpt-oss-20b"
 PROFILE="realtime"
 HW="g6e"                 # matrix cell suffix: g5 | g6 | g6e
 MANIFEST_OVERRIDE=""     # optional explicit manifest path
+DATASET_OVERRIDE=""      # optional explicit dataset path / S3 key
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -46,6 +47,7 @@ while [[ $# -gt 0 ]]; do
         --profile)  PROFILE="$2";  shift 2 ;;
         --hw)       HW="$2";       shift 2 ;;
         --manifest) MANIFEST_OVERRIDE="$2"; shift 2 ;;
+        --dataset)  DATASET_OVERRIDE="$2";  shift 2 ;;
         *) log_error "Unknown: $1"; exit 1 ;;
     esac
 done
@@ -102,6 +104,32 @@ echo ""
 
 cd "${FRAMEWORK_ROOT}"
 
+# Handle custom dataset S3 sync (upload local dataset if missing from S3, else skip upload)
+if [[ -n "${DATASET_OVERRIDE:-}" ]]; then
+    DS_BASENAME=$(basename "${DATASET_OVERRIDE}")
+    S3_KEY="datasets/${DS_BASENAME}"
+
+    if aws s3 ls "s3://${RESULTS_BUCKET}/${S3_KEY}" --region "${AWS_REGION}" >/dev/null 2>&1; then
+        log_info "Dataset found in S3: s3://${RESULTS_BUCKET}/${S3_KEY} (Skipping upload)."
+    else
+        LOCAL_FILE=""
+        if [[ -f "${DATASET_OVERRIDE}" ]]; then
+            LOCAL_FILE="${DATASET_OVERRIDE}"
+        elif [[ -f "${FRAMEWORK_ROOT}/configs/workload_profiles/datasets/${DS_BASENAME}" ]]; then
+            LOCAL_FILE="${FRAMEWORK_ROOT}/configs/workload_profiles/datasets/${DS_BASENAME}"
+        fi
+
+        if [[ -n "${LOCAL_FILE}" && -f "${LOCAL_FILE}" ]]; then
+            log_info "Dataset not found in S3. Uploading '${LOCAL_FILE}' -> s3://${RESULTS_BUCKET}/${S3_KEY}..."
+            aws s3 cp "${LOCAL_FILE}" "s3://${RESULTS_BUCKET}/${S3_KEY}" --region "${AWS_REGION}"
+            log_info "Dataset upload complete."
+        else
+            log_warn "Dataset '${DATASET_OVERRIDE}' not found locally or in S3. Pod will attempt download."
+        fi
+    fi
+    DATASET_OVERRIDE="${S3_KEY}"
+fi
+
 # ==============================================================================
 # Step 1 — Create / update ConfigMaps (script + manifest + profile)
 # ==============================================================================
@@ -119,7 +147,16 @@ kubectl create configmap "oai-infopt-benchmark-profile-${PROFILE}" \
     --from-file=profile.yaml="${FRAMEWORK_ROOT}/${PROFILE_FILE}" \
     -n "${BENCHMARK_NAMESPACE}" --dry-run=client -o yaml | kubectl apply -f - >/dev/null
 
-log_info "ConfigMaps ready. (Inputs come from vllm bench serve's built-in 'random' dataset — no external dataset needed.)"
+if [[ -n "${DATASET_OVERRIDE:-}" ]]; then
+    log_info "ConfigMaps ready. (Using custom dataset from S3: s3://${RESULTS_BUCKET}/${DATASET_OVERRIDE})"
+else
+    log_info "ConfigMaps ready. (Inputs come from vllm bench serve's built-in 'random' dataset)."
+fi
+
+DATASET_JOB_ARG=""
+if [[ -n "${DATASET_OVERRIDE:-}" ]]; then
+    DATASET_JOB_ARG="--dataset ${DATASET_OVERRIDE}"
+fi
 
 # ==============================================================================
 # Step 2 — Submit Job (runs from the vLLM DLC image, CPU-only)
@@ -190,7 +227,7 @@ spec:
                 --profile  /configs/profiles/profile.yaml \
                 --endpoint "${ENDPOINT}" \
                 --output   /results \
-                --wait-timeout 600 || TEST_EXIT=\$?
+                --wait-timeout 600 ${DATASET_JOB_ARG} || TEST_EXIT=\$?
 
               echo "=== Uploading results to S3 ==="
               python3 -c "
