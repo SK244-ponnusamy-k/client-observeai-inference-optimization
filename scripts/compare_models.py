@@ -74,7 +74,19 @@ def export_csv(results: list[dict[str, Any]], csv_path: Path) -> None:
         writer.writeheader()
         for r in results:
             writer.writerow(r)
-    print(f"✅ Benchmark comparison CSV exported to: {csv_path.resolve()}")
+    print(f"[SUCCESS] Benchmark comparison CSV exported to: {csv_path.resolve()}")
+
+
+def _v(r: dict[str, Any], *keys: str, default: float = 0.0) -> float:
+    """Safely extract float metric from dict, handling None values and key fallbacks."""
+    for key in keys:
+        val = r.get(key)
+        if val is not None:
+            try:
+                return float(val)
+            except (TypeError, ValueError):
+                continue
+    return default
 
 
 def export_excel(results: list[dict[str, Any]], xlsx_path: Path) -> None:
@@ -112,7 +124,6 @@ def export_excel(results: list[dict[str, Any]], xlsx_path: Path) -> None:
         "TTFT p95 (ms)",
         "ITL p95 (ms)",
         "Throughput (tok/s)",
-        "Accuracy (%)",
         "Cost / 1M Tokens ($)",
         "Cost / Form ($)",
         "GPU Util (%)",
@@ -146,16 +157,15 @@ def export_excel(results: list[dict[str, Any]], xlsx_path: Path) -> None:
             r.get("hf_id", "unknown").split("/")[-1],
             r.get("profile", "unknown"),
             r.get("concurrency", 1),
-            round(r.get("ttft_p50_ms", 0.0), 1),
-            round(r.get("ttft_p95_ms", 0.0), 1),
-            round(r.get("itl_p95_ms", 0.0), 1),
-            round(r.get("throughput_tokens_s", 0.0), 1),
-            round(r.get("accuracy_avg_pct", 0.0), 1),
-            round(r.get("cost_per_1m_tokens", 0.0), 4),
-            round(r.get("cost_per_qa_form", 0.0), 6),
-            round(r.get("gpu_utilization_pct", 0.0), 1),
-            round(r.get("gpu_memory_used_mib", 0.0), 0),
-            round(r.get("gpu_cache_usage_pct", 0.0), 1),
+            round(_v(r, "ttft_p50_ms", "median_ttft_ms"), 1),
+            round(_v(r, "ttft_p95_ms", "p95_ttft_ms"), 1),
+            round(_v(r, "itl_p95_ms", "p95_itl_ms"), 1),
+            round(_v(r, "throughput_tokens_s", "output_throughput_tokens_s"), 1),
+            round(_v(r, "cost_per_1m_tokens"), 4),
+            round(_v(r, "cost_per_qa_form"), 6),
+            round(_v(r, "gpu_utilization_pct"), 1),
+            round(_v(r, "gpu_memory_used_mib", "gpu_mem_used_mib"), 0),
+            round(_v(r, "gpu_cache_usage_pct", "kv_cache_utilization_pct"), 1),
             r.get("instance_type", "unknown"),
             "PASSED" if r.get("status") == "passed" else "SLO FAIL",
         ])
@@ -190,8 +200,8 @@ def export_excel(results: list[dict[str, Any]], xlsx_path: Path) -> None:
 
     xlsx_path.parent.mkdir(parents=True, exist_ok=True)
     wb.save(xlsx_path)
-    print(f"\n✅ Model comparison Excel report generated successfully!")
-    print(f"📊 File Location: {xlsx_path.resolve()}\n")
+    print(f"\n[SUCCESS] Model comparison Excel report generated successfully!")
+    print(f"[REPORT]  File Location: {xlsx_path.resolve()}\n")
 
 
 def print_comparison_table(results: list[dict[str, Any]]) -> None:
@@ -208,32 +218,31 @@ def print_comparison_table(results: list[dict[str, Any]]) -> None:
             seen.add(key)
             unique_results.append(r)
 
-    sep = "═" * 110
+    sep = "=" * 100
     print(f"\n{sep}")
     print(f"  LLM BENCHMARK MODEL COMPARISON SUMMARY ({len(unique_results)} runs found)")
     print(sep)
     print(
         f"  {'Model (HF ID)':<26} {'Profile':<10} {'Concur':>6} "
-        f"{'TTFT p95':>10} {'ITL p95':>9} {'Tok/s':>9} {'Acc %':>7} "
+        f"{'TTFT p95':>10} {'ITL p95':>9} {'Tok/s':>9} "
         f"{'Cost/1M':>10} {'GPU Util':>9} {'Status':<10}"
     )
-    print(f"  {'-'*106}")
+    print(f"  {'-'*96}")
 
     for r in sorted(unique_results, key=lambda x: (x.get("hf_id", ""), x.get("profile", ""), x.get("concurrency", 0))):
         hf_id = r.get("hf_id", "unknown").split("/")[-1]
         profile = r.get("profile", "unknown")
         concurrency = r.get("concurrency", 1)
-        ttft_p95 = f"{r.get('ttft_p95_ms', 0.0):.1f}ms"
-        itl_p95 = f"{r.get('itl_p95_ms', 0.0):.1f}ms"
-        throughput = f"{r.get('throughput_tokens_s', 0.0):.1f}"
-        accuracy = f"{r.get('accuracy_avg_pct', 0.0):.1f}%"
-        cost = f"${r.get('cost_per_1m_tokens', 0.0):.4f}"
-        gpu_util = f"{r.get('gpu_utilization_pct', 0.0):.1f}%"
-        status = "✓ pass" if r.get("status") == "passed" else "✗ SLO FAIL"
+        ttft_p95 = f"{_v(r, 'ttft_p95_ms', 'p95_ttft_ms'):.1f}ms"
+        itl_p95 = f"{_v(r, 'itl_p95_ms', 'p95_itl_ms'):.1f}ms"
+        throughput = f"{_v(r, 'throughput_tokens_s', 'output_throughput_tokens_s'):.1f}"
+        cost = f"${_v(r, 'cost_per_1m_tokens'):.4f}"
+        gpu_util = f"{_v(r, 'gpu_utilization_pct'):.1f}%"
+        status = "PASSED" if r.get("status") == "passed" else "SLO FAIL"
 
         print(
             f"  {hf_id:<26} {profile:<10} {concurrency:>6} "
-            f"{ttft_p95:>10} {itl_p95:>9} {throughput:>9} {accuracy:>7} "
+            f"{ttft_p95:>10} {itl_p95:>9} {throughput:>9} "
             f"{cost:>10} {gpu_util:>9} {status:<10}"
         )
 
