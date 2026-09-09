@@ -641,7 +641,11 @@ def _run(args: argparse.Namespace) -> None:
     served_model = manifest["model"].get("served_name") or hf_id.split("/")[-1]
     tokenizer = manifest["model"].get("tokenizer", hf_id)
     endpoint = args.endpoint.rstrip("/")
-    dcgm_url = os.getenv("DCGM_METRICS_URL")
+    dcgm_url = (
+        os.getenv("DCGM_METRICS_URL")
+        or os.getenv("DCGM_EXPORTER_URL")
+        or "http://dcgm-exporter.monitoring.svc.cluster.local:9400/metrics"
+    )
 
     _wait_for_vllm(endpoint, timeout_s=args.wait_timeout)
 

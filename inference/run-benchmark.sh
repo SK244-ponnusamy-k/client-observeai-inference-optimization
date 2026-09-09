@@ -248,6 +248,8 @@ spec:
               value: "${AWS_REGION}"
             - name: RESULTS_BUCKET
               value: "${RESULTS_BUCKET}"
+            - name: DCGM_METRICS_URL
+              value: "http://dcgm-exporter.monitoring.svc.cluster.local:9400/metrics"
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
