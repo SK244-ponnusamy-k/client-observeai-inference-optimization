@@ -158,8 +158,10 @@ spec:
                 --endpoint "${ENDPOINT}" \
                 --model    "${MODEL}" \
                 --quantization "${QUANT}" \
+                --hardware "${HW}" \
                 --output   /results \
                 --wait-timeout 600 || TEST_EXIT=\$?
+
               echo "=== Uploading quality results to S3 ==="
               python3 -c "
               import boto3, os, glob
@@ -170,8 +172,11 @@ spec:
               " || true
               exit \${TEST_EXIT}
           env:
+            - name: PYTHONUNBUFFERED
+              value: "1"
             - name: AWS_DEFAULT_REGION
               value: "${AWS_REGION}"
+
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true

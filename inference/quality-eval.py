@@ -70,10 +70,12 @@ class QualityResult:
     eval_id: str
     served_model: str
     quantization: str
+    hardware: str
     dataset_version: str
     decoding_mode: str
     reasoning_effort: str
     n_total: int
+
     n_scored: int
     n_unparseable: int
     accuracy: float
@@ -102,24 +104,70 @@ def load_dataset(path: str, cfg: dict[str, Any]) -> list[dict[str, str]]:
         raise FileNotFoundError(f"Dataset not found: {path}")
 
     def _row(d: dict[str, Any], i: int) -> dict[str, str]:
+        lower_d = {str(k).strip().lower(): v for k, v in d.items() if k is not None}
+        prompt_val = (
+            d.get(text_f) or lower_d.get(text_f.lower()) or 
+            lower_d.get("question") or lower_d.get("input_prompt") or lower_d.get("prompt") or ""
+        )
+        gold_val = (
+            d.get(label_f) or lower_d.get(label_f.lower()) or 
+            lower_d.get("answer") or lower_d.get("gold") or lower_d.get("ground_truth") or lower_d.get("label") or ""
+        )
+        q_val = d.get(q_f) or lower_d.get(q_f.lower()) or ""
+
+        gold_str = str(gold_val).strip()
+        if gold_str.lower() == "yes":
+            gold_str = "Yes"
+        elif gold_str.lower() == "no":
+            gold_str = "No"
+
+        prompt_str = str(prompt_val).strip()
+        q_str = str(q_val).strip()
+        if (not q_str or q_str == prompt_str) and "Question:" in prompt_str:
+            q_match = re.search(r"Question:\s*(.*?)(?:\n|Sub-criteria:|$)", prompt_str, re.IGNORECASE | re.DOTALL)
+            if q_match:
+                q_str = q_match.group(1).strip()
+
         return {
-            "data_id": str(d.get("data_id", i)),
-            "prompt": (d.get(text_f) or "").strip(),
-            "gold": (d.get(label_f) or "").strip(),
-            "question": ((d.get(q_f) or "").strip()[:60] if q_f else "all"),
+            "data_id": str(d.get("data_id") or lower_d.get("data_id") or i),
+            "prompt": prompt_str,
+            "gold": gold_str,
+            "question": (q_str[:60] if q_str else "all"),
         }
 
-    if p.suffix.lower() == ".jsonl":
+    # Auto-detect JSONL content by checking first non-empty characters
+    first_chars = ""
+    with p.open(encoding="utf-8") as f:
+        for line in f:
+            s = line.strip()
+            if s:
+                first_chars = s[:10]
+                break
+
+    is_json = p.suffix.lower() == ".jsonl" or first_chars.startswith("{") or first_chars.startswith("[")
+
+    if is_json:
         with p.open(encoding="utf-8") as f:
-            rows = [_row(json.loads(line), i) for i, line in enumerate(f) if line.strip()]
-    else:  # csv
+            for i, line in enumerate(f):
+                line = line.strip()
+                if line:
+                    try:
+                        rows.append(_row(json.loads(line), i))
+                    except Exception as exc:
+                        logger.warning("Failed to parse JSONL line %d: %s", i+1, exc)
+    else:  # csv / tsv
         with p.open(newline="", encoding="utf-8") as f:
-            rows = [_row(d, i) for i, d in enumerate(csv.DictReader(f))]
+            sample = f.read(4096)
+            f.seek(0)
+            first_line = sample.splitlines()[0] if sample else ""
+            delim = "\t" if "\t" in first_line else ","
+            rows = [_row(d, i) for i, d in enumerate(csv.DictReader(f, delimiter=delim))]
 
     n = int(cfg.get("run", {}).get("max_samples", 0) or 0)
     if n > 0:
         rows = rows[:n]
     return rows
+
 
 
 # ---------------------------------------------------------------------------
@@ -183,19 +231,21 @@ def _classify_one(
 
     out = _post_chat(endpoint, body)
     msg = out["choices"][0]["message"]
-    # gpt-oss / reasoning models: the final verdict is in `content`; the
-    # chain-of-thought is in `reasoning` (vLLM 0.26) or `reasoning_content`.
-    # Prefer content; fall back to the reasoning text (its last Yes/No is the
-    # conclusion). Field name confirmed via a raw /v1/chat/completions probe.
-    content = (msg.get("content") or "").strip()
-    if not content:
-        content = (msg.get("reasoning") or msg.get("reasoning_content") or "").strip()
-    return _parse_label(content, labels)
+    # Combine content and reasoning fields in case vLLM places output in content, reasoning_content, or reasoning
+    full_text = " ".join([
+        str(msg.get("content") or ""),
+        str(msg.get("reasoning_content") or ""),
+        str(msg.get("reasoning") or ""),
+        str(msg.get("text") or ""),
+    ]).strip()
+    return _parse_label(full_text, labels)
 
 
 def _parse_label(content: str, labels: list[str]) -> str:
-    """Exact match first; else last label mention; else UNKNOWN."""
+    """Exact match first; else last label mention; else fallback search; else UNKNOWN."""
     c = content.strip()
+    if not c:
+        return "UNKNOWN"
     for lab in labels:
         if c.lower() == lab.lower():
             return lab
@@ -205,7 +255,11 @@ def _parse_label(content: str, labels: list[str]) -> str:
         for lab in labels:
             if lab.lower() == last:
                 return lab
+    for lab in labels:
+        if lab.lower() in c.lower():
+            return lab
     return "UNKNOWN"
+
 
 
 # ---------------------------------------------------------------------------
@@ -324,6 +378,7 @@ def _run(args: argparse.Namespace) -> None:
         eval_id=cfg.get("eval_id", "autoqa"),
         served_model=served_model,
         quantization=args.quantization,
+        hardware=args.hardware,
         dataset_version=cfg.get("dataset", {}).get("version", "autoqa_v1"),
         decoding_mode=str(dcfg.get("mode", "guided_choice")),
         reasoning_effort=str(mcfg.get("reasoning_effort", "") or "n/a"),
@@ -355,7 +410,7 @@ def _run(args: argparse.Namespace) -> None:
 
 def _print_summary(r: QualityResult) -> None:
     sep = "=" * 70
-    print(f"\n{sep}\n  QUALITY (AutoQA) — {r.served_model}  [{r.quantization}]\n{sep}")
+    print(f"\n{sep}\n  QUALITY (AutoQA) — {r.served_model}  [{r.quantization}]  ({r.hardware})\n{sep}")
     print(f"  dataset={r.dataset_version}  decoding={r.decoding_mode}  reasoning={r.reasoning_effort}")
     print(f"  n={r.n_total}  unparseable={r.n_unparseable}")
     print(f"  Accuracy : {r.accuracy:.4f}")
@@ -377,8 +432,10 @@ def main() -> None:
     ap.add_argument("--output", default="results/", help="Output dir for the quality JSONL")
     ap.add_argument("--model", default="", help="Served model name override")
     ap.add_argument("--quantization", default="unknown", help="Quant label for the result row")
+    ap.add_argument("--hardware", default="unknown", help="Hardware/instance type label (e.g. g5, g6, g6e)")
     ap.add_argument("--wait-timeout", type=int, default=300)
     _run(ap.parse_args())
+
 
 
 if __name__ == "__main__":
