@@ -131,19 +131,23 @@ if [[ -n "${DATASET_OVERRIDE:-}" ]]; then
 fi
 
 # ==============================================================================
-# Step 1 — Create / update ConfigMaps (script + manifest + profile)
+# Step 1 — Create / update ConfigMaps (script + manifest + profile isolated per Job)
 # ==============================================================================
 log_info "Creating ConfigMaps..."
 
-kubectl create configmap oai-infopt-benchmark-script \
+SCRIPT_CM="${JOB_NAME}-script"
+MANIFEST_CM="${JOB_NAME}-manifest"
+PROFILE_CM="${JOB_NAME}-profile"
+
+kubectl create configmap "${SCRIPT_CM}" \
     --from-file=load-test.py="${FRAMEWORK_ROOT}/inference/load-test.py" \
     -n "${BENCHMARK_NAMESPACE}" --dry-run=client -o yaml | kubectl apply -f - >/dev/null
 
-kubectl create configmap oai-infopt-benchmark-manifest \
+kubectl create configmap "${MANIFEST_CM}" \
     --from-file=manifest.yaml="${FRAMEWORK_ROOT}/${MANIFEST}" \
     -n "${BENCHMARK_NAMESPACE}" --dry-run=client -o yaml | kubectl apply -f - >/dev/null
 
-kubectl create configmap "oai-infopt-benchmark-profile-${PROFILE}" \
+kubectl create configmap "${PROFILE_CM}" \
     --from-file=profile.yaml="${FRAMEWORK_ROOT}/${PROFILE_FILE}" \
     -n "${BENCHMARK_NAMESPACE}" --dry-run=client -o yaml | kubectl apply -f - >/dev/null
 
@@ -278,13 +282,13 @@ spec:
       volumes:
         - name: app-code
           configMap:
-            name: oai-infopt-benchmark-script
+            name: ${SCRIPT_CM}
         - name: manifest
           configMap:
-            name: oai-infopt-benchmark-manifest
+            name: ${MANIFEST_CM}
         - name: profile
           configMap:
-            name: oai-infopt-benchmark-profile-${PROFILE}
+            name: ${PROFILE_CM}
         - name: results
           emptyDir:
             sizeLimit: 1Gi
