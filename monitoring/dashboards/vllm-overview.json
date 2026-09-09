@@ -2393,83 +2393,6 @@
           }
         }
       },
-      "panel-71": {
-        "kind": "Panel",
-        "spec": {
-          "data": {
-            "kind": "QueryGroup",
-            "spec": {
-              "queries": [
-                {
-                  "kind": "PanelQuery",
-                  "spec": {
-                    "hidden": false,
-                    "query": {
-                      "datasource": {
-                        "name": "${DS_PROMETHEUS}"
-                      },
-                      "group": "grafana-amazonprometheus-datasource",
-                      "kind": "DataQuery",
-                      "spec": {
-                        "expr": "llm_benchmark_cost_per_qa_form{namespace=\"oai-infopt\"}",
-                        "legendFormat": "{{model_name}} c={{concurrency}} ({{profile}})"
-                      },
-                      "version": "v0"
-                    },
-                    "refId": "A"
-                  }
-                }
-              ],
-              "queryOptions": {},
-              "transformations": []
-            }
-          },
-          "description": "USD cost per individual QA form / completed request. Derived from (instance_hourly_usd / 3600) × runtime_s / successful_requests.",
-          "id": 71,
-          "links": [],
-          "title": "Cost per QA Form (USD)",
-          "vizConfig": {
-            "group": "stat",
-            "kind": "VizConfig",
-            "spec": {
-              "fieldConfig": {
-                "defaults": {
-                  "color": {
-                    "mode": "thresholds"
-                  },
-                  "decimals": 5,
-                  "thresholds": {
-                    "mode": "absolute",
-                    "steps": [
-                      { "color": "green", "value": 0 },
-                      { "color": "yellow", "value": 0.001 },
-                      { "color": "red", "value": 0.005 }
-                    ]
-                  },
-                  "unit": "currencyUSD"
-                },
-                "overrides": []
-              },
-              "options": {
-                "colorMode": "background",
-                "graphMode": "area",
-                "justifyMode": "auto",
-                "orientation": "auto",
-                "percentChangeColorMode": "standard",
-                "reduceOptions": {
-                  "calcs": ["lastNotNull"],
-                  "fields": "",
-                  "values": false
-                },
-                "showPercentChange": false,
-                "textMode": "auto",
-                "wideLayout": true
-              }
-            },
-            "version": "13.2.0"
-          }
-        }
-      },
       "panel-72": {
         "kind": "Panel",
         "spec": {
@@ -3026,21 +2949,8 @@
                           "name": "panel-70"
                         },
                         "height": 4,
-                        "width": 8,
+                        "width": 24,
                         "x": 0,
-                        "y": 0
-                      }
-                    },
-                    {
-                      "kind": "GridLayoutItem",
-                      "spec": {
-                        "element": {
-                          "kind": "ElementReference",
-                          "name": "panel-71"
-                        },
-                        "height": 4,
-                        "width": 8,
-                        "x": 8,
                         "y": 0
                       }
                     },
