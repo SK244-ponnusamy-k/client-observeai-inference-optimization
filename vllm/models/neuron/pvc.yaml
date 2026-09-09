@@ -1,0 +1,25 @@
+# Persistent cache for the Neuron single-instance deployment:
+#   /cache/models                → HF weights (download-dir); avoids re-download
+#   /cache/neuron-compile-cache  → compiled NEFFs; avoids re-compile on restart
+# Sized for gpt-oss-20b weights (~13-40GB depending on Trn2 BF16 vs Trn3 MXFP4)
+# plus compiled graphs. ReadWriteOnce is fine — single-instance, one pod.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: oai-infopt-neuron-cache-gpt-oss-20b
+  namespace: oai-infopt
+  labels:
+    app.kubernetes.io/name: oai-infopt-neuron-cache-gpt-oss-20b
+    app.kubernetes.io/component: neuron-cache
+    project: observeai-inference-optimization
+    engagement: shellkode-sow
+    environment: sandbox
+    model: gpt-oss-20b
+    source: neuron
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: gp3
+  resources:
+    requests:
+      storage: 150Gi

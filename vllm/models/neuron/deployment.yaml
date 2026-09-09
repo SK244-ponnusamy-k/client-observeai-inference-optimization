@@ -1,61 +1,91 @@
 # ==============================================================================
-# vllm/models/neuron/deployment.yaml  — Flow B SERVE stage (SCAFFOLD)
+# vllm/models/neuron/deployment.yaml
 #
-# Serves a Neuron-compiled model via vLLM-Neuron on a Trainium node, exposing the
-# same OpenAI API on :8000 so the SHARED benchmark harness works unchanged.
+# SINGLE-INSTANCE (non-DI) gpt-oss-20b on AWS Trainium via the vLLM Neuron plugin.
+# Follows the validated recipe (Neuron SDK 2.31): one server, TP8, serving the
+# whole model. Same OpenAI API on :8000, so the SHARED benchmark/quality harness
+# (load-test.py / quality-eval.py) targets it unchanged.
 #
-# ⚠ SCAFFOLD — validate per model (README.md). Serving on Neuron differs from GPU:
-#   - Different image (${NEURON_VLLM_IMAGE}, NOT the GPU DLC).
-#   - Device resource aws.amazon.com/neuron (not nvidia.com/gpu).
-#   - --device neuron; tensor-parallel = NEURON_CORES; batch/seq must match the
-#     buckets the NEFF was compiled for (see compile-job.yaml).
+# Disaggregated inference (prefill/decode split + proxy + EFA) is OUT OF SCOPE.
 #
-# Runtime values injected via envsubst:
-#   ${BENCHMARK_NAMESPACE} ${NEURON_VLLM_IMAGE} ${MODEL_BUCKET}
-#   ${MODEL_FOLDER} ${SERVED_NAME} ${NEURON_CORES}
+# Same `vllm serve` args work on Trn3 (auto-selects MXFP4) and Trn2 (BF16) — the
+# Neuron backend picks the weights by hardware. Only NODE_INSTANCE_TYPE changes.
 #
-# Security hardening mirrors the GPU deployments.
+# ⚠ VALIDATE / CONFIRM before first run:
+#   - NEURON_VLLM_IMAGE  : the AWS Neuron DLC / vLLM-Neuron-plugin image for SDK
+#                          2.31 (set in config/config.env). NOT the GPU DLC.
+#   - NEURON_DEVICE_COUNT : TP8 needs 8 NeuronCores. The device plugin resource
+#                          `aws.amazon.com/neuron` counts CHIPS (2 cores each) →
+#                          typically 4. Confirm against your device-plugin build
+#                          (some expose `aws.amazon.com/neuroncore` instead).
+#   - MODEL_REF          : served from the HF id per the recipe (downloads to the
+#                          cache PVC). Switch to the S3 copy only if runai_streamer
+#                          is confirmed on Neuron (it is not the tested path).
+#   - Trn3 availability   : confirm in-region + on the EKS Neuron AMI.
+#
+# COLD START: first launch JIT-compiles the graphs (minutes+). The startupProbe
+# below gives a generous budget; compiled NEFFs persist on the cache PVC so
+# subsequent pods start fast.
+#
+# envsubst-injected (deploy.sh):
+#   ${BENCHMARK_NAMESPACE} ${NEURON_VLLM_IMAGE} ${MODEL_REF} ${SERVED_NAME}
+#   ${NODE_INSTANCE_TYPE} ${NEURON_DEVICE_COUNT}
+#
+# Security hardening mirrors the GPU deployments (non-root, readOnlyRootFilesystem,
+# drop ALL caps, no priv-esc, automountServiceAccountToken false, seccomp).
 # ==============================================================================
 
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: oai-infopt-vllm-neuron
+  name: oai-infopt-vllm-gpt-oss-20b-neuron
   namespace: ${BENCHMARK_NAMESPACE}
   labels:
-    app.kubernetes.io/name: oai-infopt-vllm-neuron
+    app.kubernetes.io/name: oai-infopt-vllm-gpt-oss-20b-neuron
     app.kubernetes.io/component: inference-server
     app.kubernetes.io/managed-by: kubectl
+    app.kubernetes.io/version: "gpt-oss-20b-neuron-single"
     project: observeai-inference-optimization
     engagement: shellkode-sow
     environment: sandbox
+    model: gpt-oss-20b
     source: neuron
+  annotations:
+    checkov.io/skip1: "CKV_K8S_43=Image pinned in NEURON_VLLM_IMAGE via config/config.env; envsubst resolves at deploy time"
+    checkov.io/skip2: "CKV_K8S_14=Image tag pinned in NEURON_VLLM_IMAGE; not latest — static analysis cannot resolve envsubst variables"
+    checkov.io/skip3: "CKV_K8S_15=imagePullPolicy IfNotPresent acceptable with a pinned image; reassess next sprint"
+    checkov.io/skip4: "CKV_K8S_40=runAsUser 1000 pending vLLM-Neuron UID compatibility test; tracked for next hardening sprint"
 spec:
   replicas: 1
   strategy:
     type: Recreate
   selector:
     matchLabels:
-      app: oai-infopt-vllm-neuron
+      app: oai-infopt-vllm-gpt-oss-20b-neuron
   template:
     metadata:
       labels:
-        app: oai-infopt-vllm-neuron
-        app.kubernetes.io/name: oai-infopt-vllm-neuron
+        app: oai-infopt-vllm-gpt-oss-20b-neuron
+        app.kubernetes.io/name: oai-infopt-vllm-gpt-oss-20b-neuron
         app.kubernetes.io/component: inference-server
         project: observeai-inference-optimization
         engagement: shellkode-sow
         environment: sandbox
+        model: gpt-oss-20b
         source: neuron
     spec:
       serviceAccountName: oai-infopt-serving-sa
       automountServiceAccountToken: false
+
       hostPID: false
       hostIPC: false
       hostNetwork: false
 
+      # Pin the Trainium instance type (deploy.sh --hw). Neuron backend selects
+      # MXFP4 on trn3 / BF16 on trn2 automatically.
       nodeSelector:
-        eks.amazonaws.com/instance-family: trn2
+        node.kubernetes.io/instance-type: ${NODE_INSTANCE_TYPE}
+
       tolerations:
         - key: aws.amazon.com/neuron
           operator: Exists
@@ -75,29 +105,48 @@ spec:
         - name: vllm-neuron
           image: ${NEURON_VLLM_IMAGE}
           imagePullPolicy: IfNotPresent
+
+          # Recipe (single-instance, non-DI). Model id is the first positional arg.
+          # For deterministic quality runs, add on_device_sampling_config.all_greedy=true
+          # to neuron_config (see quality-eval notes).
           args:
-            # Point at the compiled NEFF cache in S3 (see compile-job.yaml).
-            - "--model=s3://${MODEL_BUCKET}/${MODEL_FOLDER}/"
-            - "--served-model-name=${SERVED_NAME}"
-            - "--device=neuron"
-            - "--tensor-parallel-size=${NEURON_CORES}"
-            - "--host=0.0.0.0"
-            - "--port=8000"
+            - "--tensor-parallel-size=8"
+            - "--enable-prefix-caching"
+            - "--no-disable-hybrid-kv-cache-manager"
             - "--max-model-len=16384"
-            # max-num-seqs MUST match a compiled batch bucket.
-            - "--max-num-seqs=8"
+            - "--max-num-batched-tokens=8192"
+            - "--max-num-seqs=4"
+            - "--served-model-name=${SERVED_NAME}"
+            - "--download-dir=/cache/models"
+            - "--hf-overrides"
+            - '{"quantization_config": {}}'
+            - "--additional-config"
+            - '{"neuron_config": {"num_batched_tokens_buckets": [8192], "num_seqs_buckets": [4]}}'
+            - "${MODEL_REF}"
+
           ports:
             - name: http
               containerPort: 8000
               protocol: TCP
+
           envFrom:
             - configMapRef:
                 name: oai-infopt-vllm-config
+
           env:
             - name: HOME
               value: "/tmp"
             - name: USER
               value: "vllm"
+            # gpt-oss compilation/execution timeouts (recipe).
+            - name: VLLM_NEURON_COMPILATION_TIMEOUT
+              value: "1200"
+            - name: VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS
+              value: "1200"
+            # Persist compiled NEFFs on the cache PVC so only the first pod compiles.
+            - name: NEURON_COMPILE_CACHE_URL
+              value: "/cache/neuron-compile-cache"
+
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
@@ -108,37 +157,54 @@ spec:
               drop: ["ALL"]
             seccompProfile:
               type: RuntimeDefault
+
           resources:
             requests:
               cpu: "8"
-              memory: "32Gi"
-              aws.amazon.com/neuron: "1"
-            limits:
-              cpu: "16"
               memory: "64Gi"
-              aws.amazon.com/neuron: "1"
+              aws.amazon.com/neuron: "${NEURON_DEVICE_COUNT}"
+            limits:
+              cpu: "32"
+              memory: "128Gi"
+              aws.amazon.com/neuron: "${NEURON_DEVICE_COUNT}"
+
+          # First launch JIT-compiles graphs — allow a long cold start via a
+          # startupProbe (60 min budget) before readiness/liveness kick in.
+          startupProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            periodSeconds: 15
+            failureThreshold: 240
+            timeoutSeconds: 5
           readinessProbe:
             httpGet:
               path: /health
               port: 8000
-            initialDelaySeconds: 300
             periodSeconds: 10
-            failureThreshold: 60
+            failureThreshold: 6
             timeoutSeconds: 5
           livenessProbe:
             httpGet:
               path: /health
               port: 8000
-            initialDelaySeconds: 420
             periodSeconds: 30
             failureThreshold: 10
             timeoutSeconds: 5
+
           volumeMounts:
+            - name: cache
+              mountPath: /cache
             - name: dshm
               mountPath: /dev/shm
             - name: tmp
               mountPath: /tmp
+
       volumes:
+        # Persistent cache: model weights (download-dir) + compiled NEFFs.
+        - name: cache
+          persistentVolumeClaim:
+            claimName: oai-infopt-neuron-cache-gpt-oss-20b
         - name: dshm
           emptyDir:
             medium: Memory

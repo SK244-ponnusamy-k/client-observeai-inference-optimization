@@ -255,9 +255,10 @@ def _parse_label(content: str, labels: list[str]) -> str:
         for lab in labels:
             if lab.lower() == last:
                 return lab
-    for lab in labels:
-        if lab.lower() in c.lower():
-            return lab
+    # No exact match and no word-boundary label → genuinely no clear verdict.
+    # Deliberately NO substring fallback: "no" is a substring of not/know/now/cannot
+    # and "yes" of yesterday, so `lab in text` mis-scores. Return UNKNOWN honestly
+    # (it counts against accuracy and shows up in n_unparseable) rather than guessing.
     return "UNKNOWN"
 
 

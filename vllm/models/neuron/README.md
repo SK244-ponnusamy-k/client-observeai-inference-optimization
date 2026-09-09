@@ -1,69 +1,97 @@
-# Neuron / Trainium — Flow B (scaffold)
+# Trainium (Neuron) — single-instance gpt-oss-20b
 
-Trainium (`trn`) is a **separate flow** from the GPU path. It adds a **compile stage**
-(Neuron SDK → NEFF artifacts) before serving, and for some architectures a
-weight-conversion step. The tail of the pipeline — **benchmark → observability → cost →
-teardown — is shared unchanged** with the GPU flow (`inference/load-test.py` +
-`inference/benchmark-job.yaml`), so results land in the same schema for comparison.
+Flow B (Trainium) for the benchmark matrix. This directory deploys **gpt-oss-20b
+single-instance (non-DI)** on AWS Trainium via the vLLM Neuron plugin, following
+the validated recipe (Neuron SDK 2.31). It exposes the **same OpenAI API on
+:8000**, so the shared performance and quality harnesses run against it
+unchanged — only the deploy differs.
 
 ```
-HF weights ─▶ [download to S3] ─▶ [COMPILE (Neuron) ─▶ NEFF cache to S3] ─▶ [SERVE vLLM-Neuron] ─▶ [benchmark] ─▶ [teardown]
-                                   └── Flow-B-only steps ──┘                 └──────── shared with GPU flow ────────┘
+HF weights ─▶ [vllm serve on Trn (JIT-compiles NEFFs → cached on PVC)] ─▶ [benchmark] ─▶ [teardown]
+              └───────────── Flow-B-only ─────────────┘                  └── shared with GPU flow ──┘
 ```
 
-## ⚠ Status: PENDING PER-MODEL VALIDATION
+## Scope
 
-This is a **scaffold**. Do not promise trn benchmark numbers until each model is
-confirmed to compile **and** serve under vLLM-Neuron on the pinned toolchain.
+- **In scope:** single instance, one `vllm serve --tensor-parallel-size 8`, whole
+  model on one Trn node. The apples-to-apples comparable to the GPU single-node
+  cells.
+- **Out of scope (phase 2):** **disaggregated inference (DI)** — prefill/decode
+  split across instances + proxy router + EFA/NIXL. That's the peak-throughput
+  production topology; it's a different (multi-instance) cost class and a large
+  lift. Not built here.
+- **Model:** gpt-oss-20b only (it has a tested Neuron recipe). Qwen3.5-4B and
+  Gemma-4 on Neuron are unvalidated — do not assume they compile/serve yet.
 
-| Model | Neuron support (as of pinned toolchain) | Action before benchmarking |
-|---|---|---|
-| gpt-oss-20b | MoE + MXFP4 on Neuron **unconfirmed** | Try compile; MXFP4 likely unsupported → may need bf16/fp8 conversion or **defer** |
-| Qwen3.5-4B | Hybrid-attention multimodal VLM **unconfirmed** | Validate architecture support; likely **defer** until added |
-| Gemma-4-26B-A4B | Gemma-4 **unconfirmed** (Gemma-3 exists in `optimum-neuron`) | Validate compile first |
+## Hardware
 
-Neuron data types are FP16/BF16 (no MXFP4/NVFP4). 4-bit GPU checkpoints are **not**
-reusable on Neuron — compile from the bf16 base instead.
+- **Trn3** → serves gpt-oss in **MXFP4** (native, auto-selected). Best match.
+- **Trn2** → serves gpt-oss in **BF16**.
+- Same `vllm serve` command works on both; the Neuron backend picks weights by
+  hardware. Only the instance type changes.
 
-## Prerequisites (set in config/config.env)
+## Files
+
+| File | Purpose |
+|---|---|
+| `deployment.yaml` | single-instance TP8 serve (templated: image, instance type, device count, model ref) |
+| `pvc.yaml` | persistent cache for HF weights (`--download-dir`) + compiled NEFFs |
+| `service.yaml` | ClusterIP `oai-infopt-vllm-gpt-oss-20b-neuron:8000` |
+| `model.env` | names + hardware defaults |
+| `deploy.sh` / `stop.sh` | deploy (with `--hw`) / teardown |
+
+## Run
 
 ```bash
-# Neuron toolchain image for the COMPILE job (optimum-neuron / neuronx-cc):
-export NEURON_COMPILE_IMAGE="<neuron-compile-image>"     # TODO: pin a Neuron SDK image
-# vLLM-Neuron serving image (NOT the GPU DLC):
-export NEURON_VLLM_IMAGE="<vllm-neuron-image>"           # TODO: pin vLLM-Neuron image
-export NEURON_CORES="8"                                   # cores used = tensor-parallel degree
-```
-
-## Steps
-
-```bash
-# 0. NodePool for Trainium (once)
+# 0. once: Neuron NodePool + Neuron device plugin installed on the cluster
 kubectl apply -f cluster/neuron-nodepool.yaml
+# (install the AWS Neuron k8s device plugin separately — exposes aws.amazon.com/neuron)
 
-# 1. Download bf16 weights to S3 (reuse the GPU download jobs — same weights)
-bash model-download/<model>/download.sh
+# 1. set NEURON_VLLM_IMAGE in config/config.env  (vLLM Neuron plugin, SDK 2.31)
 
-# 2. Compile → NEFF cache in S3   (Flow-B-only)
-#    Edit MODEL_HF_ID / instance type in compile-job.yaml, then:
-envsubst < vllm/models/neuron/compile-job.yaml | kubectl apply -f -
+# 2. deploy (first launch JIT-compiles NEFFs — can take 20-60 min; cached after)
+bash vllm/models/neuron/deploy.sh --hw trn2.48xlarge      # BF16 on Trn2
+#   or                              --hw trn3.<size>       # MXFP4 on Trn3
 
-# 3. Serve on Trainium via vLLM-Neuron
-envsubst < vllm/models/neuron/deployment.yaml | kubectl apply -f -
+# 3. benchmark / quality — SHARED harness, just pick the trn hardware:
+bash inference/run-benchmark.sh --model gpt-oss-20b --hw trn2 --profile realtime
+bash inference/run-quality.sh   --model gpt-oss-20b --hw trn2 --quant bf16   # after the quality merge
 
-# 4. Benchmark — SHARED GPU-flow harness, just point --endpoint at the neuron service
-#    (inference/benchmark-job.yaml, set MODEL_NAME / VLLM_ENDPOINT accordingly)
-
-# 5. Teardown — release the (expensive) Trainium node
-kubectl delete -f vllm/models/neuron/deployment.yaml
+# 4. teardown (releases the Trn node; keeps the cache PVC)
+bash vllm/models/neuron/stop.sh
 ```
 
-## Key differences vs the GPU flow (why this is not just another --hw)
+## Important caveats
 
-- **Ahead-of-time compilation**: batch sizes / sequence lengths are compiled into the NEFF.
-  Changing `max-num-seqs` or `max-model-len` means recompiling. Cache NEFFs in S3 so a
-  benchmark sweep doesn't recompile every run.
-- **Fixed buckets**: Neuron serves compiled input/output-length "buckets"; the workload
-  profile must map onto them.
-- **tensor-parallel = NeuronCores** used, set at compile + serve time (`NEURON_CORES`).
-- **Different image + device resource** (`aws.amazon.com/neuron`), different taint/NodePool.
+- **Concurrency cap.** The tested recipe compiles `num_seqs_buckets=[4]`, so the
+  server handles ~4 concurrent sequences. The **realtime** profile (conc 1/2/4)
+  is representative; the **batch** profile (conc 16+) will *queue*, not
+  parallelize, unless you recompile with larger `num_seqs_buckets`. Maximizing
+  Neuron throughput is precisely what DI is for (out of scope). Read Trn batch
+  numbers with this in mind.
+- **Cold-start compilation.** First launch compiles graphs (minutes → tens of
+  minutes). The `startupProbe` allows a 60-min budget; NEFFs persist on the cache
+  PVC so later pods start fast. Don't delete the PVC between runs unless you want
+  a clean recompile.
+- **Quality determinism.** For reproducible Yes/No in the quality eval, add
+  `on_device_sampling_config: {all_greedy: true}` to `neuron_config` (Neuron
+  defaults to top-k sampling).
+- **Observability.** DCGM is NVIDIA-only. Device utilisation on Trn comes from
+  **neuron-monitor** (different endpoint/metric names) — vLLM `/metrics`
+  (throughput, KV) still works, so latency/throughput/cost are unaffected; only
+  device-util telemetry needs the neuron-monitor path (or mark it N/A for Trn).
+
+## Open decisions to confirm (before promoting results)
+
+1. **Trn2 vs Trn3** — which generation, and is Trn3 available in-region + on the
+   EKS Neuron AMI (SDK 2.31)? (Trn analog of the G7-driver caveat.)
+2. **`NEURON_VLLM_IMAGE`** — pin the exact AWS Neuron vLLM-plugin image + digest.
+3. **`NEURON_DEVICE_COUNT`** — TP8 = 8 NeuronCores; the device plugin counts chips
+   (2 cores each) → likely `4`. Confirm against your plugin build (some expose
+   `aws.amazon.com/neuroncore`).
+4. **Weight source** — HF `--download-dir` (tested path, current default) vs the
+   S3 copy (only if runai_streamer is confirmed on Neuron — it isn't the tested path).
+5. **Instance $/hr** — replace the placeholder Trn rates in the manifests with real
+   on-demand pricing for a meaningful cost/1M.
+6. **Prefix caching** — the recipe leaves it on; the GPU cells turned it off for
+   consistency. Decide which for the cross-hardware comparison.

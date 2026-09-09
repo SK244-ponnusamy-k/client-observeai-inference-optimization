@@ -1,0 +1,53 @@
+# ==============================================================================
+# configs/manifests/gpt-oss-20b-trn3-mxfp4.yaml
+# Matrix cell: gpt-oss-20b × Trn3 (Trainium3) × MXFP4 × single-instance (non-DI)
+#
+# Trn3 auto-selects gpt-oss's native MXFP4 weights — the closest match to how the
+# model ships. Same single-instance recipe/command as Trn2; only the instance
+# type changes. Same concurrency cap applies (num_seqs_buckets=[4]).
+#
+# ⚠ Confirm Trn3 availability in-region and on the EKS Neuron AMI (SDK 2.31)
+#    before relying on this cell — this is the Trn analog of the G7-driver caveat.
+#
+# Deploy: bash vllm/models/neuron/deploy.sh --hw trn3.<size>
+# ==============================================================================
+run_id: oai-infopt-2026-08-20-gpt-oss-20b-trn3-mxfp4-001
+description: "openai/gpt-oss-20b MXFP4 on Trn3 (Trainium3), TP8, single-instance"
+
+model:
+  hf_id: openai/gpt-oss-20b
+  served_name: gpt-oss-20b
+  tokenizer: openai/gpt-oss-20b
+  s3_prefix: "openai/gpt-oss-20b (HF via --download-dir; not S3-streamed on Neuron)"
+  source: neuron
+
+serving:
+  image: "vllm-neuron-plugin (Neuron SDK 2.31) — set NEURON_VLLM_IMAGE in config.env"
+  nodepool: neuron-inf
+  instance_type: trn3.48xlarge   # VERIFY exact Trn3 instance type name
+
+optimization_variants:
+  - label: mxfp4-trn3-tp8
+    quantization: mxfp4           # native weights, auto-selected on Trn3
+    tensor_parallel_size: 8
+    max_num_seqs: 4               # single-instance recipe bucket
+    max_num_batched_tokens: 8192
+    max_model_len: 16384
+    kv_cache_dtype: auto
+
+benchmark:
+  workload_profiles:
+    - configs/workload_profiles/realtime_v1.yaml
+    - configs/workload_profiles/batch_v1.yaml
+
+cost:
+  instance_hourly_usd: 21.50   # PLACEHOLDER — REPLACE with real Trn3 on-demand rate
+
+tags:
+  Project: observeai-inference-optimization
+  Engagement: shellkode-sow
+  Environment: sandbox
+  ManagedBy: benchmark-runner
+  Owner: TBD
+  CostCenter: TBD
+  RunId: oai-infopt-2026-08-20-gpt-oss-20b-trn3-mxfp4-001

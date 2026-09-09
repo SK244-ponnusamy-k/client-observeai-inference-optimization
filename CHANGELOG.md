@@ -5,6 +5,76 @@ Format loosely follows Keep a Changelog; dates are ISO-8601.
 
 ---
 
+## [Unreleased] — 2026-08-20 — Trainium (Neuron) single-instance testing (Flow B)
+
+Added the Trainium path for gpt-oss-20b, following the validated vLLM Neuron recipe
+(Neuron SDK 2.31). Single instance only; **disaggregated inference (DI) is out of
+scope** (documented as a phase-2 peak-throughput topology). Same OpenAI API on
+:8000, so the shared benchmark/quality harness runs against it unchanged.
+
+### Added
+- **`cluster/neuron-nodepool.yaml`** — Karpenter NodePool for `trn2`/`trn3`,
+  `aws.amazon.com/neuron` taint (requires the AWS Neuron device plugin).
+- **`vllm/models/neuron/`** — single-instance gpt-oss-20b: `deployment.yaml`
+  (TP8, recipe `neuron_config` buckets, compile timeouts, 60-min `startupProbe`
+  for cold JIT compile, persistent NEFF/weights cache), `pvc.yaml` (150Gi cache),
+  `service.yaml`, `model.env`, `deploy.sh --hw`, `stop.sh`, `README.md`.
+- **Matrix cells** — `configs/manifests/gpt-oss-20b-trn2-bf16.yaml` and
+  `gpt-oss-20b-trn3-mxfp4.yaml` (`source: neuron`, TP8).
+- **`config/config.env`** — `NEURON_VLLM_IMAGE` (blank, fail-fast guarded).
+- **`run-benchmark.sh`** — `--hw trn*` routes to the `-neuron` service and picks
+  quant by generation (trn3 → mxfp4, trn2 → bf16).
+
+### Notes / decisions
+- **Like-for-like = MXFP4 = Trn3.** gpt-oss ships MXFP4; g5/g6/g6e serve MXFP4
+  (dequantized to BF16 for compute on Ada); Trn3 runs MXFP4 natively. Trn2 has no
+  FP4 → it inflates the *same* MXFP4 values to BF16 (~40 GB): **same quality, 3×
+  memory**, not higher quality. Trn2 is a valid "no-FP4 tax" data point, not a
+  like-for-like MXFP4 comparison.
+- **Concurrency cap:** the recipe compiles `num_seqs_buckets=[4]` → the realtime
+  profile is representative; the batch profile queues rather than scales.
+- **Cost caveat:** Trainium instances are whole multi-chip nodes (trn2.48xlarge =
+  16 chips / 1.5 TB HBM; Trn3 mostly UltraServers). A 20B model uses a sliver, so
+  single-instance cost/token is over-provisioned by construction — report Trn
+  perf/quality confidently, annotate cost.
+- **Placeholders to fill before running** are consolidated in the README
+  ("Placeholders to fill") and `vllm/models/neuron/README.md`.
+
+## [Unreleased] — 2026-08-20 — Quality evaluation stage (accuracy / F1)
+
+Added a **separate** quality stage (model correctness), distinct from the
+performance harness. Runs the customer AutoQA rubric (binary Yes/No) against a
+deployed vLLM endpoint and reports accuracy / precision / recall / F1.
+
+### Added
+- **`inference/quality-eval.py`** — deterministic (temp 0, fixed seed) evaluator
+  over the same OpenAI API. Confusion matrix + precision/recall/F1 (+ macro-F1,
+  per-question F1). Reads `content`, falling back to `reasoning`/`reasoning_content`
+  (reasoning models leave `content` empty). A guided-decoding capability probe
+  degrades to `free_parse` if `guided_choice` isn't accepted.
+- **`configs/quality/autoqa_v1.yaml`** — frozen eval config (label set, decoding
+  mode, fields, reasoning effort).
+- **`inference/run-quality.sh`** — stages the dataset to S3 (`--stage-dataset`),
+  runs the eval Job in-cluster, uploads results. Accuracy is hardware-independent
+  → run once per (model, quantization), not per GPU family.
+
+### Fixed / hardened
+- **Reasoning-model parsing** — gpt-oss returns the verdict in `reasoning`; a run
+  scored 0 until we read that field and gave it a real token budget (`free_parse`,
+  `reasoning_max_tokens`, `reasoning_effort: low`). guided_choice with tiny
+  max_tokens truncated it mid-thought.
+- **Gold-label guard** — fails loudly (with sample values) if the `answer` column
+  isn't in the label set — catches CSV column/quoting shifts that otherwise yield
+  a silent all-zero confusion matrix.
+- **Unparseable-as-correct edge** — an `UNKNOWN` prediction on a negative row is no
+  longer miscounted as a true negative.
+
+### Data handling (per shellkode-security)
+- The customer AutoQA dataset (synthetic, shared for assessment) lives in **S3
+  only** — pulled to ephemeral pod storage at run time, never committed to git
+  (`.gitignore`) or baked into a ConfigMap. Transcripts are never logged (only
+  `data_id` + label + metrics).
+
 ## [Unreleased] — 2026-08-20 — Benchmark matrix restructure (3 models × 4 hardware)
 
 Reframed the framework into a customer-deliverable **benchmark matrix** per the SoW:

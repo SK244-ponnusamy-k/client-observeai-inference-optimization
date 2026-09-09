@@ -1,11 +1,17 @@
 # ==============================================================================
 # cluster/neuron-nodepool.yaml
 #
-# Karpenter NodePool for AWS Trainium (Neuron) inference — Flow B.
-# Separate from gpu-inf (which is GPU category "g" only).
+# Karpenter NodePool for AWS Trainium (Neuron) inference — Flow B, SINGLE-INSTANCE.
+# Separate from gpu-inf (GPU category "g"). Disaggregated inference (DI, multi-
+# instance + EFA) is OUT OF SCOPE for this phase — this pool targets one Trn node
+# serving the whole model with tensor parallelism.
 #
-# Trainium nodes are tainted with aws.amazon.com/neuron so only Neuron-tolerating
-# pods (the vLLM-Neuron serving Deployment) schedule here. On-demand only.
+# Requires the AWS Neuron Kubernetes device plugin on the cluster (exposes
+# `aws.amazon.com/neuron`). It is NOT the NVIDIA plugin — install separately:
+#   https://awsdocs-neuron.readthedocs-hosted.com/en/latest/containers/kubernetes-getting-started.html
+#
+# Trn nodes are tainted with aws.amazon.com/neuron so only Neuron-tolerating pods
+# (the vLLM-Neuron serving Deployment) schedule here. On-demand only.
 #
 # Apply:
 #   kubectl apply -f cluster/neuron-nodepool.yaml
@@ -43,10 +49,14 @@ spec:
           effect: NoSchedule
 
       requirements:
-        # Trainium2 family (adjust to trn1 if trn2 is unavailable in-region)
+        # Trainium generations for the tested recipe:
+        #   trn3 → gpt-oss served MXFP4 (native quant, auto-selected)
+        #   trn2 → gpt-oss served BF16
+        # VERIFY availability in-region and on the EKS Neuron AMI (Neuron SDK 2.31),
+        # exactly like the G7-driver caveat on the GPU side.
         - key: eks.amazonaws.com/instance-family
           operator: In
-          values: ["trn2", "trn1"]
+          values: ["trn2", "trn3"]
         - key: kubernetes.io/arch
           operator: In
           values: ["amd64"]
@@ -54,7 +64,8 @@ spec:
           operator: In
           values: ["on-demand"]
 
-  # Safety cap — Trainium nodes are expensive; keep the ceiling tight for benchmarking.
+  # Safety cap — Trainium nodes are expensive; keep the ceiling tight for a
+  # single-instance benchmark (one Trn node at a time).
   limits:
     cpu: "256"
 

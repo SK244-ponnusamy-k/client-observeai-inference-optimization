@@ -1,0 +1,56 @@
+# ==============================================================================
+# configs/manifests/gpt-oss-20b-trn2-bf16.yaml
+# Matrix cell: gpt-oss-20b × Trn2 (Trainium2) × BF16 × single-instance (non-DI)
+#
+# Serves via the vLLM Neuron plugin (SDK 2.31), TP8 on one Trn2 node. Same OpenAI
+# API, so the shared perf harness runs unchanged.
+#
+# ⚠ CONCURRENCY CAP: the tested single-instance recipe compiles num_seqs_buckets=[4]
+#    → the server handles at most ~4 concurrent sequences. The realtime profile
+#    (conc 1/2/4) is representative; the batch profile (conc 16/32/64/128) will
+#    QUEUE, not parallelize, unless you recompile with larger num_seqs_buckets.
+#    (Maximizing Neuron throughput is what disaggregated inference is for — out of
+#    scope here.) Interpret Trn batch numbers accordingly.
+#
+# Deploy: bash vllm/models/neuron/deploy.sh --hw trn2.48xlarge
+# ==============================================================================
+run_id: oai-infopt-2026-08-20-gpt-oss-20b-trn2-bf16-001
+description: "openai/gpt-oss-20b BF16 on Trn2 (Trainium2), TP8, single-instance"
+
+model:
+  hf_id: openai/gpt-oss-20b
+  served_name: gpt-oss-20b
+  tokenizer: openai/gpt-oss-20b
+  s3_prefix: "openai/gpt-oss-20b (HF via --download-dir; not S3-streamed on Neuron)"
+  source: neuron
+
+serving:
+  image: "vllm-neuron-plugin (Neuron SDK 2.31) — set NEURON_VLLM_IMAGE in config.env"
+  nodepool: neuron-inf
+  instance_type: trn2.48xlarge
+
+optimization_variants:
+  - label: bf16-trn2-tp8
+    quantization: none            # BF16 on Trn2 (auto-selected by hardware)
+    tensor_parallel_size: 8
+    max_num_seqs: 4               # single-instance recipe bucket (see concurrency cap note)
+    max_num_batched_tokens: 8192
+    max_model_len: 16384
+    kv_cache_dtype: auto
+
+benchmark:
+  workload_profiles:
+    - configs/workload_profiles/realtime_v1.yaml
+    - configs/workload_profiles/batch_v1.yaml
+
+cost:
+  instance_hourly_usd: 21.50   # PLACEHOLDER (Trn1.32xlarge reference) — REPLACE with real Trn2 on-demand rate
+
+tags:
+  Project: observeai-inference-optimization
+  Engagement: shellkode-sow
+  Environment: sandbox
+  ManagedBy: benchmark-runner
+  Owner: TBD
+  CostCenter: TBD
+  RunId: oai-infopt-2026-08-20-gpt-oss-20b-trn2-bf16-001

@@ -67,6 +67,16 @@ case "${MODEL}" in
         ;;
 esac
 
+# Trainium (Neuron, single-instance) cells: separate service, quant by generation.
+#   trn3 → MXFP4 (native), trn2 → BF16. Manifest cell: <model>-<hw>-<quant>.yaml
+if [[ "${HW}" == trn* ]]; then
+    SVC="${SVC}-neuron"
+    case "${HW}" in
+        trn3*) QUANT="mxfp4" ;;
+        trn2*) QUANT="bf16" ;;
+    esac
+fi
+
 # Resolve the manifest: explicit override > smoke baseline > matrix cell <model>-<hw>-<quant>.
 if [[ -n "${MANIFEST_OVERRIDE}" ]]; then
     MANIFEST="${MANIFEST_OVERRIDE}"
