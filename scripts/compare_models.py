@@ -25,31 +25,59 @@ def load_results_local(results_dir: Path) -> list[dict[str, Any]]:
     if not results_dir.exists():
         return rows
 
-    # Use rglob to search recursively through all subdirectories
     for f in results_dir.rglob("*.jsonl"):
-        if f.name.startswith("comparison") or f.name.startswith("summary"):
+        if "quality" in f.parts or f.name.startswith("comparison") or f.name.startswith("summary"):
             continue
         with f.open("r", encoding="utf-8") as file:
             for line in file:
                 if line.strip():
                     try:
-                        rows.append(json.loads(line))
+                        data = json.loads(line)
+                        if "f1" not in data and "f1_score" not in data and "accuracy" not in data:
+                            rows.append(data)
                     except json.JSONDecodeError:
                         pass
     return rows
 
 
 def sync_results_from_s3(bucket: str, local_dir: Path) -> None:
-    """Sync all benchmark results from S3 bucket into local results/ directory."""
+    """Sync both load benchmark results and quality eval results from S3."""
     import subprocess
 
-    cmd = f"aws s3 sync s3://{bucket}/results/ {local_dir}/"
-    print(f"Syncing benchmark results from S3 (s3://{bucket}/results/) ...")
+    cmd_perf = f"aws s3 sync s3://{bucket}/results/ {local_dir}/perf/"
+    cmd_qual = f"aws s3 sync s3://{bucket}/quality/ {local_dir}/quality/"
+    print(f"Syncing benchmark & quality results from S3 (s3://{bucket}) ...")
     try:
-        subprocess.run(cmd, shell=True, check=True)
+        subprocess.run(cmd_perf, shell=True, check=True)
+        subprocess.run(cmd_qual, shell=True, check=True)
         print("S3 sync complete.")
     except Exception as e:
         print(f"Warning: S3 sync failed or AWS CLI not found: {e}")
+
+
+def load_quality_results(results_dir: Path) -> list[dict[str, Any]]:
+    rows = []
+    if not results_dir.exists():
+        return rows
+
+    for f in results_dir.rglob("*.jsonl"):
+        with f.open("r", encoding="utf-8") as file:
+            for line in file:
+                if line.strip():
+                    try:
+                        data = json.loads(line)
+                        if "f1" in data or "f1_score" in data or "accuracy" in data:
+                            model = data.get("served_model") or data.get("model") or data.get("hf_id") or "gpt-oss-20b"
+                            data["_clean_model"] = model
+                            data["_clean_hw"] = data.get("hardware") or data.get("instance_type") or "-"
+                            data["_clean_quant"] = data.get("quantization") or "-"
+                            data["_clean_rows"] = int(_v(data, "n_total", "total_rows", "n_scored"))
+                            data["_clean_acc"] = _v(data, "accuracy") * (100.0 if _v(data, "accuracy") <= 1.0 else 1.0)
+                            data["_clean_f1"] = _v(data, "f1", "f1_score", "macro_f1")
+                            rows.append(data)
+                    except json.JSONDecodeError:
+                        pass
+    return rows
 
 
 def get_all_headers(results: list[dict[str, Any]]) -> list[str]:
@@ -89,10 +117,10 @@ def _v(r: dict[str, Any], *keys: str, default: float = 0.0) -> float:
     return default
 
 
-def export_excel(results: list[dict[str, Any]], xlsx_path: Path) -> None:
-    """Generates a formatted Excel (.xlsx) report with a Summary sheet and Details sheet."""
-    if not results:
-        print("No benchmark results to export.")
+def export_excel(perf_results: list[dict[str, Any]], qual_results: list[dict[str, Any]], xlsx_path: Path) -> None:
+    """Generates a formatted Excel (.xlsx) report with Performance, Quality, and Detail sheets."""
+    if not perf_results and not qual_results:
+        print("No benchmark or quality results to export.")
         return
 
     try:
@@ -107,16 +135,20 @@ def export_excel(results: list[dict[str, Any]], xlsx_path: Path) -> None:
             from openpyxl.styles import Alignment, Font, PatternFill
         except ImportError:
             print("Notice: openpyxl unavailable — exporting CSV report.")
-            export_csv(results, xlsx_path.with_suffix(".csv"))
+            export_csv(perf_results, xlsx_path.with_suffix(".csv"))
             return
 
     wb = openpyxl.Workbook()
 
-    # ── Sheet 1: Comparison Summary ─────────────────────────────────────────
-    ws_summary = wb.active
-    ws_summary.title = "Model Comparison"
+    header_font = Font(name="Calibri", size=11, bold=True, color="FFFFFF")
+    header_fill_perf = PatternFill(start_color="1F4E79", end_color="1F4E79", fill_type="solid")
+    header_fill_qual = PatternFill(start_color="276A3C", end_color="276A3C", fill_type="solid")
 
-    headers_summary = [
+    # ── Sheet 1: Performance Comparison ────────────────────────────────────
+    ws_perf = wb.active
+    ws_perf.title = "Performance Benchmarks"
+
+    headers_perf = [
         "Model (HF ID)",
         "Profile",
         "Concurrency",
@@ -133,27 +165,23 @@ def export_excel(results: list[dict[str, Any]], xlsx_path: Path) -> None:
         "Status",
     ]
 
-    header_font = Font(name="Calibri", size=11, bold=True, color="FFFFFF")
-    header_fill = PatternFill(start_color="1F4E79", end_color="1F4E79", fill_type="solid")
-
-    ws_summary.append(headers_summary)
-    for col_num in range(1, len(headers_summary) + 1):
-        cell = ws_summary.cell(row=1, column=col_num)
+    ws_perf.append(headers_perf)
+    for col_num in range(1, len(headers_perf) + 1):
+        cell = ws_perf.cell(row=1, column=col_num)
         cell.font = header_font
-        cell.fill = header_fill
+        cell.fill = header_fill_perf
         cell.alignment = Alignment(horizontal="center", vertical="center")
 
-    # Deduplicate rows by (hf_id, profile, concurrency, started_at)
-    seen = set()
-    unique_results = []
-    for r in results:
+    seen_perf = set()
+    unique_perf = []
+    for r in perf_results:
         key = (r.get("hf_id", ""), r.get("profile", ""), r.get("concurrency", 0), r.get("started_at", ""))
-        if key not in seen:
-            seen.add(key)
-            unique_results.append(r)
+        if key not in seen_perf:
+            seen_perf.add(key)
+            unique_perf.append(r)
 
-    for r in sorted(unique_results, key=lambda x: (x.get("hf_id", ""), x.get("profile", ""), x.get("concurrency", 0))):
-        ws_summary.append([
+    for r in sorted(unique_perf, key=lambda x: (x.get("hf_id", ""), x.get("profile", ""), x.get("concurrency", 0))):
+        ws_perf.append([
             r.get("hf_id", "unknown").split("/")[-1],
             r.get("profile", "unknown"),
             r.get("concurrency", 1),
@@ -170,10 +198,52 @@ def export_excel(results: list[dict[str, Any]], xlsx_path: Path) -> None:
             "PASSED" if r.get("status") == "passed" else "SLO FAIL",
         ])
 
-    # ── Sheet 2: All Detailed Runs ──────────────────────────────────────────
-    ws_detail = wb.create_sheet(title="All Detailed Runs")
-    if unique_results:
-        all_keys = get_all_headers(unique_results)
+    # ── Sheet 2: Quality & Accuracy Evaluation ──────────────────────────────
+    ws_qual = wb.create_sheet(title="Quality Evaluation")
+    headers_qual = [
+        "Model",
+        "Instance Type / HW",
+        "Quantization",
+        "Total Transcripts",
+        "Accuracy (%)",
+        "Precision",
+        "Recall",
+        "AutoQA F1 Score",
+        "Timestamp",
+    ]
+
+    ws_qual.append(headers_qual)
+    for col_num in range(1, len(headers_qual) + 1):
+        cell = ws_qual.cell(row=1, column=col_num)
+        cell.font = header_font
+        cell.fill = header_fill_qual
+        cell.alignment = Alignment(horizontal="center", vertical="center")
+
+    seen_qual = set()
+    unique_qual = []
+    for q in qual_results:
+        key = (q.get("_clean_model", ""), q.get("_clean_quant", ""), q.get("_clean_hw", ""), q.get("started_at", ""))
+        if key not in seen_qual:
+            seen_qual.add(key)
+            unique_qual.append(q)
+
+    for q in sorted(unique_qual, key=lambda x: (x.get("_clean_model", ""), x.get("_clean_quant", ""))):
+        ws_qual.append([
+            q.get("_clean_model", "gpt-oss-20b"),
+            q.get("_clean_hw", "-"),
+            q.get("_clean_quant", "-"),
+            q.get("_clean_rows", 1200),
+            round(q.get("_clean_acc", 0.0), 2),
+            round(_v(q, "precision"), 4),
+            round(_v(q, "recall"), 4),
+            round(q.get("_clean_f1", 0.0), 4),
+            str(q.get("started_at", q.get("timestamp", "-")))[:19].replace("T", " "),
+        ])
+
+    # ── Sheet 3: All Detailed Runs ──────────────────────────────────────────
+    ws_detail = wb.create_sheet(title="All Detailed Perf Runs")
+    if unique_perf:
+        all_keys = get_all_headers(unique_perf)
         ws_detail.append(all_keys)
 
         for col_num in range(1, len(all_keys) + 1):
@@ -181,7 +251,7 @@ def export_excel(results: list[dict[str, Any]], xlsx_path: Path) -> None:
             cell.font = header_font
             cell.fill = PatternFill(start_color="2F5597", end_color="2F5597", fill_type="solid")
 
-        for r in unique_results:
+        for r in unique_perf:
             row_vals = []
             for k in all_keys:
                 v = r.get(k, "")
@@ -192,7 +262,7 @@ def export_excel(results: list[dict[str, Any]], xlsx_path: Path) -> None:
             ws_detail.append(row_vals)
 
     # Auto-adjust column widths
-    for ws in [ws_summary, ws_detail]:
+    for ws in [ws_perf, ws_qual, ws_detail]:
         for col in ws.columns:
             max_len = max(len(str(cell.value or "")) for cell in col)
             col_letter = openpyxl.utils.get_column_letter(col[0].column)
@@ -204,49 +274,81 @@ def export_excel(results: list[dict[str, Any]], xlsx_path: Path) -> None:
     print(f"[REPORT]  File Location: {xlsx_path.resolve()}\n")
 
 
-def print_comparison_table(results: list[dict[str, Any]]) -> None:
-    if not results:
-        print("No benchmark result JSONL files found.")
-        return
-
-    # Deduplicate rows by (hf_id, profile, concurrency, started_at)
-    seen = set()
-    unique_results = []
-    for r in results:
-        key = (r.get("hf_id", ""), r.get("profile", ""), r.get("concurrency", 0), r.get("started_at", ""))
-        if key not in seen:
-            seen.add(key)
-            unique_results.append(r)
-
-    sep = "=" * 100
+def print_comparison_table(perf_results: list[dict[str, Any]], qual_results: list[dict[str, Any]]) -> None:
+    sep = "=" * 105
     print(f"\n{sep}")
-    print(f"  LLM BENCHMARK MODEL COMPARISON SUMMARY ({len(unique_results)} runs found)")
+    print(f"  LLM BENCHMARK MODEL COMPARISON SUMMARY ({len(perf_results)} perf runs, {len(qual_results)} quality runs)")
     print(sep)
-    print(
-        f"  {'Model (HF ID)':<26} {'Profile':<10} {'Concur':>6} "
-        f"{'TTFT p95':>10} {'ITL p95':>9} {'Tok/s':>9} "
-        f"{'Cost/1M':>10} {'GPU Util':>9} {'Status':<10}"
-    )
-    print(f"  {'-'*96}")
 
-    for r in sorted(unique_results, key=lambda x: (x.get("hf_id", ""), x.get("profile", ""), x.get("concurrency", 0))):
-        hf_id = r.get("hf_id", "unknown").split("/")[-1]
-        profile = r.get("profile", "unknown")
-        concurrency = r.get("concurrency", 1)
-        ttft_p95 = f"{_v(r, 'ttft_p95_ms', 'p95_ttft_ms'):.1f}ms"
-        itl_p95 = f"{_v(r, 'itl_p95_ms', 'p95_itl_ms'):.1f}ms"
-        throughput = f"{_v(r, 'throughput_tokens_s', 'output_throughput_tokens_s'):.1f}"
-        cost = f"${_v(r, 'cost_per_1m_tokens'):.4f}"
-        gpu_util = f"{_v(r, 'gpu_utilization_pct'):.1f}%"
-        status = "PASSED" if r.get("status") == "passed" else "SLO FAIL"
-
+    # ── Section 1: Load Test Performance Results ─────────────────────────────
+    if perf_results:
+        print("\n  [ PERFORMANCE & EFFICIENCY BENCHMARKS ]")
         print(
-            f"  {hf_id:<26} {profile:<10} {concurrency:>6} "
-            f"{ttft_p95:>10} {itl_p95:>9} {throughput:>9} "
-            f"{cost:>10} {gpu_util:>9} {status:<10}"
+            f"  {'Model':<22} {'HW':<8} {'Profile':<9} {'Concur':>6} "
+            f"{'TTFT p95':>10} {'ITL p95':>9} {'Tok/s':>9} "
+            f"{'Cost/1M':>9} {'GPU Util':>9} {'Status':<9}"
         )
+        print(f"  {'-'*101}")
 
-    print(sep)
+        seen = set()
+        unique_perf = []
+        for r in perf_results:
+            key = (r.get("hf_id", ""), r.get("profile", ""), r.get("concurrency", 0), r.get("started_at", ""))
+            if key not in seen:
+                seen.add(key)
+                unique_perf.append(r)
+
+        for r in sorted(unique_perf, key=lambda x: (x.get("hf_id", ""), x.get("profile", ""), x.get("concurrency", 0))):
+            model = r.get("hf_id", "unknown").split("/")[-1]
+            hw = r.get("instance_type", r.get("hardware", "-"))
+            profile = r.get("profile", "unknown")
+            concurrency = r.get("concurrency", 1)
+            ttft_p95 = f"{_v(r, 'ttft_p95_ms', 'p95_ttft_ms'):.1f}ms"
+            itl_p95 = f"{_v(r, 'itl_p95_ms', 'p95_itl_ms'):.1f}ms"
+            throughput = f"{_v(r, 'throughput_tokens_s', 'output_throughput_tokens_s'):.1f}"
+            cost = f"${_v(r, 'cost_per_1m_tokens'):.4f}"
+            gpu_util = f"{_v(r, 'gpu_utilization_pct'):.1f}%"
+            status = "PASSED" if r.get("status") == "passed" else "SLO FAIL"
+
+            print(
+                f"  {model:<22} {hw:<8} {profile:<9} {concurrency:>6} "
+                f"{ttft_p95:>10} {itl_p95:>9} {throughput:>9} "
+                f"{cost:>9} {gpu_util:>9} {status:<9}"
+            )
+
+    # ── Section 2: Quality Evaluation Results ────────────────────────────────
+    if qual_results:
+        print("\n  [ QUALITY & ACCURACY BENCHMARKS (AutoQA F1 Score) ]")
+        print(
+            f"  {'Model':<22} {'HW':<8} {'Quant':<8} {'Rows':>6} "
+            f"{'Accuracy':>10} {'Precision':>10} {'Recall':>9} {'F1 Score':>10}"
+        )
+        print(f"  {'-'*90}")
+
+        seen_q = set()
+        unique_qual = []
+        for q in qual_results:
+            key = (q.get("_clean_model", ""), q.get("_clean_quant", ""), q.get("_clean_hw", ""), q.get("started_at", ""))
+            if key not in seen_q:
+                seen_q.add(key)
+                unique_qual.append(q)
+
+        for q in sorted(unique_qual, key=lambda x: (x.get("_clean_model", ""), x.get("_clean_quant", ""))):
+            model = str(q.get("_clean_model", "gpt-oss-20b"))
+            hw = str(q.get("_clean_hw", "-"))
+            quant = str(q.get("_clean_quant", "-"))
+            rows = q.get("_clean_rows", 1200)
+            acc = f"{q.get('_clean_acc', 0.0):.2f}%"
+            prec = f"{_v(q, 'precision'):.4f}"
+            rec = f"{_v(q, 'recall'):.4f}"
+            f1 = f"{q.get('_clean_f1', 0.0):.4f}"
+
+            print(
+                f"  {model:<22} {hw:<8} {quant:<8} {rows:>6} "
+                f"{acc:>10} {prec:>10} {rec:>9} {f1:>10}"
+            )
+
+    print(f"\n{sep}\n")
 
 
 def main() -> None:
@@ -278,15 +380,18 @@ def main() -> None:
     if args.s3_bucket:
         sync_results_from_s3(args.s3_bucket, results_path)
 
-    results = load_results_local(results_path)
-    print_comparison_table(results)
+    perf_results = load_results_local(results_path)
+    qual_results = load_quality_results(results_path)
 
-    if args.export_csv and results:
-        export_csv(results, Path(args.export_csv))
+    print_comparison_table(perf_results, qual_results)
 
-    if args.export_excel and results:
-        export_excel(results, Path(args.export_excel))
+    if args.export_csv and perf_results:
+        export_csv(perf_results, Path(args.export_csv))
+
+    if args.export_excel:
+        export_excel(perf_results, qual_results, Path(args.export_excel))
 
 
 if __name__ == "__main__":
     main()
+
