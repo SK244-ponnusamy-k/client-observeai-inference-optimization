@@ -133,6 +133,7 @@ class BenchmarkResult:
     instance_hourly_usd: float
     runtime_s: float
     cost_per_1m_tokens: float | None
+    cost_per_1m_output_tokens: float | None
     cost_per_qa_form: float | None
     tokens_per_usd: float | None
     energy_per_1m_tokens_wh: float | None
@@ -193,19 +194,22 @@ def _fetch_text(url: str, timeout: int = 5) -> str | None:
         return None
 
 
-def _sum_metric(text: str, metric_name: str) -> float | None:
-    """Sum all samples of a Prometheus metric family (ignores labels)."""
+def _sum_metric(text: str, *metric_names: str) -> float | None:
+    """Sum all samples of a Prometheus metric family (ignores labels & trailing timestamps)."""
     total: float | None = None
-    pattern = re.compile(rf"^{re.escape(metric_name)}(?:\{{[^}}]*\}})?\s+([0-9eE.+-]+)\s*$")
-    for line in text.splitlines():
-        if line.startswith("#"):
-            continue
-        m = pattern.match(line)
-        if m:
-            try:
-                total = (total or 0.0) + float(m.group(1))
-            except ValueError:
+    for m_name in metric_names:
+        pattern = re.compile(rf"^\s*{re.escape(m_name)}(?:\{{[^}}]*\}})?\s+([0-9eE.+-]+)(?:\s+[0-9]+)?\s*$")
+        for line in text.splitlines():
+            if line.startswith("#"):
                 continue
+            m = pattern.match(line)
+            if m:
+                try:
+                    total = (total or 0.0) + float(m.group(1))
+                except ValueError:
+                    continue
+        if total is not None:
+            break
     return total
 
 
@@ -216,16 +220,19 @@ def _scrape_vllm_metrics(endpoint: str) -> dict[str, float | None]:
         return {"kv_cache_utilization_pct": None, "num_requests_waiting": None,
                 "prefix_cache_hit_rate": None, "generation_tokens_total": None}
 
-    kv = _sum_metric(text, "vllm:gpu_cache_usage_perc")
-    waiting = _sum_metric(text, "vllm:num_requests_waiting")
-    gen_tokens = _sum_metric(text, "vllm:generation_tokens_total")
-    hits = _sum_metric(text, "vllm:prefix_cache_hits_total")
-    queries = _sum_metric(text, "vllm:prefix_cache_queries_total")
+    kv = _sum_metric(text, "vllm:gpu_cache_usage_perc", "vllm_gpu_cache_usage_perc",
+                     "vllm:gpu_cache_usage_percent", "vllm_gpu_cache_usage_percent",
+                     "vllm:gpu_memory_utilization", "vllm_gpu_memory_utilization",
+                     "vllm:kv_cache_usage_perc", "vllm_kv_cache_usage_perc")
+    waiting = _sum_metric(text, "vllm:num_requests_waiting", "vllm_num_requests_waiting")
+    gen_tokens = _sum_metric(text, "vllm:generation_tokens_total", "vllm_generation_tokens_total")
+    hits = _sum_metric(text, "vllm:prefix_cache_hits_total", "vllm_prefix_cache_hits_total")
+    queries = _sum_metric(text, "vllm:prefix_cache_queries_total", "vllm_prefix_cache_queries_total")
     hit_rate = (hits / queries) if (hits is not None and queries) else None
 
     return {
-        # vLLM reports 0-1; normalise to percent
-        "kv_cache_utilization_pct": (kv * 100.0) if kv is not None else None,
+        # vLLM reports 0-1 ratio; normalise to percent if <= 1.0
+        "kv_cache_utilization_pct": (kv * 100.0) if (kv is not None and kv <= 1.0) else (kv if kv is not None else None),
         "num_requests_waiting": waiting,
         "prefix_cache_hit_rate": hit_rate,
         "generation_tokens_total": gen_tokens,
@@ -236,13 +243,23 @@ def _scrape_gpu_metrics(dcgm_url: str | None) -> dict[str, float | None]:
     """
     Best-effort GPU telemetry from a DCGM-exporter (or Prometheus federate) URL.
     Set DCGM_METRICS_URL to a scrape endpoint that exposes DCGM_FI_DEV_* for the
-    GPU node under test. If unavailable, fields are None and GPU util should be
-    joined from Amazon Managed Prometheus / Grafana post-hoc.
+    GPU node under test.
     """
-    if not dcgm_url:
-        return {"gpu_utilization_pct": None, "gpu_mem_used_mib": None,
-                "gpu_power_watts": None}
-    text = _fetch_text(dcgm_url)
+    urls_to_try = []
+    if dcgm_url:
+        urls_to_try.append(dcgm_url)
+    urls_to_try.extend([
+        os.getenv("DCGM_METRICS_URL", ""),
+        os.getenv("DCGM_EXPORTER_URL", ""),
+        "http://dcgm-exporter.monitoring.svc.cluster.local:9400/metrics",
+        "http://dcgm-exporter.monitoring:9400/metrics",
+    ])
+    text = None
+    for u in urls_to_try:
+        if u:
+            text = _fetch_text(u)
+            if text:
+                break
     if not text:
         return {"gpu_utilization_pct": None, "gpu_mem_used_mib": None,
                 "gpu_power_watts": None}
@@ -335,26 +352,32 @@ def _derive_cost(
     successful: int,
     gpu_power_watts: float | None,
 ) -> dict[str, float | None]:
-    """Derive cost/efficiency based on total tokens processed (input + output)."""
-    tokens_to_use = total_tokens if total_tokens > 0 else total_output_tokens
-    if tokens_to_use < 1 or runtime_s <= 0 or instance_usd <= 0:
+    """Derive cost/efficiency for both total tokens and output-only tokens."""
+    if (total_tokens < 1 and total_output_tokens < 1) or runtime_s <= 0 or instance_usd <= 0:
         logger.warning(
-            "Cost not derivable: tokens=%s runtime=%.2fs usd/hr=%.4f -> emitting null",
-            tokens_to_use, runtime_s, instance_usd,
+            "Cost not derivable: total_tokens=%s output_tokens=%s runtime=%.2fs usd/hr=%.4f -> emitting null",
+            total_tokens, total_output_tokens, runtime_s, instance_usd,
         )
-        return {"cost_per_1m_tokens": None, "cost_per_qa_form": None,
-                "tokens_per_usd": None, "energy_per_1m_tokens_wh": None}
+        return {
+            "cost_per_1m_tokens": None,
+            "cost_per_1m_output_tokens": None,
+            "cost_per_qa_form": None,
+            "tokens_per_usd": None,
+            "energy_per_1m_tokens_wh": None,
+        }
 
     run_cost = (instance_usd / 3600.0) * runtime_s
-    cost_per_1m = run_cost / (tokens_to_use / 1_000_000)
+    cost_per_1m_total = run_cost / (total_tokens / 1_000_000) if total_tokens > 0 else None
+    cost_per_1m_output = run_cost / (total_output_tokens / 1_000_000) if total_output_tokens > 0 else None
     cost_per_form = run_cost / max(successful, 1)
-    tokens_per_usd = tokens_to_use / run_cost if run_cost > 0 else None
+    tokens_per_usd = total_tokens / run_cost if run_cost > 0 else None
     energy_per_1m = None
-    if gpu_power_watts and gpu_power_watts > 0:
+    if gpu_power_watts and gpu_power_watts > 0 and total_tokens > 0:
         wh = gpu_power_watts * (runtime_s / 3600.0)
-        energy_per_1m = wh / (tokens_to_use / 1_000_000)
+        energy_per_1m = wh / (total_tokens / 1_000_000)
     return {
-        "cost_per_1m_tokens": round(cost_per_1m, 6),
+        "cost_per_1m_tokens": round(cost_per_1m_total, 6) if cost_per_1m_total else None,
+        "cost_per_1m_output_tokens": round(cost_per_1m_output, 6) if cost_per_1m_output else None,
         "cost_per_qa_form": round(cost_per_form, 8),
         "tokens_per_usd": round(tokens_per_usd, 2) if tokens_per_usd else None,
         "energy_per_1m_tokens_wh": round(energy_per_1m, 3) if energy_per_1m else None,
@@ -436,6 +459,7 @@ def _build_result(
         instance_hourly_usd=instance_usd,
         runtime_s=round(runtime_s, 2),
         cost_per_1m_tokens=cost["cost_per_1m_tokens"],
+        cost_per_1m_output_tokens=cost["cost_per_1m_output_tokens"],
         cost_per_qa_form=cost["cost_per_qa_form"],
         tokens_per_usd=cost["tokens_per_usd"],
         energy_per_1m_tokens_wh=cost["energy_per_1m_tokens_wh"],
