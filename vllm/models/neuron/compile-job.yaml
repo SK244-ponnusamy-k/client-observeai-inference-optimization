@@ -51,7 +51,7 @@ spec:
       hostNetwork: false
       # Compilation runs on a Trainium node (needs the Neuron device to trace/compile).
       nodeSelector:
-        eks.amazonaws.com/instance-family: trn2
+        eks.amazonaws.com/instance-family: trn1
       tolerations:
         - key: aws.amazon.com/neuron
           operator: Exists

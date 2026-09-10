@@ -1,0 +1,207 @@
+# ==============================================================================
+# vllm/models/gpt-oss-20b-neuron/compile-job.yaml  — Flow B COMPILE stage
+#
+# Model     : openai/gpt-oss-20b  (MoE, ~21B total / 3.6B active)
+# Input     : s3://<MODEL_BUCKET>/gpt-oss-20b/        (bf16 weights, already in S3)
+# Output    : s3://<MODEL_BUCKET>/gpt-oss-20b-neuron/ (compiled NEFF artifacts)
+# Hardware  : trn1.32xlarge  — 16 NeuronCores (8 Trainium chips × 2 cores/chip)
+#
+# ⚠ MoE ARCHITECTURE WARNING:
+#   Expert-routing kernels in MoE models have historically had limited Neuron SDK
+#   support. Validate that the compile step completes successfully before scheduling
+#   benchmark runs against this deployment. If compilation fails, bf16 or fp16
+#   weight conversion may not help — the architecture may need to be deferred until
+#   the Neuron SDK adds explicit MoE support.
+#
+# Compile parameters are locked at ahead-of-time compile time.
+# Changing NEURON_CORES, SEQ_LEN, or BATCH requires a full recompile.
+# Cache the NEFF artifacts in S3 so subsequent deploys skip recompilation.
+#
+# Runtime values injected via envsubst by deploy.sh:
+#   ${BENCHMARK_NAMESPACE} ${DOWNLOAD_SERVICE_ACCOUNT}
+#   ${MODEL_BUCKET} ${AWS_REGION} ${NEURON_COMPILE_IMAGE}
+#
+# Apply manually (one-off before first serve):
+#   source config/config.env
+#   envsubst < vllm/models/gpt-oss-20b-neuron/compile-job.yaml | kubectl apply -f -
+#   kubectl logs -f job/oai-infopt-neuron-compile-gpt-oss-20b -n <BENCHMARK_NAMESPACE>
+#
+# Security hardening: non-root UID 1000, readOnlyRootFilesystem, drop ALL caps,
+# no privilege escalation, automountServiceAccountToken false, seccomp RuntimeDefault.
+# ==============================================================================
+
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: oai-infopt-neuron-compile-gpt-oss-20b
+  namespace: ${BENCHMARK_NAMESPACE}
+  labels:
+    app.kubernetes.io/name: oai-infopt-neuron-compile-gpt-oss-20b
+    app.kubernetes.io/component: neuron-compile
+    app.kubernetes.io/managed-by: kubectl
+    project: observeai-inference-optimization
+    engagement: shellkode-sow
+    environment: sandbox
+    model: gpt-oss-20b
+spec:
+  backoffLimit: 1
+  # 12-hour ceiling — MoE compile can be slow but should not run indefinitely.
+  activeDeadlineSeconds: 43200
+  ttlSecondsAfterFinished: 3600
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: oai-infopt-neuron-compile-gpt-oss-20b
+        app.kubernetes.io/component: neuron-compile
+        project: observeai-inference-optimization
+        engagement: shellkode-sow
+        environment: sandbox
+        model: gpt-oss-20b
+    spec:
+      restartPolicy: Never
+      serviceAccountName: ${DOWNLOAD_SERVICE_ACCOUNT}
+      automountServiceAccountToken: false
+      hostPID: false
+      hostIPC: false
+      hostNetwork: false
+
+      # Pin to a trn2 node — gpt-oss-20b requires trn2 (sink attention not supported on trn1).
+      nodeSelector:
+        eks.amazonaws.com/instance-family: trn2
+      tolerations:
+        - key: aws.amazon.com/neuron
+          operator: Exists
+          effect: NoSchedule
+
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+
+      containers:
+        - name: neuron-compile
+          image: ${NEURON_COMPILE_IMAGE}
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              set -euo pipefail
+
+              # ── Compile parameters — must match model.env and deployment.yaml ──
+              MODEL_FOLDER="gpt-oss-20b"           # S3 source: bf16 weights
+              NEFF_FOLDER="gpt-oss-20b-neuron"     # S3 dest:   compiled NEFFs
+              NEURON_CORES="${NEURON_CORES:-16}"    # tensor-parallel degree; trn1.32xlarge = 16
+              SEQ_LEN="16384"                       # max sequence length bucket
+              BATCH="8"                             # max batch size bucket
+
+              SRC_S3="s3://${MODEL_BUCKET}/${MODEL_FOLDER}/"
+              DST_S3="s3://${MODEL_BUCKET}/${NEFF_FOLDER}/"
+              WORK_DIR="/tmp/model"
+              NEFF_DIR="/tmp/neff"
+
+              echo "======================================================"
+              echo "  Compile: gpt-oss-20b → Neuron NEFF"
+              echo "  Source  : ${SRC_S3}"
+              echo "  Output  : ${DST_S3}"
+              echo "  Cores   : ${NEURON_CORES}   (tensor-parallel degree)"
+              echo "  SeqLen  : ${SEQ_LEN}"
+              echo "  Batch   : ${BATCH}"
+              echo "======================================================"
+
+              # ── Step 1: Check if NEFF cache already exists in S3 ──────────
+              echo "[1/4] Checking S3 NEFF cache..."
+              if aws s3 ls "${DST_S3}" --region "${AWS_DEFAULT_REGION}" 2>/dev/null | grep -q .; then
+                echo "NEFF cache already present at ${DST_S3} — skipping recompile."
+                echo "To force recompile: aws s3 rm ${DST_S3} --recursive"
+                exit 0
+              fi
+              echo "No NEFF cache found. Proceeding with compilation."
+
+              # ── Step 2: Sync bf16 weights from S3 ─────────────────────────
+              echo "[2/4] Syncing bf16 weights from S3..."
+              mkdir -p "${WORK_DIR}" "${NEFF_DIR}"
+              aws s3 sync "${SRC_S3}" "${WORK_DIR}/" \
+                --region "${AWS_DEFAULT_REGION}" \
+                --no-progress
+
+              # ── Step 3: Compile to NEFF via optimum-neuron ─────────────────
+              # pytorch-training-neuronx has neuronx-cc pre-installed but needs
+              # optimum-neuron for the optimum-cli export command.
+              # ⚠ MoE ARCHITECTURE: gpt-oss-20b uses Mixture-of-Experts routing.
+              #   If this command fails with an unsupported-architecture error,
+              #   the model may need to wait for Neuron SDK MoE support.
+              #   Check: https://awsdocs-neuron.readthedocs-hosted.com/en/latest/
+              echo "[3/4] Installing optimum-neuron and compiling to Neuron NEFF..."
+              pip install --quiet optimum-neuron
+              export PATH="/tmp/.local/bin:${PATH}"
+              optimum-cli export neuron \
+                --model "${WORK_DIR}" \
+                --sequence_length "${SEQ_LEN}" \
+                --batch_size "${BATCH}" \
+                --num_cores "${NEURON_CORES}" \
+                --auto_cast_type bf16 \
+                --task text-generation \
+                "${NEFF_DIR}"
+
+              # ── Step 4: Upload NEFF artifacts to S3 ───────────────────────
+              echo "[4/4] Uploading NEFF artifacts to S3..."
+              aws s3 sync "${NEFF_DIR}/" "${DST_S3}" \
+                --region "${AWS_DEFAULT_REGION}" \
+                --no-progress
+
+              echo "======================================================"
+              echo "  Compile complete."
+              echo "  NEFF artifacts at: ${DST_S3}"
+              echo "  Next: envsubst < vllm/models/gpt-oss-20b-neuron/deployment.yaml | kubectl apply -f -"
+              echo "======================================================"
+
+          env:
+            - name: AWS_DEFAULT_REGION
+              value: "${AWS_REGION}"
+            - name: MODEL_BUCKET
+              value: "${MODEL_BUCKET}"
+            - name: NEURON_CORES
+              value: "16"
+            # Direct Neuron compiler to use /tmp so readOnlyRootFilesystem is satisfied.
+            - name: NEURONX_CACHE
+              value: "/tmp/neuronx_cache"
+            - name: HOME
+              value: "/tmp"
+
+          securityContext:
+            allowPrivilegeEscalation: false
+            # readOnlyRootFilesystem must be false for the compile job —
+            # pip install and neuronx-cc both write to the filesystem during compilation.
+            readOnlyRootFilesystem: false
+            runAsNonRoot: true
+            runAsUser: 1000
+            runAsGroup: 1000
+            capabilities:
+              drop: ["ALL"]
+            seccompProfile:
+              type: RuntimeDefault
+
+          resources:
+            requests:
+              cpu: "16"
+              memory: "64Gi"
+              # Request all 16 Neuron devices on trn1.32xlarge — avoids needing
+              # the k8s-neuron-scheduler extender (required only for partial allocation).
+              aws.amazon.com/neuron: "16"
+            limits:
+              cpu: "32"
+              memory: "128Gi"
+              aws.amazon.com/neuron: "16"
+
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+
+      volumes:
+        - name: tmp
+          emptyDir:
+            # bf16 weights (~40 GB) + NEFF artifacts — give ample scratch space.
+            sizeLimit: 150Gi

@@ -1,0 +1,254 @@
+# ==============================================================================
+# vllm/models/gpt-oss-20b-neuron/deployment.yaml  — Flow B SERVE stage
+#
+# Model     : openai/gpt-oss-20b  (MoE, ~21B total / 3.6B active)
+# Weights   : BF16, loaded from s3://<MODEL_BUCKET>/gpt-oss-20b/ via init container
+# Hardware  : trn1.32xlarge — 16 NeuronCores (8 chips × 2 cores/chip)
+#
+# Loading strategy:
+#   An init container (AWS CLI image) syncs the bf16 weights from S3 to a shared
+#   emptyDir volume (/model). The vLLM-Neuron container then serves from /model
+#   (local path) — this avoids the runai_model_streamer dependency which is not
+#   available in the Neuron DLC.
+#
+# Runtime values injected via envsubst by deploy.sh:
+#   ${BENCHMARK_NAMESPACE} ${NEURON_VLLM_IMAGE} ${MODEL_BUCKET}
+#   ${MODEL_FOLDER} ${MODEL_HF_ID} ${SERVED_NAME} ${NEURON_CORES}
+# ==============================================================================
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: oai-infopt-vllm-gpt-oss-20b-neuron
+  namespace: ${BENCHMARK_NAMESPACE}
+  labels:
+    app.kubernetes.io/name: oai-infopt-vllm-gpt-oss-20b-neuron
+    app.kubernetes.io/component: inference-server
+    app.kubernetes.io/managed-by: kubectl
+    app.kubernetes.io/version: "gpt-oss-20b-neuron"
+    project: observeai-inference-optimization
+    engagement: shellkode-sow
+    environment: sandbox
+    model: gpt-oss-20b
+    source: neuron
+  annotations:
+    checkov.io/skip1: "CKV_K8S_43=Image digest pinned in NEURON_VLLM_IMAGE via config/config.env"
+    checkov.io/skip2: "CKV_K8S_14=Image tag pinned in NEURON_VLLM_IMAGE; static analysis cannot resolve envsubst"
+    checkov.io/skip3: "CKV_K8S_15=imagePullPolicy IfNotPresent acceptable with pinned image"
+    checkov.io/skip4: "CKV_K8S_40=runAsUser 1000 pending vLLM-Neuron UID compatibility test"
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: oai-infopt-vllm-gpt-oss-20b-neuron
+  template:
+    metadata:
+      labels:
+        app: oai-infopt-vllm-gpt-oss-20b-neuron
+        app.kubernetes.io/name: oai-infopt-vllm-gpt-oss-20b-neuron
+        app.kubernetes.io/component: inference-server
+        project: observeai-inference-optimization
+        engagement: shellkode-sow
+        environment: sandbox
+        model: gpt-oss-20b
+        source: neuron
+    spec:
+      serviceAccountName: oai-infopt-serving-sa
+      automountServiceAccountToken: false
+
+      hostPID: false
+      hostIPC: false
+      hostNetwork: false
+
+      nodeSelector:
+        # gpt-oss-20b requires trn2 or trn3 — sliding window attention with sink tokens
+        # is not supported on trn1 (hard assertion in neuronx_distributed_inference).
+        eks.amazonaws.com/instance-family: trn2
+
+      tolerations:
+        - key: aws.amazon.com/neuron
+          operator: Exists
+          effect: NoSchedule
+
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    app.kubernetes.io/component: benchmark-runner
+                topologyKey: kubernetes.io/hostname
+
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+
+      terminationGracePeriodSeconds: 180
+
+      # ── Init container: sync model weights from S3 → /model ──────────────────
+      # The Neuron vLLM DLC does not have runai_model_streamer. Syncing weights
+      # locally first and serving from /model bypasses the S3 streamer dependency.
+      initContainers:
+        - name: model-sync
+          image: amazon/aws-cli:2.15.0
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              echo "Syncing model weights from s3://${MODEL_BUCKET}/${MODEL_FOLDER}/ → /model/"
+              aws s3 sync "s3://${MODEL_BUCKET}/${MODEL_FOLDER}/" /model/ \
+                --region "${AWS_DEFAULT_REGION}" \
+                --no-progress
+              echo "Sync complete. Files:"
+              ls -lh /model/
+              echo "Verifying config.json exists:"
+              test -f /model/config.json && echo "config.json OK" || { echo "ERROR: config.json missing"; exit 1; }
+          env:
+            - name: AWS_DEFAULT_REGION
+              value: "us-east-2"
+            - name: MODEL_BUCKET
+              value: "${MODEL_BUCKET}"
+            - name: MODEL_FOLDER
+              value: "${MODEL_FOLDER}"
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: false
+            runAsNonRoot: true
+            runAsUser: 1000
+            runAsGroup: 1000
+            capabilities:
+              drop: ["ALL"]
+            seccompProfile:
+              type: RuntimeDefault
+          resources:
+            requests:
+              cpu: "4"
+              memory: "8Gi"
+            limits:
+              cpu: "8"
+              memory: "16Gi"
+          volumeMounts:
+            - name: model-weights
+              mountPath: /model
+
+      containers:
+        - name: vllm-neuron
+          image: ${NEURON_VLLM_IMAGE}
+          imagePullPolicy: IfNotPresent
+
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              echo "======================================================"
+              echo "  vLLM-Neuron serving"
+              echo "  Model : /model  (synced from s3://${MODEL_BUCKET}/${MODEL_FOLDER}/)"
+              echo "  Cores : ${NEURON_CORES}"
+              echo "======================================================"
+              NEURON_SKIP_EFA_AFFINITY=1 vllm serve /model \
+                --served-model-name "${SERVED_NAME}" \
+                --max-model-len 16384 \
+                --max-num-batched-tokens 8192 \
+                --max-num-seqs 4 \
+                --tensor-parallel-size "${NEURON_CORES}" \
+                --block-size 8 \
+                --no-enable-prefix-caching \
+                --hf-overrides '{"quantization_config": {}}' \
+                --additional-config '{"neuron_config": {"num_batched_tokens_buckets": [8192], "num_seqs_buckets": [4]}}' \
+                --port 8000
+
+          ports:
+            - name: http
+              containerPort: 8000
+              protocol: TCP
+
+          env:
+            - name: HOME
+              value: "/tmp"
+            - name: USER
+              value: "vllm"
+            - name: MODEL_BUCKET
+              value: "${MODEL_BUCKET}"
+            - name: MODEL_FOLDER
+              value: "${MODEL_FOLDER}"
+            - name: SERVED_NAME
+              value: "${SERVED_NAME}"
+            - name: NEURON_CORES
+              value: "${NEURON_CORES}"
+            - name: NEURONX_CACHE
+              value: "/tmp/neuronx_cache"
+            - name: NEURON_RT_NUM_CORES
+              value: "${NEURON_CORES}"
+            # Redirect vLLM-Neuron compiled artifact cache to /tmp.
+            # Without this, vLLM tries to write to /model/neuron-compiled-artifacts
+            # which would require the model volume to be writable.
+            - name: NEURON_COMPILE_CACHE_URL
+              value: "/tmp/neuron-compiled-artifacts"
+            - name: AWS_DEFAULT_REGION
+              value: "us-east-2"
+
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: false
+            runAsNonRoot: true
+            runAsUser: 1000
+            runAsGroup: 1000
+            capabilities:
+              drop: ["ALL"]
+            seccompProfile:
+              type: RuntimeDefault
+
+          resources:
+            requests:
+              cpu: "16"
+              memory: "64Gi"
+              aws.amazon.com/neuron: "16"
+            limits:
+              cpu: "32"
+              memory: "128Gi"
+              aws.amazon.com/neuron: "16"
+
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 600
+            periodSeconds: 15
+            failureThreshold: 480
+            timeoutSeconds: 5
+
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 720
+            periodSeconds: 30
+            failureThreshold: 10
+            timeoutSeconds: 5
+
+          volumeMounts:
+            - name: model-weights
+              mountPath: /model
+            - name: dshm
+              mountPath: /dev/shm
+            - name: tmp
+              mountPath: /tmp
+
+      volumes:
+        - name: model-weights
+          emptyDir:
+            # gpt-oss-20b safetensors (~40 GB) — size limit must cover the model.
+            sizeLimit: 60Gi
+        - name: dshm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 16Gi
+        - name: tmp
+          emptyDir:
+            sizeLimit: 100Gi

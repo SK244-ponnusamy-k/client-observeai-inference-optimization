@@ -1,0 +1,63 @@
+# ==============================================================================
+# configs/manifests/gpt-oss-20b-trn1-bf16.yaml
+# Matrix cell: gpt-oss-20b × trn1.32xlarge (AWS Trainium) × BF16
+#
+# ⚠ NOTE: MoE architecture support on Neuron SDK is UNCONFIRMED.
+#   Validate the compile step (vllm/models/gpt-oss-20b-neuron/compile-job.yaml)
+#   before treating these numbers as reliable.  MXFP4 is NOT available on Neuron;
+#   bf16 weights are compiled ahead-of-time to NEFF artifacts (see Flow B).
+#
+# Prerequisites:
+#   1. Compile: envsubst < vllm/models/gpt-oss-20b-neuron/compile-job.yaml | kubectl apply -f -
+#   2. NEFF cache lands at s3://<MODEL_BUCKET>/gpt-oss-20b-neuron/
+#   3. Serve:   bash vllm/models/gpt-oss-20b-neuron/deploy.sh
+# ==============================================================================
+run_id: oai-infopt-2026-09-10-gpt-oss-20b-trn1-bf16-001
+description: "openai/gpt-oss-20b BF16, trn1.32xlarge (16x NeuronCores), Trainium"
+
+model:
+  hf_id: openai/gpt-oss-20b
+  served_name: gpt-oss-20b
+  tokenizer: openai/gpt-oss-20b
+  # Points at the compiled NEFF cache in S3 (output of compile-job.yaml).
+  # On first deploy: bash deploy.sh --compile  → creates this folder
+  # All subsequent deploys: bash deploy.sh     → loads from this cache (fast)
+  s3_prefix: gpt-oss-20b-neuron/
+  source: eks_neuron
+
+serving:
+  # Pin to a specific tag/digest before running benchmarks.
+  # Current value is the placeholder from config/config.env; update when image is pinned.
+  image: public.ecr.aws/neuron/vllm-neuron:latest
+  nodepool: neuron-inf
+  instance_type: trn1.32xlarge        # 16 NeuronCores (8 chips × 2 cores/chip)
+
+optimization_variants:
+  - label: bf16-trn1
+    quantization: bf16
+    # tensor_parallel_size must equal NEURON_CORES used at compile time.
+    tensor_parallel_size: 16
+    # max_num_seqs and max_model_len MUST match the compiled batch/sequence buckets.
+    max_num_seqs: 8
+    max_num_batched_tokens: 8192
+    max_model_len: 16384
+    kv_cache_dtype: auto
+
+benchmark:
+  workload_profiles:
+    - configs/workload_profiles/realtime_v1.yaml
+    - configs/workload_profiles/batch_v1.yaml
+
+cost:
+  # trn1.32xlarge on-demand us-east-1 — VERIFY before run.
+  # https://aws.amazon.com/ec2/instance-types/trn1/
+  instance_hourly_usd: 21.50
+
+tags:
+  Project: observeai-inference-optimization
+  Engagement: shellkode-sow
+  Environment: sandbox
+  ManagedBy: benchmark-runner
+  Owner: TBD
+  CostCenter: TBD
+  RunId: oai-infopt-2026-09-10-gpt-oss-20b-trn1-bf16-001

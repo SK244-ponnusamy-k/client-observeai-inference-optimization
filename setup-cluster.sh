@@ -63,6 +63,57 @@ log_phase() {
     echo -e "${GREEN}╚══════════════════════════════════════════════════════╝${NC}"
 }
 
+# CLI Argument Parsing & Pass-through
+PASSTHROUGH_ARGS=("$@")
+
+usage() {
+    echo "Usage: bash setup-cluster.sh [OPTIONS]"
+    echo ""
+    echo "Options:"
+    echo "  --compute <gpu|g7|neuron|all>   Comma-separated list of compute pools to enable (e.g. --compute gpu,g7)"
+    echo "  --enable-gpu / --disable-gpu     Enable/disable standard GPU pool (G5/G6/G6e)"
+    echo "  --enable-g7 / --disable-g7       Enable/disable G7 Blackwell pool (G7/G7e)"
+    echo "  --enable-neuron / --disable-neuron Enable/disable AWS Neuron pool (Trn1/Inf2)"
+    echo "  --g7-ami <ami-id>               Specify custom AMI ID for G7 instances (NVIDIA Driver 595+)"
+    echo "  -h, --help                      Show this help message"
+    echo ""
+    exit 0
+}
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --compute)
+            IFS=',' read -ra COMPUTE_ARR <<< "$2"
+            ENABLE_GPU_STANDARD="false"
+            ENABLE_G7_SUPPORT="false"
+            ENABLE_NEURON_SUPPORT="false"
+            for item in "${COMPUTE_ARR[@]}"; do
+                case "$item" in
+                    gpu|standard) ENABLE_GPU_STANDARD="true" ;;
+                    g7|blackwell) ENABLE_G7_SUPPORT="true" ;;
+                    neuron|trn1)  ENABLE_NEURON_SUPPORT="true" ;;
+                    all)
+                        ENABLE_GPU_STANDARD="true"
+                        ENABLE_G7_SUPPORT="true"
+                        ENABLE_NEURON_SUPPORT="true"
+                        ;;
+                    *) echo "Unknown compute type: $item"; exit 1 ;;
+                esac
+            done
+            shift 2
+            ;;
+        --enable-gpu) ENABLE_GPU_STANDARD="true"; shift ;;
+        --disable-gpu) ENABLE_GPU_STANDARD="false"; shift ;;
+        --enable-g7) ENABLE_G7_SUPPORT="true"; shift ;;
+        --disable-g7) ENABLE_G7_SUPPORT="false"; shift ;;
+        --enable-neuron) ENABLE_NEURON_SUPPORT="true"; shift ;;
+        --disable-neuron) ENABLE_NEURON_SUPPORT="false"; shift ;;
+        --g7-ami) G7_CUSTOM_AMI_ID="$2"; ENABLE_G7_SUPPORT="true"; shift 2 ;;
+        -h|--help) usage ;;
+        *) echo "Unknown option: $1"; usage ;;
+    esac
+done
+
 # ==============================================================================
 # Pre-flight checks
 # ==============================================================================
@@ -117,6 +168,9 @@ printf "║  %-20s : %-37s║\n" "EKS Version"    "${EKS_VERSION}"
 printf "║  %-20s : %-37s║\n" "Model Bucket"   "${MODEL_BUCKET}"
 printf "║  %-20s : %-37s║\n" "Results Bucket" "${RESULTS_BUCKET}"
 printf "║  %-20s : %-37s║\n" "Namespace"      "${BENCHMARK_NAMESPACE}"
+printf "║  %-20s : %-37s║\n" "Standard GPU"   "G5/G6/G6e (${ENABLE_GPU_STANDARD})"
+printf "║  %-20s : %-37s║\n" "G7 Blackwell"   "G7/G7e (${ENABLE_G7_SUPPORT})"
+printf "║  %-20s : %-37s║\n" "Neuron"         "Trn1/Inf2 (${ENABLE_NEURON_SUPPORT})"
 printf "║  %-20s : %-37s║\n" "vLLM Image"     "${VLLM_IMAGE:0:37}"
 echo "╠══════════════════════════════════════════════════════════════╣"
 echo "║  Phases:                                                     ║"
@@ -132,8 +186,9 @@ read -r -p "Start full setup? [y/N]: " CONFIRM
 # Phase 1 — Cluster & Infrastructure
 # ==============================================================================
 log_phase "Phase 1 — Cluster & Infrastructure"
-bash "${SCRIPT_DIR}/cluster/bootstrap.sh"
+bash "${SCRIPT_DIR}/cluster/bootstrap.sh" "${PASSTHROUGH_ARGS[@]}"
 log_info "Phase 1 complete."
+
 
 # ==============================================================================
 # Phase 2 — K8s Prerequisites

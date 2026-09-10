@@ -1,0 +1,75 @@
+# ==============================================================================
+# cluster/gpu-g7-nodepool.yaml
+#
+# Karpenter NodePool dedicated for EC2 G7 and G7e (NVIDIA Blackwell) GPU workloads.
+#
+# Hardware requirements:
+#   - Targets g7 and g7e EC2 instance families.
+#   - Uses custom-g7-nodeclass (pre-configured with NVIDIA Driver 595+).
+#   - On-demand capacity to prevent benchmark/inference interrupts.
+#
+# Apply:
+#   kubectl apply -f cluster/gpu-g7-nodepool.yaml
+# ==============================================================================
+
+apiVersion: karpenter.sh/v1
+kind: NodePool
+metadata:
+  name: gpu-g7-inf
+  labels:
+    app.kubernetes.io/name: gpu-g7-inf
+    app.kubernetes.io/component: nodepool
+    app.kubernetes.io/managed-by: karpenter
+    project: observeai-inference-optimization
+    environment: sandbox
+    engagement: shellkode-sow
+    gpu-family: g7-blackwell
+spec:
+  template:
+    metadata:
+      labels:
+        workload: gpu
+        workload-type: ai-ml
+        gpu-family: g7
+        project: observeai-inference-optimization
+        environment: sandbox
+        engagement: shellkode-sow
+    spec:
+      nodeClassRef:
+        group: eks.amazonaws.com
+        kind: NodeClass
+        name: default
+
+      # Dedicated GPU taint — only pods requesting nvidia.com/gpu schedule here
+      taints:
+        - key: nvidia.com/gpu
+          effect: NoSchedule
+
+      requirements:
+        - key: eks.amazonaws.com/instance-family
+          operator: In
+          values: ["g7", "g7e"]
+
+        - key: kubernetes.io/arch
+          operator: In
+          values: ["amd64"]
+
+        # On-demand only for stability during inference benchmarks
+        - key: karpenter.sh/capacity-type
+          operator: In
+          values: ["on-demand"]
+
+        - key: topology.kubernetes.io/zone
+          operator: In
+          values: ["us-east-2a", "us-east-2b", "us-east-2c"]   # overridden by bootstrap
+
+  # Upper cap limit for G7 compute
+  limits:
+    cpu: "256"
+    memory: 2048Gi
+
+  disruption:
+    consolidationPolicy: WhenEmptyOrUnderutilized
+    consolidateAfter: 10m
+    budgets:
+      - nodes: "20%"

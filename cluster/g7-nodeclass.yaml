@@ -1,0 +1,53 @@
+# ==============================================================================
+# cluster/g7-nodeclass.yaml
+#
+# NodeClass definition for EC2 G7 (NVIDIA Blackwell) GPU instances.
+#
+# NOTE: EC2 G7 instances require NVIDIA Driver version 595+ and CUDA 13.x.
+# Standard AWS EKS GPU AMIs ship with Driver 550/580, which CANNOT initialize
+# G7 hardware. This NodeClass specifies a custom AMI built with Driver 595+.
+#
+# Environment variables substituted by cluster/bootstrap.sh:
+#   G7_AMI_ID — custom AMI ID with NVIDIA Driver 595+
+# ==============================================================================
+
+apiVersion: karpenter.k8s.aws/v1
+kind: EC2NodeClass
+metadata:
+  name: custom-g7-nodeclass
+  labels:
+    app.kubernetes.io/name: custom-g7-nodeclass
+    app.kubernetes.io/component: nodeclass
+    app.kubernetes.io/managed-by: karpenter
+    project: observeai-inference-optimization
+    environment: sandbox
+    engagement: shellkode-sow
+spec:
+  amiSelectorTerms:
+    - id: "${G7_AMI_ID}"
+
+  role: "KarpenterNodeRole-${CLUSTER_NAME}"
+
+  subnetSelectorTerms:
+    - tags:
+        karpenter.sh/discovery: "${CLUSTER_NAME}"
+
+  securityGroupSelectorTerms:
+    - tags:
+        karpenter.sh/discovery: "${CLUSTER_NAME}"
+
+  blockDeviceMappings:
+    - deviceName: /dev/xvda
+      ebs:
+        volumeSize: 200Gi
+        volumeType: gp3
+        iops: 3000
+        throughput: 125
+        encrypted: true
+        deleteOnTermination: true
+
+  tags:
+    Project: observeai-inference-optimization
+    Engagement: shellkode-sow
+    Environment: sandbox
+    Component: g7-blackwell-compute
