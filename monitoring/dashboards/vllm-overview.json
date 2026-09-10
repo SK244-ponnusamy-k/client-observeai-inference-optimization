@@ -2177,8 +2177,8 @@
                       "group": "grafana-amazonprometheus-datasource",
                       "kind": "DataQuery",
                       "spec": {
-                        "expr": "count(vllm:num_requests_running{namespace=\"oai-infopt\",job=~\"oai-infopt-vllm.*|vllm-gpt-oss.*\"}) or vector(1)",
-                        "legendFormat": "models"
+                        "expr": "count(up{namespace=\"oai-infopt\",job=~\"oai-infopt-vllm.*|vllm-gpt-oss.*\"} == 1) or vector(0)",
+                        "legendFormat": "active models"
                       },
                       "version": "v0"
                     },
@@ -2190,7 +2190,7 @@
               "transformations": []
             }
           },
-          "description": "",
+          "description": "Number of vLLM inference pods currently live (up == 1). Uses the scrape-target 'up' metric so stale AMP series from terminated pods do not inflate the count.",
           "id": 6,
           "links": [],
           "title": "Active Models",
