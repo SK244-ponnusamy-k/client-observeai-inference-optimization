@@ -1,0 +1,243 @@
+# ==============================================================================
+# vllm/models/gemma-4-31b/deployment.yaml
+#
+# Model     : google/gemma-4-31B-it  (instruction-tuned checkpoint)
+# S3 path   : s3://<MODEL_BUCKET>/gemma-4-31B-it/
+#             (MODEL_BUCKET resolved at runtime — not hardcoded here)
+# Size      : ~31.3B params (30.7B text + ~0.55B vision encoder), dense, bf16
+#             ~63 GB weights on disk / in VRAM (2 bytes/param, no quantization)
+# GPU       : g6e.12xlarge (4x L40S 48GB = 192GB total) — tensor-parallel-size=4
+#             Karpenter auto-provisions on demand.
+#
+# History — why -it and not the base checkpoint:
+#   google/gemma-4-31B (base) was deployed first and confirmed at request time
+#   to have no chat_template in tokenizer_config.json, so every
+#   /v1/chat/completions call (used by inference/load-test.py) failed with a
+#   400 ("must be provide a chat template"). Switched to -it, which ships one.
+#
+# Multimodal note:
+#   Gemma-4-31B is text+image (vision encoder ~0.55B params). This benchmark
+#   harness (inference/load-test.py) only ever sends text prompts, so the
+#   vision tower is loaded but unused — no special vLLM multimodal flags added.
+#
+# Runtime values injected via envsubst by deploy.sh:
+#   ${MODEL_BUCKET}  ${BENCHMARK_NAMESPACE}  ${VLLM_IMAGE}
+#
+# GPU sizing rationale:
+#   BF16 weights: ~63 GB total (31.3B params x 2 bytes/param, dense — no MoE).
+#   A single L40S (48GB) or even 2x L40S (96GB) cannot hold weights + KV cache
+#   with headroom, so TP=4 on g6e.12xlarge (4x L40S, 192GB total) is used:
+#     ~63GB / 4 GPUs = ~15.75GB weight shard per GPU
+#     48GB x 0.85 utilization = ~40.8GB usable per GPU
+#     ~40.8GB - ~15.75GB = ~25GB per GPU free for KV cache — comfortable
+#     headroom at max_model_len=8192.
+#   g6e.4xlarge/2xlarge are single-GPU instances in this instance family
+#   (only g6e.12xlarge/24xlarge/48xlarge carry multiple GPUs) — do not resize
+#   down to g6e.4xlarge expecting multi-GPU capacity.
+#
+# Security hardening (Checkov CKV_K8S_*):
+#   - Non-root user (UID 1000)                      [CKV_K8S_6,  CKV_K8S_40]
+#   - readOnlyRootFilesystem: true                  [CKV_K8S_22]
+#   - allowPrivilegeEscalation: false               [CKV_K8S_20]
+#   - Capabilities: drop ALL                        [CKV_K8S_25, CKV_K8S_28]
+#   - automountServiceAccountToken: false           [CKV_K8S_43]
+#   - No hostPath, hostPID, hostIPC, hostNetwork    [CKV_K8S_14-19]
+#   - CPU + memory requests and limits set          [CKV_K8S_10, CKV_K8S_11]
+#   - Liveness/readiness probes defined             [CKV_K8S_8,  CKV_K8S_9]
+#   - Config from ConfigMap, no hardcoded env vals  [CKV_K8S_35]
+# ==============================================================================
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: oai-infopt-vllm-gemma-4-31b
+  namespace: ${BENCHMARK_NAMESPACE}
+  labels:
+    app.kubernetes.io/name: oai-infopt-vllm-gemma-4-31b
+    app.kubernetes.io/component: inference-server
+    app.kubernetes.io/managed-by: kubectl
+    app.kubernetes.io/version: "gemma-4-31b"
+    project: observeai-inference-optimization
+    engagement: shellkode-sow
+    environment: sandbox
+    model: gemma-4-31b
+  annotations:
+    # Static-analysis suppressions — see gpt-oss-20b/deployment.yaml for full rationale.
+    checkov.io/skip1: "CKV_K8S_43=Image digest pinned in VLLM_IMAGE via config/config.env; envsubst resolves at deploy time"
+    checkov.io/skip2: "CKV_K8S_14=Image tag pinned in VLLM_IMAGE; not latest — static analysis cannot resolve envsubst variables"
+    checkov.io/skip3: "CKV_K8S_15=imagePullPolicy IfNotPresent acceptable with digest-pinned image; reassess next sprint"
+    checkov.io/skip4: "CKV_K8S_40=runAsUser 1000 pending vLLM UID compatibility test; tracked for next hardening sprint"
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: oai-infopt-vllm-gemma-4-31b
+  template:
+    metadata:
+      labels:
+        app: oai-infopt-vllm-gemma-4-31b
+        app.kubernetes.io/name: oai-infopt-vllm-gemma-4-31b
+        app.kubernetes.io/component: inference-server
+        project: observeai-inference-optimization
+        engagement: shellkode-sow
+        environment: sandbox
+        model: gemma-4-31b
+    spec:
+      serviceAccountName: oai-infopt-serving-sa
+      automountServiceAccountToken: false
+
+      hostPID: false
+      hostIPC: false
+      hostNetwork: false
+
+      tolerations:
+        - key: nvidia.com/gpu
+          operator: Exists
+          effect: NoSchedule
+
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    app.kubernetes.io/component: benchmark-runner
+                topologyKey: kubernetes.io/hostname
+
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+
+      terminationGracePeriodSeconds: 120
+
+      containers:
+        - name: vllm
+          image: ${VLLM_IMAGE}
+          imagePullPolicy: IfNotPresent
+
+          args:
+            - "--model=s3://${MODEL_BUCKET}/gemma-4-31B-it/"
+            - "--load-format=runai_streamer"
+            - "--host=0.0.0.0"
+            - "--port=8000"
+            - "--served-model-name=gemma-4-31b"
+            # Required for newly-released architectures whose modeling code
+            # is not yet bundled in every transformers/vLLM release.
+            - "--trust-remote-code"
+            # ── Parallelism ───────────────────────────────────────────────────
+            # Dense 31B bf16 model does not fit on 1-2 L40S GPUs — shard across
+            # all 4 GPUs on g6e.12xlarge.
+            - "--tensor-parallel-size=4"
+            # ── Memory ────────────────────────────────────────────────────────
+            # 0.85 on 4x L40S 48GB → ~40.8GB usable per GPU.
+            # Weights ~15.75GB/GPU shard, leaving ~25GB/GPU for KV cache blocks.
+            - "--gpu-memory-utilization=0.85"
+            # 8192 context window — matches other models' benchmark profiles;
+            # model natively supports up to 256K but that is not exercised here.
+            - "--max-model-len=8192"
+            # ── Scheduler ─────────────────────────────────────────────────────
+            # 128 concurrent sequences — ample headroom on 4-GPU KV cache.
+            # Lower if OOM observed at high concurrency during profiling.
+            - "--max-num-seqs=128"
+            # ── Chunked Prefill ───────────────────────────────────────────────
+            # NOTE: Gemma4's vision encoder uses bidirectional attention, so
+            # vLLM forces --disable-chunked-mm-input for this architecture.
+            # That requires max-num-batched-tokens >= the model's per-image
+            # token budget (2496 for Gemma4) or the engine refuses to start.
+            # 2048 (used by other, text-only models in this repo) is too low.
+            - "--enable-chunked-prefill"
+            - "--max-num-batched-tokens=4096"
+            # ── Prefix Caching ────────────────────────────────────────────────
+            - "--enable-prefix-caching"
+
+          ports:
+            - name: http
+              containerPort: 8000
+              protocol: TCP
+
+          envFrom:
+            - configMapRef:
+                name: oai-infopt-vllm-config
+
+          env:
+            # Required when running as UID 1000 without a passwd entry.
+            - name: HOME
+              value: "/tmp"
+            - name: USER
+              value: "vllm"
+            - name: TORCHINDUCTOR_CACHE_DIR
+              value: "/tmp/torchinductor_cache"
+
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            runAsUser: 1000
+            runAsGroup: 1000
+            capabilities:
+              drop: ["ALL"]
+            seccompProfile:
+              type: RuntimeDefault
+
+          resources:
+            requests:
+              cpu: "16"
+              memory: "200Gi"
+              nvidia.com/gpu: "4"
+            limits:
+              cpu: "32"
+              # 96Gi OOMKilled (exit 137) during weight streaming: 4 TP workers
+              # each staging shards of the ~58GB model in host RAM, plus NCCL/
+              # dshm overhead, exceeded that limit. g6e.12xlarge has ~371GiB
+              # allocatable — 300Gi leaves ample headroom for other node pods.
+              memory: "300Gi"
+              nvidia.com/gpu: "4"
+
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            # TP=4 rank sync + ~63GB streamed from S3 takes longer than
+            # single-GPU models on first load.
+            initialDelaySeconds: 480
+            periodSeconds: 15
+            failureThreshold: 40
+            timeoutSeconds: 5
+
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 600
+            periodSeconds: 30
+            failureThreshold: 10
+            timeoutSeconds: 5
+
+          volumeMounts:
+            - name: metadata-cache
+              mountPath: /metadata
+            - name: dshm
+              mountPath: /dev/shm
+            - name: tmp
+              mountPath: /tmp
+
+      volumes:
+        - name: metadata-cache
+          persistentVolumeClaim:
+            claimName: oai-infopt-metadata-gemma-4-31b
+        # TP=4 NCCL cross-GPU communication needs more shared memory than
+        # single-GPU deployments.
+        - name: dshm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 32Gi
+        - name: tmp
+          emptyDir:
+            sizeLimit: 4Gi

@@ -20,7 +20,7 @@ description: >
 
 # -- Input distribution -------------------------------------------------------
 input:
-  dataset: configs/workload_profiles/datasets/qa_eval_v1.jsonl
+  dataset: configs/workload_profiles/datasets/qa_eval_v1.xlsx
   token_distribution:
     p50_tokens: 512
     p95_tokens: 1024

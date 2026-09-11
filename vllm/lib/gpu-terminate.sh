@@ -235,8 +235,7 @@ print('\n'.join('  ' + n for n in gpu) if gpu else '  none — GPU billing stopp
     echo ""
     _log_info "Remaining workloads in ${namespace}:"
     local remaining
-    remaining=$(kubectl get all -n "${namespace}" --no-headers 2>/dev/null | \
-        grep -v "^$" | wc -l | tr -d ' ')
+    remaining=$(kubectl get all -n "${namespace}" --no-headers 2>/dev/null | wc -l | tr -d ' ')
     if [[ "${remaining}" -eq 0 ]]; then
         echo "  none — namespace is clean ✓"
     else
