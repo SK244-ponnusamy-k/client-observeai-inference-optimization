@@ -1,0 +1,33 @@
+apiVersion: eksctl.io/v1alpha5
+kind: ClusterConfig
+metadata:
+  name: ai-eks-cluster
+  region: us-east-2
+  version: "1.36"
+iam:
+  withOIDC: true
+# Self-managed node group (nodeGroups, not managedNodeGroups).
+# Managed node groups force a capacity-optimized ASG spot strategy across AZs
+# which fails for trn2's single-AZ availability (UnfulfillableCapacity).
+# Self-managed uses instancesDistribution for full control over spot allocation.
+nodeGroups:
+  - name: trn2-48xl-sm
+    amiFamily: AmazonLinux2023
+    minSize: 0
+    desiredCapacity: 1
+    maxSize: 1
+    subnets:
+      - subnet-06aba69e5fc5abfd1
+    volumeSize: 500
+    privateNetworking: true
+    instancesDistribution:
+      instanceTypes: ["trn2.48xlarge"]
+      onDemandBaseCapacity: 0
+      onDemandPercentageAboveBaseCapacity: 0
+      spotAllocationStrategy: lowest-price
+    labels:
+      aws.amazon.com/neuron: "true"
+    taints:
+      - key: aws.amazon.com/neuron
+        value: "true"
+        effect: NoSchedule

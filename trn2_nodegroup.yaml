@@ -1,0 +1,19 @@
+apiVersion: eksctl.io/v1alpha5
+kind: ClusterConfig
+metadata:
+  name: ai-eks-cluster
+  region: us-east-2
+  version: "1.36"
+iam:
+  withOIDC: true
+managedNodeGroups:
+  - name: trn2-48xl-ng1
+    launchTemplate:
+      id: lt-0de7d50d228bec18c
+    minSize: 0
+    desiredCapacity: 1
+    maxSize: 1
+    subnets:
+      - subnet-0121a0997eb148895
+    privateNetworking: true
+    efaEnabled: true

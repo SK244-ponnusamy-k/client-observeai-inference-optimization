@@ -1,19 +1,31 @@
 # ==============================================================================
-# vllm/models/gpt-oss-20b-neuron/deployment.yaml  — Flow B SERVE stage
+# vllm/models/gpt-oss-20b-neuron/deployment-managed-ng.yaml  — Flow B SERVE stage
 #
-# Model     : openai/gpt-oss-20b  (MoE, ~21B total / 3.6B active)
-# Weights   : BF16, loaded from s3://<MODEL_BUCKET>/gpt-oss-20b/ via init container
-# Hardware  : trn1.32xlarge — 16 NeuronCores (8 chips × 2 cores/chip)
+# USE THIS FILE when deploying on a managed node group (not Karpenter).
+# This is needed when EKS Auto Mode cannot provision trn2 via its Fleet API
+# (UnfulfillableCapacity error). The managed node group (trn2-neuron) bypasses
+# EKS Auto Mode and directly provisions a trn2.48xlarge spot instance.
 #
-# Loading strategy:
-#   An init container (AWS CLI image) syncs the bf16 weights from S3 to a shared
-#   emptyDir volume (/model). The vLLM-Neuron container then serves from /model
-#   (local path) — this avoids the runai_model_streamer dependency which is not
-#   available in the Neuron DLC.
+# Create the managed node group first (one-time):
+#   aws eks create-nodegroup \
+#     --cluster-name ai-eks-cluster \
+#     --nodegroup-name trn2-neuron \
+#     --instance-types trn2.48xlarge \
+#     --scaling-config minSize=0,maxSize=1,desiredSize=1 \
+#     --node-role <AutoModeNodeRole ARN> \
+#     --subnets subnet-06aba69e5fc5abfd1 \
+#     --ami-type AL2023_x86_64_NEURON \
+#     --capacity-type SPOT \
+#     --region us-east-2
 #
-# Runtime values injected via envsubst by deploy.sh:
-#   ${BENCHMARK_NAMESPACE} ${NEURON_VLLM_IMAGE} ${MODEL_BUCKET}
-#   ${MODEL_FOLDER} ${MODEL_HF_ID} ${SERVED_NAME} ${NEURON_CORES}
+# Deploy with:
+#   envsubst < vllm/models/gpt-oss-20b-neuron/deployment-managed-ng.yaml | kubectl apply -f -
+#
+# Key difference vs deployment.yaml:
+#   nodeSelector uses eks.amazonaws.com/nodegroup: trn2-neuron
+#   instead of eks.amazonaws.com/instance-family: trn2
+#
+# Everything else (init container, vLLM args, security, volumes) is identical.
 # ==============================================================================
 
 apiVersion: apps/v1
@@ -62,11 +74,11 @@ spec:
       hostIPC: false
       hostNetwork: false
 
+      # ── KEY DIFFERENCE: target the managed node group, not Karpenter ─────────
+      # EKS Auto Mode cannot provision trn2 via CreateFleet (UnfulfillableCapacity).
+      # The managed node group bypasses Auto Mode and directly joins the cluster.
       nodeSelector:
-        # gpt-oss-20b requires trn2 or trn3 — sliding window attention with sink tokens
-        # is not supported on trn1 (hard assertion in neuronx_distributed_inference).
-        # Used when trn2 is provisioned via the neuron-inf Karpenter NodePool.
-        eks.amazonaws.com/instance-family: trn2
+        eks.amazonaws.com/nodegroup: trn2-neuron
 
       tolerations:
         - key: aws.amazon.com/neuron
@@ -94,8 +106,6 @@ spec:
       terminationGracePeriodSeconds: 180
 
       # ── Init container: sync model weights from S3 → /model ──────────────────
-      # The Neuron vLLM DLC does not have runai_model_streamer. Syncing weights
-      # locally first and serving from /model bypasses the S3 streamer dependency.
       initContainers:
         - name: model-sync
           image: amazon/aws-cli:2.15.0
@@ -148,7 +158,7 @@ spec:
           args:
             - |
               echo "======================================================"
-              echo "  vLLM-Neuron serving"
+              echo "  vLLM-Neuron serving (managed node group)"
               echo "  Model : /model  (synced from s3://${MODEL_BUCKET}/${MODEL_FOLDER}/)"
               echo "  Cores : ${NEURON_CORES}"
               echo "======================================================"
@@ -186,9 +196,6 @@ spec:
               value: "/tmp/neuronx_cache"
             - name: NEURON_RT_NUM_CORES
               value: "${NEURON_CORES}"
-            # Redirect vLLM-Neuron compiled artifact cache to /tmp.
-            # Without this, vLLM tries to write to /model/neuron-compiled-artifacts
-            # which would require the model volume to be writable.
             - name: NEURON_COMPILE_CACHE_URL
               value: "/tmp/neuron-compiled-artifacts"
             - name: AWS_DEFAULT_REGION
@@ -244,7 +251,6 @@ spec:
       volumes:
         - name: model-weights
           emptyDir:
-            # gpt-oss-20b safetensors (~40 GB) — size limit must cover the model.
             sizeLimit: 60Gi
         - name: dshm
           emptyDir:

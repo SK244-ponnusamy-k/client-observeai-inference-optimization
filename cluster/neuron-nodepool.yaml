@@ -43,16 +43,18 @@ spec:
           effect: NoSchedule
 
       requirements:
-        # Trainium2 family (adjust to trn1 if trn2 is unavailable in-region)
+        # Use instance-family directly without instance-category.
+        # The instance-category + instance-family combination caused UnfulfillableCapacity
+        # in EKS Auto Mode's Fleet API — using family alone avoids that conflict.
         - key: eks.amazonaws.com/instance-family
           operator: In
-          values: ["trn2", "trn1"]
+          values: ["trn2"]
         - key: kubernetes.io/arch
           operator: In
           values: ["amd64"]
         - key: karpenter.sh/capacity-type
           operator: In
-          values: ["on-demand"]
+          values: ["spot", "on-demand"]
 
   # Safety cap — Trainium nodes are expensive; keep the ceiling tight for benchmarking.
   limits:

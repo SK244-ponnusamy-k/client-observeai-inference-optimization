@@ -43,11 +43,13 @@ log_error() { echo -e "${RED}[ERROR] $(date +'%H:%M:%S')${NC} $1"; }
 
 RUN_COMPILE="false"
 VALIDATE="false"
+USE_MANAGED_NG="false"
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --compile)  RUN_COMPILE="true"; shift ;;
-        --cores)    NEURON_CORES="$2"; shift 2 ;;
-        --validate) VALIDATE="true"; shift ;;
+        --compile)     RUN_COMPILE="true"; shift ;;
+        --cores)       NEURON_CORES="$2"; shift 2 ;;
+        --validate)    VALIDATE="true"; shift ;;
+        --managed-ng)  USE_MANAGED_NG="true"; shift ;;
         *) log_warn "Unknown argument: $1"; shift ;;
     esac
 done
@@ -65,7 +67,38 @@ echo "  Compile first : ${RUN_COMPILE}"
 echo "══════════════════════════════════════════════════════════════"
 echo ""
 
-# ── Step 1: Verify bf16 source weights exist in S3 ───────────────────────────
+# ── Step 1: Scale up the managed node group (if --managed-ng) ────────────────
+# Scale from 0 → 1 so the trn2 node exists before the pod tries to schedule.
+# If TRN2_NODEGROUP_NAME is empty, skip (using Karpenter auto-provisioning).
+if [[ "${USE_MANAGED_NG}" == "true" && -n "${TRN2_NODEGROUP_NAME:-}" ]]; then
+    log_info "Scaling up managed node group: ${TRN2_NODEGROUP_NAME} (desiredSize=1)..."
+    aws eks update-nodegroup-config \
+        --cluster-name "${CLUSTER_NAME}" \
+        --nodegroup-name "${TRN2_NODEGROUP_NAME}" \
+        --scaling-config minSize=0,maxSize=1,desiredSize=1 \
+        --region "${AWS_REGION}" >/dev/null
+    log_info "Node group scale-up initiated. Waiting for trn2 node to join cluster (~3-5 min)..."
+    # Wait for the node to appear and become Ready
+    for i in $(seq 1 30); do
+        TRN2_NODE=$(kubectl get nodes \
+            -l "eks.amazonaws.com/nodegroup=${TRN2_NODEGROUP_NAME}" \
+            -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)
+        if [[ -n "${TRN2_NODE}" ]]; then
+            log_info "trn2 node found: ${TRN2_NODE}"
+            break
+        fi
+        echo -n "."
+        sleep 10
+    done
+    echo ""
+    # Wait for node to be Ready
+    if [[ -n "${TRN2_NODE:-}" ]]; then
+        kubectl wait node "${TRN2_NODE}" --for=condition=Ready --timeout=300s || \
+            log_warn "Node not Ready yet — continuing anyway, pod will wait."
+    fi
+fi
+
+# ── Step 2: Verify bf16 source weights exist in S3 ───────────────────────────
 # Always check SOURCE_FOLDER (bf16 weights). MODEL_FOLDER (NEFF cache) won't
 # exist yet before the first compile — that's expected, not an error.
 log_info "Checking bf16 source weights in S3: s3://${MODEL_BUCKET}/${SOURCE_FOLDER}/"
@@ -77,7 +110,7 @@ if ! aws s3 ls "s3://${MODEL_BUCKET}/${SOURCE_FOLDER}/" \
 fi
 log_info "Source weights found in S3."
 
-# ── Step 2: Optionally run compile job ───────────────────────────────────────
+# ── Step 3: Optionally run compile job ───────────────────────────────────────
 # Use --compile on the FIRST deploy. After that, the NEFF cache exists in S3
 # and every subsequent deploy skips this step entirely (fast pod startup).
 # Without --compile: vLLM-Neuron auto-compiles inside the pod on first start
@@ -99,18 +132,29 @@ if [[ "${RUN_COMPILE}" == "true" ]]; then
     log_info "Compile job complete."
 fi
 
-# ── Step 3: Apply service ─────────────────────────────────────────────────────
+# ── Step 4: Apply service ─────────────────────────────────────────────────────
 log_info "Applying service: ${SERVICE_NAME}..."
 kubectl apply -f "${SCRIPT_DIR}/service.yaml"
 
-# ── Step 4: Apply deployment ──────────────────────────────────────────────────
+# ── Step 5: Apply deployment ──────────────────────────────────────────────────
 log_info "Applying deployment: ${DEPLOYMENT_NAME} (NeuronCores=${NEURON_CORES})..."
 export MODEL_BUCKET BENCHMARK_NAMESPACE NEURON_VLLM_IMAGE MODEL_FOLDER MODEL_HF_ID SERVED_NAME NEURON_CORES
-envsubst '${MODEL_BUCKET} ${BENCHMARK_NAMESPACE} ${NEURON_VLLM_IMAGE} ${MODEL_FOLDER} ${MODEL_HF_ID} ${SERVED_NAME} ${NEURON_CORES}' \
-    < "${SCRIPT_DIR}/deployment.yaml" | kubectl apply -f -
 
-# ── Step 5: Wait for pod to appear (Karpenter provisions trn1 node) ───────────
-log_info "Waiting for pod (Karpenter provisioning ${NEURON_INSTANCE_TYPE} — allow 3-5 min)..."
+# Use managed node group deployment if --managed-ng flag is set.
+# deployment-managed-ng.yaml targets eks.amazonaws.com/nodegroup: trn2-neuron
+# deployment.yaml targets eks.amazonaws.com/instance-family: trn2 (Karpenter)
+if [[ "${USE_MANAGED_NG}" == "true" ]]; then
+    log_info "Using managed node group deployment (deployment-managed-ng.yaml)..."
+    DEPLOY_FILE="${SCRIPT_DIR}/deployment-managed-ng.yaml"
+else
+    DEPLOY_FILE="${SCRIPT_DIR}/deployment.yaml"
+fi
+
+envsubst '${MODEL_BUCKET} ${BENCHMARK_NAMESPACE} ${NEURON_VLLM_IMAGE} ${MODEL_FOLDER} ${MODEL_HF_ID} ${SERVED_NAME} ${NEURON_CORES}' \
+    < "${DEPLOY_FILE}" | kubectl apply -f -
+
+# ── Step 6: Wait for pod to appear ───────────────────────────────────────────
+log_info "Waiting for pod (allow 1-2 min for trn2 node to accept scheduling)..."
 sleep 15
 POD=""
 for i in $(seq 1 36); do
@@ -125,7 +169,7 @@ done
 echo ""
 log_info "Pod: ${POD:-not found yet — check: kubectl get pods -n ${BENCHMARK_NAMESPACE}}"
 
-# ── Step 6: Wait for deployment ready ────────────────────────────────────────
+# ── Step 7: Wait for deployment ready ────────────────────────────────────────
 # With --compile: NEFF already in S3, pod loads and starts in ~10-15 min.
 # Without --compile: vLLM-Neuron compiles inside the pod — allow up to 2 hours.
 log_info "Waiting for Ready (allow up to 2 hours if compiling inside pod)..."

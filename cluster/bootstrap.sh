@@ -369,13 +369,20 @@ fi
 
 # AWS Neuron (Trn1, Trn1n, Inf2)
 if [[ "${ENABLE_NEURON_SUPPORT}" == "true" ]]; then
-    log_info "Applying Neuron NodePool (neuron-inf for Trn1/Inf2)..."
+    log_info "Applying Neuron NodePool (neuron-inf for Trn1/Trn2/Inf2)..."
     if [[ -f "${SCRIPT_DIR}/neuron-nodepool.yaml" ]]; then
         kubectl apply -f "${SCRIPT_DIR}/neuron-nodepool.yaml"
-        log_info "Neuron NodePool applied."
-    else
-        log_warn "neuron-nodepool.yaml not found — skipping Neuron setup."
+        log_info "Neuron NodePool (Karpenter) applied."
     fi
+
+    # Set up trn2 managed node group via CloudFormation + eksctl.
+    # This is needed because EKS Auto Mode's Fleet API does not support
+    # trn2 provisioning — managed node group bypasses Auto Mode.
+    log_info "Setting up trn2 managed node group (CloudFormation + eksctl)..."
+    bash "${SCRIPT_DIR}/setup-trn2-nodegroup.sh" || {
+        log_warn "trn2 node group setup failed — check capacity in ${AWS_REGION}."
+        log_warn "Retry manually: bash cluster/setup-trn2-nodegroup.sh"
+    }
 fi
 
 

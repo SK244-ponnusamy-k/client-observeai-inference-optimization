@@ -1,0 +1,35 @@
+apiVersion: eksctl.io/v1alpha5
+kind: ClusterConfig
+metadata:
+  name: ai-eks-cluster
+  region: us-east-2
+  version: "1.36"
+iam:
+  withOIDC: true
+# Multi-AZ self-managed node group. The ASG tries all 3 private subnets and
+# grabs trn2.48xlarge spot capacity wherever it appears — trn2 capacity rotates
+# between AZs minute-to-minute, so spanning all AZs maximizes the chance of a hit.
+# No EFA / placement group (single-node inference doesn't need NeuronLink).
+nodeGroups:
+  - name: trn2-48xl-multiaz
+    amiFamily: AmazonLinux2023
+    minSize: 0
+    desiredCapacity: 1
+    maxSize: 1
+    subnets:
+      - subnet-09bcc4d6f56df38e2   # us-east-2a private
+      - subnet-0121a0997eb148895   # us-east-2b private
+      - subnet-0662c5119c903f1f6   # us-east-2c private
+    volumeSize: 500
+    privateNetworking: true
+    instancesDistribution:
+      instanceTypes: ["trn2.48xlarge"]
+      onDemandBaseCapacity: 0
+      onDemandPercentageAboveBaseCapacity: 0
+      spotAllocationStrategy: capacity-optimized
+    labels:
+      aws.amazon.com/neuron: "true"
+    taints:
+      - key: aws.amazon.com/neuron
+        value: "true"
+        effect: NoSchedule
