@@ -1,0 +1,54 @@
+# ==============================================================================
+# catalog/models/gpt-oss-20b-neuron.yaml
+#
+# Worked example — Neuron / Trainium path. Reproduces the existing hardened
+# deployment at vllm/models/gpt-oss-20b-neuron/ from this single file.
+#
+# Neuron supports fp16/bf16 only (no MXFP4/NVFP4), so this compiles from the
+# bf16 base weights. Compile-time parameters below are baked into the artifact.
+# ==============================================================================
+
+id: gpt-oss-20b-neuron
+display_name: GPT-OSS 20B (Trainium / Neuron)
+hardware: neuron
+
+source:
+  hf_id: openai/gpt-oss-20b
+  gated: true
+  size_gb: 40                   # bf16 weights are larger than the MXFP4 GPU variant
+
+serving:
+  served_name: gpt-oss-20b
+  tokenizer: openai/gpt-oss-20b
+  quantization: bf16
+  max_model_len: 16384
+  max_num_seqs: 4               # must match a compiled batch bucket
+  max_num_batched_tokens: 8192
+
+resources:
+  cpu_request: "16"
+  cpu_limit: "32"
+  memory_request: "64Gi"
+  memory_limit: "128Gi"
+
+instances:
+  neuron_cores: 8               # = tensor-parallel degree; must match compile time
+  candidates:
+    - trn2.48xlarge
+    - trn1.32xlarge
+  node_group: trn2-48xl-ngc     # managed node-group fallback when Karpenter can't provision trn2
+
+neuron:
+  source_folder: gpt-oss-20b        # bf16 weights (compile input)
+  neff_folder: gpt-oss-20b-neuron   # compiled NEFF cache (compile output)
+  sequence_length: 16384
+  batch_size: 8
+  auto_cast_type: bf16
+  instance_family: trn2             # gpt-oss needs trn2/trn3 (sink attention unsupported on trn1)
+
+benchmark:
+  auto: false
+  profiles:
+    - configs/workload_profiles/realtime_v1.yaml
+    - configs/workload_profiles/batch_v1.yaml
+  instance_hourly_usd: 12.00        # trn2.48xlarge — VERIFY before run

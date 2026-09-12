@@ -1,0 +1,57 @@
+# ==============================================================================
+# catalog/models/gpt-oss-20b.yaml
+#
+# Worked example — GPU path. Reproduces the existing hardened deployment at
+# vllm/models/gpt-oss-20b/ from this single file.
+#
+# openai/gpt-oss-20b: MoE, 21B total / 3.6B active, reasoning model.
+# MXFP4 weights ~13 GB → fits a single GPU on g5/g6/g6e (TP=1).
+# ==============================================================================
+
+id: gpt-oss-20b
+display_name: GPT-OSS 20B (MXFP4)
+hardware: gpu
+
+source:
+  hf_id: openai/gpt-oss-20b
+  gated: true                 # accept license at https://huggingface.co/openai/gpt-oss-20b
+  size_gb: 13
+  ignore_patterns:
+    - "*.msgpack"
+    - "*.h5"
+    - "flax_*"
+    - "tf_*"
+    - "rust_*"
+
+serving:
+  served_name: gpt-oss-20b
+  tokenizer: openai/gpt-oss-20b
+  quantization: mxfp4
+  max_model_len: 16384          # reasoning model — needs headroom for chain-of-thought
+  gpu_memory_utilization: 0.90
+  max_num_seqs: 256
+  max_num_batched_tokens: 8192
+  extra_args:
+    - "--async-scheduling"        # recipe optimisation (overlap CPU/GPU)
+    - "--no-enable-prefix-caching" # required for consistent benchmark numbers
+
+resources:
+  cpu_request: "4"
+  cpu_limit: "8"
+  memory_request: "24Gi"
+  memory_limit: "30Gi"
+  vram_gb_required: 16
+
+instances:
+  tensor_parallel_size: 1
+  candidates:
+    - g6e.2xlarge
+    - g6.2xlarge
+    - g5.2xlarge
+
+benchmark:
+  auto: false
+  profiles:
+    - configs/workload_profiles/realtime_v1.yaml
+    - configs/workload_profiles/batch_v1.yaml
+  instance_hourly_usd: 2.24     # g6e.2xlarge on-demand us-east-2 — VERIFY before run

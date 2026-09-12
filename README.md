@@ -16,6 +16,63 @@ Serving engine: **AWS vLLM Deep Learning Container (DLC)** — OpenAI-compatible
 IaC: **AWS CDK (Python)** for cluster-adjacent resources; Kubernetes manifests versioned in-repo.  
 Security: IAM least-privilege via EKS Pod Identity; secrets in AWS Secrets Manager; no public NLB; Checkov-hardened pod specs.
 
+## Onboard a model the easy way — the `oai` CLI
+
+You do **not** need to hand-write Kubernetes manifests, download jobs, or deploy
+scripts to add a model. Describe the model in one small catalog file and the
+`oai` tool generates everything (with the same security hardening) and runs it.
+
+```bash
+oai model new              # guided questions -> writes catalog/models/<id>.yaml
+oai model generate <id>    # build all deployment files from that one entry
+oai download <id>          # HuggingFace weights -> S3
+oai deploy <id>            # run it — an available instance is auto-selected
+oai deploy <id> --benchmark  # ...or deploy and benchmark in one step
+oai status                 # what's running + which nodes are billed
+oai stop <id>              # stop and free the accelerator node
+```
+
+One-time cluster + monitoring setup is also driven by `oai` (every command
+reuses what already exists instead of recreating it):
+
+```bash
+oai cluster bootstrap                  # EKS cluster + S3 + IAM + node pools
+oai cluster setup-monitoring           # Prometheus + Grafana + DCGM GPU metrics
+oai cluster status                     # cluster + monitoring + node-group health
+oai cluster teardown                   # delete the cluster (keeps S3 + IAM)
+```
+
+For **AWS Trainium** models there is a one-time node-group setup (idempotent —
+reuses an existing group, never recreates it), then the normal deploy flow:
+
+```bash
+oai cluster setup-neuron               # once: create or reuse the trn2 node group
+oai deploy <id> --compile --managed-ng # first deploy (compiles); later: drop --compile
+```
+
+Highlights:
+
+- **One file per model** (`catalog/models/<id>.yaml`) — plain fields, fully
+  commented. Works for **GPU** and **AWS Trainium/Neuron** models.
+- **Dynamic instance selection**: `oai deploy` picks the cheapest available
+  instance from your preferred list, checks region availability + quota, and
+  falls back automatically. If nothing is available it tells you exactly what to
+  do (quota, region, node-group fallback, or wait) — never a silent failure.
+- **Customizable, optional auto-benchmarking**: set `benchmark.auto: true` (or
+  pass `--benchmark`) to benchmark right after deploy; choose profiles and
+  datasets per model.
+- **Safe by default**: generated files keep non-root, read-only rootfs, dropped
+  capabilities, least-privilege IAM, pinned images, and ClusterIP-only services.
+  The generator never overwrites files it didn't create.
+
+Full walkthrough for non-technical users: [`docs/ONBOARDING.md`](docs/ONBOARDING.md).
+Catalog field reference: [`catalog/SCHEMA.md`](catalog/SCHEMA.md).
+
+Launcher: `.\oai.ps1 <command>` on Windows, `./oai <command>` on Bash/WSL/macOS.
+
+The sections below document the underlying manual workflow the `oai` CLI
+automates — useful for understanding what it generates, or for advanced tuning.
+
 ## Team Members
 
 - @shellkode-genai (GitHub handle — update when assigned)

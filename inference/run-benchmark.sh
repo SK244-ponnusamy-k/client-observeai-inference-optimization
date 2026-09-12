@@ -67,9 +67,15 @@ case "${MODEL}" in
     qwen-0.5b|qwen-0-5b|qwen)
         SVC="oai-infopt-vllm-qwen-0-5b"; QUANT="" ;;   # smoke uses its own baseline manifest
     *)
-        log_error "Unknown model: ${MODEL}."
-        log_error "Use: gpt-oss-20b | qwen3.5-4b | gemma-4-26b-a4b | qwen-0.5b"
-        exit 1
+        # Generic fallback for catalog-onboarded models (oai model generate).
+        # The service name always follows the convention oai-infopt-vllm-<id>, and
+        # the quantization is carried in the manifest filename, so an explicit
+        # --manifest (which oai benchmark always passes) makes this fully generic.
+        SVC="oai-infopt-vllm-${MODEL}"
+        QUANT="${QUANT:-}"
+        if [[ -z "${MANIFEST_OVERRIDE}" ]]; then
+            log_warn "Unknown model '${MODEL}' — relying on --manifest / <model>-<hw>-<quant> convention."
+        fi
         ;;
 esac
 

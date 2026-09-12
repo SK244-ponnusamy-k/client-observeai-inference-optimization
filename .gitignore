@@ -50,6 +50,12 @@ htmlcov/
 # --- Node (if any tooling added later) ---
 node_modules/
 
+# --- Downloaded CLI tooling (Helm archive extraction, installer) ---
+windows-amd64/
+linux-amd64/
+darwin-amd64/
+get_helm.sh
+
 # --- OS ---
 .DS_Store
 Thumbs.db
