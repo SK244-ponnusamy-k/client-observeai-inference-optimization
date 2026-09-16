@@ -40,9 +40,13 @@ serving:
 resources:
   cpu_request: "8"
   cpu_limit: "16"
-  memory_request: "48Gi"
-  memory_limit: "96Gi"
-  vram_gb_required: 70          # ~63 GB weights + KV cache; fits ONE g7e 96 GB GPU
+  # A 63 GB bf16 model loaded via Runai Streamer with TP=4 needs a lot of HOST RAM
+  # (streamer buffers + 4 worker processes + /dev/shm). The old 96Gi limit caused
+  # OOMKilled (exit 137) on load. g6.12xlarge / g7e.12xlarge nodes have ~192 GB RAM,
+  # so raise the limit well above the model size.
+  memory_request: "96Gi"
+  memory_limit: "170Gi"
+  vram_gb_required: 70          # ~63 GB weights + KV cache
 
 instances:
   # Dense 31B bf16 (~63 GB weights) needs 4x L4 24 GB = 96 GB total on g6.12xlarge.

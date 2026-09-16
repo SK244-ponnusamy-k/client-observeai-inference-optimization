@@ -140,11 +140,11 @@ spec:
           resources:
             requests:
               cpu: "8"
-              memory: "48Gi"
+              memory: "96Gi"
               nvidia.com/gpu: "${GPU_COUNT}"
             limits:
               cpu: "16"
-              memory: "96Gi"
+              memory: "170Gi"
               nvidia.com/gpu: "${GPU_COUNT}"
 
           readinessProbe:
