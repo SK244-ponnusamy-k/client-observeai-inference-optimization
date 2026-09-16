@@ -40,6 +40,10 @@ class Source:
     gated: bool = False
     size_gb: float = 0.0
     ignore_patterns: list[str] = field(default_factory=list)
+    # Optional S3 folder name override. Defaults to the model id. Use this when
+    # the weights live under a folder that differs from the id (e.g. an -it
+    # instruction-tuned checkpoint stored as 'gemma-4-31B-it').
+    s3_folder: str = ""
 
 
 @dataclass
@@ -134,7 +138,7 @@ class ModelSpec:
         if self.is_neuron and self.neuron:
             # Serve from the source (bf16) folder; NEFF cache is a serving-time detail.
             return self.neuron.source_folder or self.id
-        return self.id
+        return self.source.s3_folder or self.id
 
     @property
     def preferred_instance(self) -> str:
@@ -170,6 +174,7 @@ def from_dict(data: dict[str, Any]) -> ModelSpec:
         gated=bool(src_raw.get("gated", False)),
         size_gb=float(src_raw.get("size_gb", 0) or 0),
         ignore_patterns=list(src_raw.get("ignore_patterns", []) or []),
+        s3_folder=src_raw.get("s3_folder", "") or "",
     )
 
     srv_raw = data.get("serving", {}) or {}

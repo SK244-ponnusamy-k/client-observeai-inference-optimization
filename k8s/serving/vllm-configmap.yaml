@@ -26,8 +26,10 @@ metadata:
     engagement: shellkode-sow
     environment: sandbox
 data:
-  # AWS region for Run:ai model streamer S3 access
-  AWS_DEFAULT_REGION: "us-east-2"    # updated by bootstrap / overridden at deploy time
+  # AWS region for Run:ai model streamer S3 access.
+  # ${AWS_REGION} is substituted by bootstrap.sh (envsubst) at apply time, so this
+  # is never hardcoded to a single region.
+  AWS_DEFAULT_REGION: "${AWS_REGION}"
 
   # vLLM serving defaults (overridden per-deployment via args)
   VLLM_PORT: "8000"

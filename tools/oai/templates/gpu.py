@@ -308,16 +308,32 @@ log_warn()  { echo -e "${YELLOW}[WARN]  $(date +'%H:%M:%S')${NC} $1"; }
 log_error() { echo -e "${RED}[ERROR] $(date +'%H:%M:%S')${NC} $1"; }
 
 VALIDATE="false"
+DEPLOY_TAG=""
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --hw)       NODE_INSTANCE_TYPE="$2"; shift 2 ;;
         --tp)       TP_SIZE="$2"; shift 2 ;;
         --validate) VALIDATE="true"; shift ;;
+        --tag)      DEPLOY_TAG="$2"; shift 2 ;;
         *) log_warn "Unknown arg: $1"; shift ;;
     esac
 done
 GPU_COUNT="${TP_SIZE}"
 export NODE_INSTANCE_TYPE TP_SIZE GPU_COUNT MODEL_FOLDER SERVED_NAME
+
+# ── Optional --tag: deploy the SAME model on multiple instances concurrently ──
+# When set, every k8s object name gets a -<tag> suffix so parallel deploys do not
+# collide. Base names come from model.env. Default (no tag) = names unchanged.
+BASE_VLLM_NAME="${DEPLOYMENT_NAME}"          # oai-infopt-vllm-<id>
+BASE_PVC_NAME="${PVC_NAME}"                  # oai-infopt-metadata-<id>
+if [[ -n "${DEPLOY_TAG}" ]]; then
+    DEPLOYMENT_NAME="${BASE_VLLM_NAME}-${DEPLOY_TAG}"
+    SERVICE_NAME="${SERVICE_NAME}-${DEPLOY_TAG}"
+    PVC_NAME="${BASE_PVC_NAME}-${DEPLOY_TAG}"
+fi
+# sed program rewrites hardcoded base names in the rendered YAML to the suffixed
+# names. No-op when DEPLOY_TAG is empty (each rule replaces X with X).
+NAME_REWRITE="s|${BASE_VLLM_NAME}|${DEPLOYMENT_NAME}|g; s|${BASE_PVC_NAME}|${PVC_NAME}|g"
 
 echo ""
 echo "=================================================="
@@ -326,6 +342,7 @@ echo "  Deployment    : ${DEPLOYMENT_NAME}"
 echo "  Service       : ${SERVICE_NAME}:8000"
 echo "  Namespace     : ${BENCHMARK_NAMESPACE}"
 echo "  Instance type : ${NODE_INSTANCE_TYPE}   (TP=${TP_SIZE}, GPUs=${GPU_COUNT})"
+echo "  Tag           : ${DEPLOY_TAG:-<none>}"
 echo "=================================================="
 echo ""
 
@@ -338,15 +355,21 @@ fi
 log_info "Model found in S3."
 
 log_info "Applying PVC..."
-kubectl apply -f "${SCRIPT_DIR}/pvc.yaml"
+# Guard: if a previous stop.sh left the PVC in Terminating, applying now would
+# no-op and leave NO PVC (pod then hangs Pending). Wait for it to fully clear.
+if kubectl get pvc "${PVC_NAME}" -n "${BENCHMARK_NAMESPACE}" -o jsonpath='{.metadata.deletionTimestamp}' 2>/dev/null | grep -q .; then
+    log_warn "PVC ${PVC_NAME} is still Terminating - waiting for it to clear..."
+    kubectl wait --for=delete "pvc/${PVC_NAME}" -n "${BENCHMARK_NAMESPACE}" --timeout=120s 2>/dev/null || true
+fi
+sed "${NAME_REWRITE}" "${SCRIPT_DIR}/pvc.yaml" | kubectl apply -f -
 
 log_info "Applying service: ${SERVICE_NAME}..."
-kubectl apply -f "${SCRIPT_DIR}/service.yaml"
+sed "${NAME_REWRITE}" "${SCRIPT_DIR}/service.yaml" | kubectl apply -f -
 
 log_info "Applying deployment: ${DEPLOYMENT_NAME} on ${NODE_INSTANCE_TYPE}..."
 export MODEL_BUCKET BENCHMARK_NAMESPACE VLLM_IMAGE
 envsubst '${MODEL_BUCKET} ${BENCHMARK_NAMESPACE} ${VLLM_IMAGE} ${MODEL_FOLDER} ${SERVED_NAME} ${NODE_INSTANCE_TYPE} ${TP_SIZE} ${GPU_COUNT}' \\
-    < "${SCRIPT_DIR}/deployment.yaml" | kubectl apply -f -
+    < "${SCRIPT_DIR}/deployment.yaml" | sed "${NAME_REWRITE}" | kubectl apply -f -
 
 log_info "Waiting for pod (Karpenter provisioning ${NODE_INSTANCE_TYPE} ~2-4 min)..."
 sleep 10
@@ -360,16 +383,21 @@ done
 echo ""
 log_info "Pod: ${POD:-not found yet}"
 
-log_info "Waiting for Ready (model loading from S3 - up to 10 min)..."
-kubectl wait "deployment/${DEPLOYMENT_NAME}" \\
-    --for=condition=Available --timeout=600s -n "${BENCHMARK_NAMESPACE}" || {
-    log_warn "Deployment not ready yet - check logs:"
-    log_warn "  kubectl logs deployment/${DEPLOYMENT_NAME} -n ${BENCHMARK_NAMESPACE} | tail -30"
-}
+log_info "Waiting for Ready (node provision + image pull + model load - up to 15 min)..."
+DEPLOY_READY="false"
+if kubectl wait "deployment/${DEPLOYMENT_NAME}" \\
+    --for=condition=Available --timeout=900s -n "${BENCHMARK_NAMESPACE}"; then
+    DEPLOY_READY="true"
+else
+    log_error "Deployment did not become Ready. Common causes:"
+    log_error "  - No ${NODE_INSTANCE_TYPE} capacity/quota in this region (pod stays Pending)."
+    log_error "  - Inspect: kubectl describe pod -l app=${DEPLOYMENT_NAME} -n ${BENCHMARK_NAMESPACE} | tail -20"
+    log_error "  - Logs  : kubectl logs deployment/${DEPLOYMENT_NAME} -n ${BENCHMARK_NAMESPACE} --tail=30"
+fi
 
 echo ""
 echo "=================================================="
-echo "  DEPLOYED - {{id}} on ${NODE_INSTANCE_TYPE}"
+echo "  DEPLOY RESULT - {{id}} on ${NODE_INSTANCE_TYPE}  (ready=${DEPLOY_READY})"
 echo "=================================================="
 kubectl get pods -l app="${DEPLOYMENT_NAME}" -n "${BENCHMARK_NAMESPACE}" -o wide
 echo ""
@@ -377,6 +405,12 @@ echo "  Port-forward:"
 echo "    kubectl port-forward svc/${SERVICE_NAME} ${PORT_FORWARD_PORT}:8000 -n ${BENCHMARK_NAMESPACE} &"
 echo "    curl http://localhost:${PORT_FORWARD_PORT}/health"
 echo "=================================================="
+
+# Fail the script if the deployment never became Ready, so callers (oai deploy)
+# do NOT proceed to benchmark a model that is not actually serving.
+if [[ "${DEPLOY_READY}" != "true" ]]; then
+    exit 1
+fi
 
 if [[ "${VALIDATE}" == "true" ]]; then
     echo ""
@@ -407,13 +441,27 @@ source "${FRAMEWORK_ROOT}/config/config.env"
 source "${SCRIPT_DIR}/model.env"
 source "${FRAMEWORK_ROOT}/vllm/lib/gpu-terminate.sh"
 
+# ── Optional --tag: stop a tagged parallel deploy (must match the deploy --tag) ─
+DEPLOY_TAG=""
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --tag) DEPLOY_TAG="$2"; shift 2 ;;
+        *) shift ;;
+    esac
+done
+if [[ -n "${DEPLOY_TAG}" ]]; then
+    DEPLOYMENT_NAME="${DEPLOYMENT_NAME}-${DEPLOY_TAG}"
+    SERVICE_NAME="${SERVICE_NAME}-${DEPLOY_TAG}"
+    PVC_NAME="${PVC_NAME}-${DEPLOY_TAG}"
+fi
+
 GREEN='\\033[0;32m'; YELLOW='\\033[1;33m'; NC='\\033[0m'
 log_info()  { echo -e "${GREEN}[INFO]  $(date +'%H:%M:%S')${NC} $1"; }
 log_warn()  { echo -e "${YELLOW}[WARN]  $(date +'%H:%M:%S')${NC} $1"; }
 
 echo ""
 echo "=================================================="
-echo "  FULL STOP - ${MODEL_ID}"
+echo "  FULL STOP - ${MODEL_ID} ${DEPLOY_TAG:+(tag=${DEPLOY_TAG})}"
 echo "  Deployment : ${DEPLOYMENT_NAME}"
 echo "  Namespace  : ${BENCHMARK_NAMESPACE}"
 echo "=================================================="
@@ -445,10 +493,17 @@ kubectl delete pvc "${PVC_NAME}" -n "${BENCHMARK_NAMESPACE}" --ignore-not-found=
 
 terminate_model_gpu_node "${DEPLOYMENT_NAME}" "${BENCHMARK_NAMESPACE}" "${MODEL_NODE:-}"
 
-log_info "Cleaning up benchmark jobs for model '${MODEL_ID}'..."
-kubectl delete jobs -n "${BENCHMARK_NAMESPACE}" \\
-    -l "app.kubernetes.io/component=benchmark-runner,model=${MODEL_ID}" \\
-    --ignore-not-found=true 2>/dev/null || true
+# When --tag is set, SKIP the blanket job cleanup: benchmark Jobs are labeled by
+# model (not tag), so deleting by model could kill another tag's running benchmark.
+# Tagged Jobs self-clean via ttlSecondsAfterFinished.
+if [[ -z "${DEPLOY_TAG}" ]]; then
+    log_info "Cleaning up benchmark jobs for model '${MODEL_ID}'..."
+    kubectl delete jobs -n "${BENCHMARK_NAMESPACE}" \\
+        -l "app.kubernetes.io/component=benchmark-runner,model=${MODEL_ID}" \\
+        --ignore-not-found=true 2>/dev/null || true
+else
+    log_info "Tagged stop (tag=${DEPLOY_TAG}) - skipping blanket job cleanup (jobs self-clean via TTL)."
+fi
 
 print_stop_summary "${MODEL_ID}" "${BENCHMARK_NAMESPACE}"
 """

@@ -252,15 +252,13 @@ CLUSTER_ARN=$(aws eks describe-cluster \
     --region "${AWS_REGION}" \
     --query "cluster.arn" --output text)
 
+# `aws eks tag-resource --tags` takes a MAP: Key=Value,Key=Value (comma-separated,
+# a single argument) — NOT space-separated tokens (that made the CLI treat the
+# 2nd+ tags as unknown options). Build the map string, then pass it once.
+CLUSTER_TAGS="Project=${TAG_PROJECT},Engagement=${TAG_ENGAGEMENT},Environment=${TAG_ENVIRONMENT},Component=${TAG_COMPONENT},ManagedBy=${TAG_MANAGED_BY},Owner=${TAG_OWNER}"
 aws eks tag-resource \
     --resource-arn "${CLUSTER_ARN}" \
-    --tags \
-        "Project=${TAG_PROJECT}" \
-        "Engagement=${TAG_ENGAGEMENT}" \
-        "Environment=${TAG_ENVIRONMENT}" \
-        "Component=${TAG_COMPONENT}" \
-        "ManagedBy=${TAG_MANAGED_BY}" \
-        "Owner=${TAG_OWNER}" \
+    --tags "${CLUSTER_TAGS}" \
     --region "${AWS_REGION}" || log_warn "Cluster tag apply failed — verify manually."
 
 # ==============================================================================
@@ -325,6 +323,20 @@ else
 fi
 
 # ==============================================================================
+# Step 9b — Apply the shared vLLM serving ConfigMap (region injected dynamically)
+# Every model deployment references configmap oai-infopt-vllm-config via envFrom.
+# Without this, the first deploy fails with CreateContainerConfigError. We render
+# ${AWS_REGION} from the current region so it is NEVER hardcoded to one region.
+# ==============================================================================
+log_step "Applying vLLM serving ConfigMap"
+export AWS_REGION
+if envsubst '${AWS_REGION}' < "${FRAMEWORK_ROOT}/k8s/serving/vllm-configmap.yaml" | kubectl apply -f -; then
+    log_info "vLLM ConfigMap applied (AWS_DEFAULT_REGION=${AWS_REGION})."
+else
+    log_warn "Failed to apply vLLM ConfigMap — model deploys will fail until it exists."
+fi
+
+# ==============================================================================
 # Step 10 — Apply Compute NodePools (Standard GPU, G7 Blackwell, Neuron)
 # ==============================================================================
 log_step "Applying Compute NodePools"
@@ -344,21 +356,35 @@ if [[ "${ENABLE_G7_SUPPORT}" == "true" ]]; then
     G7_AMI_ID="${G7_CUSTOM_AMI_ID:-}"
     if [[ -z "${G7_AMI_ID}" ]]; then
         log_info "Querying SSM Parameter Store (${G7_SSM_AMI_PARAM}) for G7 custom AMI..."
-        G7_AMI_ID=$(aws ssm get-parameter --name "${G7_SSM_AMI_PARAM}" --region "${AWS_REGION}" --query Parameter.Value --output text 2>/dev/null || echo "")
+        # MSYS_NO_PATHCONV=1: on Git Bash the leading-slash SSM name (/eks/ami/...)
+        # is otherwise mangled into a Windows path, so the lookup finds nothing.
+        G7_AMI_ID=$(MSYS_NO_PATHCONV=1 aws ssm get-parameter --name "${G7_SSM_AMI_PARAM}" --region "${AWS_REGION}" --query Parameter.Value --output text 2>/dev/null || echo "")
     fi
 
     if [[ -n "${G7_AMI_ID}" ]]; then
         log_info "Using G7 Custom AMI ID: ${G7_AMI_ID}"
-        log_info "Applying G7 NodeClass (custom-g7-nodeclass)..."
-        
-        # Substitute environment variables into g7-nodeclass.yaml
-        sed -e "s/\${G7_AMI_ID}/${G7_AMI_ID}/g" \
-            -e "s/\${CLUSTER_NAME}/${CLUSTER_NAME}/g" \
-            "${SCRIPT_DIR}/g7-nodeclass.yaml" | kubectl apply -f -
 
-        log_info "Applying G7 NodePool (gpu-g7-inf)..."
-        kubectl apply -f "${SCRIPT_DIR}/gpu-g7-nodepool.yaml"
-        log_info "G7 Blackwell GPU compute configured."
+        # The g7 NodeClass is an upstream-Karpenter EC2NodeClass (karpenter.k8s.aws).
+        # EKS Auto Mode does NOT install that CRD — it manages AMIs itself and does
+        # not support pinning a custom AMI via EC2NodeClass. Detect that and skip
+        # gracefully instead of hard-failing the whole bootstrap.
+        if ! kubectl get crd ec2nodeclasses.karpenter.k8s.aws >/dev/null 2>&1; then
+            log_warn "This cluster is EKS Auto Mode (no EC2NodeClass CRD)."
+            log_warn "G7 with a custom AMI requires self-managed Karpenter OR a managed node group;"
+            log_warn "it cannot be provisioned via EC2NodeClass on Auto Mode. Skipping G7 NodePool."
+            log_warn "To benchmark G7 on this cluster, create a managed node group with the custom AMI:"
+            log_warn "  aws eks create-nodegroup --cluster-name ${CLUSTER_NAME} --nodegroup-name g7-ng \\"
+            log_warn "    --instance-types g7.2xlarge --ami-type CUSTOM --node-role <role> ... (see docs)"
+        else
+            log_info "Applying G7 NodeClass (custom-g7-nodeclass)..."
+            sed -e "s/\${G7_AMI_ID}/${G7_AMI_ID}/g" \
+                -e "s/\${CLUSTER_NAME}/${CLUSTER_NAME}/g" \
+                "${SCRIPT_DIR}/g7-nodeclass.yaml" | kubectl apply -f -
+
+            log_info "Applying G7 NodePool (gpu-g7-inf)..."
+            kubectl apply -f "${SCRIPT_DIR}/gpu-g7-nodepool.yaml"
+            log_info "G7 Blackwell GPU compute configured."
+        fi
     else
         log_warn "G7 support enabled, but no G7 Custom AMI ID found!"
         log_warn "Build AMI using: bash cluster/ami/build-g7-ami.sh"

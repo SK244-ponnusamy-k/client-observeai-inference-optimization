@@ -1,0 +1,61 @@
+# ==============================================================================
+# catalog/models/gemma-4-31b.yaml
+#
+# google/gemma-4-31B-it — dense 31B instruction-tuned, bf16 (no quantization).
+# ~63 GB weights need 4x L40S (192 GB) => tensor-parallel-size 4 on g6e.12xlarge.
+#
+# NOTE: the -it (instruction-tuned) checkpoint is used deliberately. The BASE
+# checkpoint has no chat_template, which vLLM's /v1/chat/completions endpoint
+# (used by the benchmark harness) requires — every request 400s without it.
+# The weights live in S3 under 'gemma-4-31B-it' (source.s3_folder), which differs
+# from the short id used for resource names.
+# ==============================================================================
+
+id: gemma-4-31b
+display_name: Gemma 4 31B (Instruction-tuned)
+hardware: gpu
+
+source:
+  hf_id: google/gemma-4-31B-it
+  gated: true                   # accept license at https://huggingface.co/google/gemma-4-31B-it
+  size_gb: 63
+  s3_folder: gemma-4-31B-it      # weights folder in S3 (differs from the id)
+
+serving:
+  served_name: gemma-4-31b
+  tokenizer: google/gemma-4-31B-it
+  quantization: none            # dense bf16
+  max_model_len: 8192
+  gpu_memory_utilization: 0.85
+  max_num_seqs: 128
+  # Gemma4's vision encoder forces vLLM to disable chunked MM input, which
+  # requires max_num_batched_tokens >= the model's per-image token budget (2496).
+  # 2048 (fine for text-only models) causes a startup ValueError — use 4096.
+  max_num_batched_tokens: 4096
+  extra_args:
+    - "--trust-remote-code"       # required by the gemma4 model code
+    - "--enable-chunked-prefill"
+    - "--enable-prefix-caching"
+
+resources:
+  cpu_request: "8"
+  cpu_limit: "16"
+  memory_request: "48Gi"
+  memory_limit: "96Gi"
+  vram_gb_required: 70          # ~63 GB weights + KV cache; fits ONE g7e 96 GB GPU
+
+instances:
+  # Dense 31B bf16 (~63 GB weights) needs 4x L4 24 GB = 96 GB total on g6.12xlarge.
+  # tensor-parallel-size=4 splits the model across all 4 GPUs on the node.
+  # NOTE: L4 (g6) is a low-power inference card, so expect modest throughput for a
+  # dense 31B — this is a cost/feasibility data point, not a speed champion.
+  tensor_parallel_size: 4
+  candidates:
+    - g6.12xlarge               # 4x L4 24 GB = 96 GB, TP=4
+
+benchmark:
+  auto: false
+  profiles:
+    - configs/workload_profiles/realtime_v1.yaml
+    - configs/workload_profiles/batch_v1.yaml
+  instance_hourly_usd: 5.00     # g6.12xlarge on-demand us-east-2 — VERIFY before run

@@ -43,8 +43,8 @@ output:
   temperature: 0.0               # (documentation)
 
 # -- Concurrency + sample sizing ----------------------------------------------
-concurrency_levels: [16, 32, 64, 128]   # [ACTIVE]
-num_prompts_factor: 20           # [ACTIVE]  conc*20 (e.g. 128→2560)
+concurrency_levels: [16, 32, 64, 128, 256, 500]   # [ACTIVE]
+num_prompts_factor: 20           # [ACTIVE]  conc*20 (e.g. 500→10000)
 min_prompts: 200                 # [ACTIVE]  floor for the lowest level
 warmup_requests: 20              # (documentation)
 duration_s: 300                  # (documentation)

@@ -59,9 +59,8 @@ spec:
           operator: In
           values: ["on-demand"]
 
-        - key: topology.kubernetes.io/zone
-          operator: In
-          values: ["us-east-2a", "us-east-2b", "us-east-2c"]   # overridden by bootstrap
+        # No topology.kubernetes.io/zone constraint — region-agnostic (was hardcoded
+        # to us-east-2, which broke scheduling in other regions).
 
   # Upper cap limit for G7 compute
   limits:

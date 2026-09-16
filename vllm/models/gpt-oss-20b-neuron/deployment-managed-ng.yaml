@@ -123,7 +123,7 @@ spec:
               test -f /model/config.json && echo "config.json OK" || { echo "ERROR: config.json missing"; exit 1; }
           env:
             - name: AWS_DEFAULT_REGION
-              value: "us-east-2"
+              value: "${AWS_REGION}"
             - name: MODEL_BUCKET
               value: "${MODEL_BUCKET}"
             - name: MODEL_FOLDER
@@ -199,7 +199,7 @@ spec:
             - name: NEURON_COMPILE_CACHE_URL
               value: "/tmp/neuron-compiled-artifacts"
             - name: AWS_DEFAULT_REGION
-              value: "us-east-2"
+              value: "${AWS_REGION}"
 
           securityContext:
             allowPrivilegeEscalation: false

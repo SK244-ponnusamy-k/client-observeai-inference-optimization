@@ -185,7 +185,7 @@ spec:
               test -f /model/config.json && echo "config.json OK" || { echo "ERROR: config.json missing"; exit 1; }
           env:
             - name: AWS_DEFAULT_REGION
-              value: "{{aws_region}}"
+              value: "${AWS_REGION}"
             - name: MODEL_BUCKET
               value: "${MODEL_BUCKET}"
             - name: MODEL_FOLDER
@@ -252,7 +252,7 @@ spec:
             - name: NEURON_COMPILE_CACHE_URL
               value: "/tmp/neuron-compiled-artifacts"
             - name: AWS_DEFAULT_REGION
-              value: "{{aws_region}}"
+              value: "${AWS_REGION}"
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: false
@@ -546,7 +546,7 @@ fi
 log_info "Applying service: ${SERVICE_NAME}..."
 kubectl apply -f "${SCRIPT_DIR}/service.yaml"
 
-export MODEL_BUCKET BENCHMARK_NAMESPACE NEURON_VLLM_IMAGE MODEL_FOLDER MODEL_HF_ID SERVED_NAME NEURON_CORES
+export MODEL_BUCKET BENCHMARK_NAMESPACE NEURON_VLLM_IMAGE MODEL_FOLDER MODEL_HF_ID SERVED_NAME NEURON_CORES AWS_REGION
 if [[ "${USE_MANAGED_NG}" == "true" ]]; then
     DEPLOY_FILE="${SCRIPT_DIR}/deployment-managed-ng.yaml"
     log_info "Using managed node group deployment..."
@@ -554,7 +554,7 @@ else
     DEPLOY_FILE="${SCRIPT_DIR}/deployment.yaml"
 fi
 log_info "Applying deployment: ${DEPLOYMENT_NAME} (NeuronCores=${NEURON_CORES})..."
-envsubst '${MODEL_BUCKET} ${BENCHMARK_NAMESPACE} ${NEURON_VLLM_IMAGE} ${MODEL_FOLDER} ${MODEL_HF_ID} ${SERVED_NAME} ${NEURON_CORES}' \\
+envsubst '${MODEL_BUCKET} ${BENCHMARK_NAMESPACE} ${NEURON_VLLM_IMAGE} ${MODEL_FOLDER} ${MODEL_HF_ID} ${SERVED_NAME} ${NEURON_CORES} ${AWS_REGION}' \\
     < "${DEPLOY_FILE}" | kubectl apply -f -
 
 log_info "Waiting for pod..."

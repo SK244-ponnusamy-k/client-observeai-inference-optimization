@@ -1,0 +1,48 @@
+# ==============================================================================
+# catalog/models/qwen3-5-4b.yaml
+#
+# Qwen/Qwen3.5-4B — dense 4B, bf16. ~9 GB, fits a single GPU on any family (TP=1).
+#
+# The id is K8s-safe (dashes, no dots) while the HF id / served name / S3 folder
+# keep the real "3.5" naming (source.s3_folder = Qwen3.5-4B).
+# ==============================================================================
+
+id: qwen3-5-4b
+display_name: Qwen3.5 4B
+hardware: gpu
+
+source:
+  hf_id: Qwen/Qwen3.5-4B
+  gated: false
+  size_gb: 9
+  s3_folder: Qwen3.5-4B          # weights folder in S3 (keeps the dotted name)
+
+serving:
+  served_name: Qwen3.5-4B
+  tokenizer: Qwen/Qwen3.5-4B
+  quantization: bf16
+  max_model_len: 8192
+  gpu_memory_utilization: 0.90
+  max_num_seqs: 256
+  max_num_batched_tokens: 8192
+
+resources:
+  cpu_request: "4"
+  cpu_limit: "8"
+  memory_request: "24Gi"
+  memory_limit: "30Gi"
+  vram_gb_required: 12
+
+instances:
+  tensor_parallel_size: 1
+  candidates:
+    - g6e.2xlarge
+    - g6.2xlarge
+    - g5.2xlarge
+
+benchmark:
+  auto: false
+  profiles:
+    - configs/workload_profiles/realtime_v1.yaml
+    - configs/workload_profiles/batch_v1.yaml
+  instance_hourly_usd: 2.24      # g6e.2xlarge on-demand — VERIFY for us-west-2 before run

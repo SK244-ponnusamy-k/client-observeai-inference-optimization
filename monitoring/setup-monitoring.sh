@@ -384,17 +384,31 @@ log_info "Dashboard ConfigMap applied."
 # ==============================================================================
 log_step "Step 8 — kube-prometheus-stack"
 
+# ── Control-plane ServiceMonitor auth (chart-version compatibility) ──────────
+# Recent kube-prometheus-stack versions render the control-plane ServiceMonitors
+# (kubelet, etc.) with token-Secret authentication, and REFUSE to template unless
+# that Secret is created. The chart error tells us exactly how to satisfy it:
+# enable prometheus + its ServiceAccount + createTokenSecret. We pass these as
+# --set flags so it works on top of the rendered values file, any chart version.
+KPS_CP_AUTH_ARGS=(
+    --set "prometheus.enabled=true"
+    --set "prometheus.serviceAccount.create=true"
+    --set "prometheus.serviceAccount.createTokenSecret=true"
+)
+
 if helm status kube-prometheus-stack -n "${MONITORING_NAMESPACE}" >/dev/null 2>&1; then
     log_warn "kube-prometheus-stack already installed — upgrading..."
     helm upgrade kube-prometheus-stack prometheus-community/kube-prometheus-stack \
         --namespace "${MONITORING_NAMESPACE}" \
         -f "${RENDERED_VALUES}" \
+        "${KPS_CP_AUTH_ARGS[@]}" \
         --wait --timeout 10m
 else
     log_info "Installing kube-prometheus-stack..."
     helm install kube-prometheus-stack prometheus-community/kube-prometheus-stack \
         --namespace "${MONITORING_NAMESPACE}" \
         -f "${RENDERED_VALUES}" \
+        "${KPS_CP_AUTH_ARGS[@]}" \
         --wait --timeout 10m
 fi
 log_info "kube-prometheus-stack ready."

@@ -68,7 +68,7 @@ spec:
               exit 0
           env:
             - name: AWS_DEFAULT_REGION
-              value: "us-east-2"
+              value: "${AWS_REGION}"
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true

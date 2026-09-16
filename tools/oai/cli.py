@@ -117,11 +117,12 @@ def _cmd_deploy(args: argparse.Namespace) -> int:
         do_benchmark=args.benchmark,
         profile=args.profile,
         skip_instance_check=args.no_instance_check,
+        tag=args.tag,
     )
 
 
 def _cmd_stop(args: argparse.Namespace) -> int:
-    return lifecycle.stop(args.id, managed_ng=args.managed_ng, assume_yes=args.yes)
+    return lifecycle.stop(args.id, managed_ng=args.managed_ng, assume_yes=args.yes, tag=args.tag)
 
 
 def _cmd_status(_args: argparse.Namespace) -> int:
@@ -129,7 +130,9 @@ def _cmd_status(_args: argparse.Namespace) -> int:
 
 
 def _cmd_benchmark(args: argparse.Namespace) -> int:
-    return bench_mod.run(args.id, profile=args.profile, dataset=args.dataset, skip_batch=args.skip_batch)
+    return bench_mod.run(
+        args.id, profile=args.profile, dataset=args.dataset, skip_batch=args.skip_batch, tag=args.tag
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -205,6 +208,9 @@ def _build_parser() -> argparse.ArgumentParser:
     dp.add_argument(
         "--no-instance-check", action="store_true", help="skip the live availability check (use the preferred instance)"
     )
+    dp.add_argument(
+        "--tag", help="run this model as an independent, concurrent copy (suffixes all resource names)"
+    )
     dp.set_defaults(func=_cmd_deploy)
 
     # stop
@@ -212,6 +218,7 @@ def _build_parser() -> argparse.ArgumentParser:
     st.add_argument("id")
     st.add_argument("--managed-ng", action="store_true", help="[neuron] scale the managed node group to 0")
     st.add_argument("-y", "--yes", action="store_true", help="do not prompt for confirmation")
+    st.add_argument("--tag", help="stop a specific tagged copy (must match the deploy --tag)")
     st.set_defaults(func=_cmd_stop)
 
     # status
@@ -252,6 +259,7 @@ def _build_parser() -> argparse.ArgumentParser:
     bm.add_argument("--profile", help="only run this workload profile (e.g. batch_v1)")
     bm.add_argument("--dataset", help="custom dataset (s3://... or a key in the results bucket)")
     bm.add_argument("--skip-batch", action="store_true", help="run only the realtime profile")
+    bm.add_argument("--tag", help="benchmark a specific tagged copy (matches the deploy --tag)")
     bm.set_defaults(func=_cmd_benchmark)
 
     return p

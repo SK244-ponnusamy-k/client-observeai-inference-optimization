@@ -59,7 +59,7 @@ data:
   RESULTS_DIR: "/results"
   LOG_LEVEL: "INFO"
   WAIT_TIMEOUT: "600"
-  AWS_DEFAULT_REGION: "us-east-2"
+  AWS_DEFAULT_REGION: "${AWS_REGION}"
   RESULTS_BUCKET: "${RESULTS_BUCKET}"
   # Optional: DCGM-exporter / Prometheus-federate URL exposing DCGM_FI_DEV_* for
   # the GPU node under test. Leave empty to source GPU util from Grafana/AMP post-hoc.

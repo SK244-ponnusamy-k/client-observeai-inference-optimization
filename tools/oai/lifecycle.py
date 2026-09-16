@@ -94,6 +94,7 @@ def deploy(
     do_benchmark: bool = False,
     profile: str | None = None,
     skip_instance_check: bool = False,
+    tag: str | None = None,
 ) -> int:
     spec = catalog.load(model_id)
 
@@ -132,6 +133,9 @@ def deploy(
 
     args: list[str] = []
     if spec.is_neuron:
+        if tag:
+            ui.warn("--tag is not supported for Neuron models (they use the managed node group); ignoring it.")
+            tag = None
         if compile_first:
             args += ["--compile"]
         want_managed = managed_ng or (
@@ -144,24 +148,27 @@ def deploy(
         args += ["--cores", str(spec.instances.neuron_cores)]
     else:
         args += ["--hw", chosen]
+        if tag:
+            args += ["--tag", tag]
+            ui.step(f"Deploying as an independent tagged copy: tag={tag} (resource names suffixed -{tag}).")
 
     if validate:
         args += ["--validate"]
 
-    ui.banner(f"Deploy: {spec.id}  ({chosen})")
+    ui.banner(f"Deploy: {spec.id}  ({chosen}){f'  tag={tag}' if tag else ''}")
     rc = shell.run_bash(script, args)
     if rc != 0:
         _explain_deploy_failure(spec, chosen)
         return rc
 
-    ui.info(f"'{spec.id}' deployed on {chosen}.")
+    ui.info(f"'{spec.id}' deployed on {chosen}{f' (tag={tag})' if tag else ''}.")
 
     # ---- Optional benchmark --------------------------------------------------
     if do_benchmark or spec.benchmark.auto:
         from . import benchmark as bench_mod
 
         ui.banner(f"Auto-benchmark: {spec.id}")
-        return bench_mod.run(model_id, profile=profile, skip_batch=spec.benchmark.skip_batch)
+        return bench_mod.run(model_id, profile=profile, skip_batch=spec.benchmark.skip_batch, tag=tag)
     else:
         ui.hint(f"To benchmark: oai benchmark {spec.id}   (or add --benchmark to deploy)")
     return 0
@@ -177,12 +184,17 @@ def _explain_deploy_failure(spec: ModelSpec, instance: str) -> None:
     ui.hint(f"- Logs:    kubectl logs deployment/{spec.deployment_name} -n oai-infopt --tail=50")
 
 
-def stop(model_id: str, *, managed_ng: bool = False, assume_yes: bool = False) -> int:
+def stop(model_id: str, *, managed_ng: bool = False, assume_yes: bool = False, tag: str | None = None) -> int:
     spec = catalog.load(model_id)
     script = paths.model_dir(spec.id) / "stop.sh"
     if not script.exists():
         ui.fail(f"stop.sh missing for '{model_id}'.", f"Run: oai model generate {model_id}")
     args = ["--managed-ng"] if managed_ng else []
+    if tag:
+        if spec.is_neuron:
+            ui.warn("--tag is not supported for Neuron models; ignoring it.")
+        else:
+            args += ["--tag", tag]
     env = {"OAI_ASSUME_YES": "true"} if assume_yes else {}
     rc = shell.run_bash(script, args, env=env)
     if rc != 0:

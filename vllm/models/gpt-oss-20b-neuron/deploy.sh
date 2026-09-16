@@ -138,7 +138,7 @@ kubectl apply -f "${SCRIPT_DIR}/service.yaml"
 
 # ── Step 5: Apply deployment ──────────────────────────────────────────────────
 log_info "Applying deployment: ${DEPLOYMENT_NAME} (NeuronCores=${NEURON_CORES})..."
-export MODEL_BUCKET BENCHMARK_NAMESPACE NEURON_VLLM_IMAGE MODEL_FOLDER MODEL_HF_ID SERVED_NAME NEURON_CORES
+export MODEL_BUCKET BENCHMARK_NAMESPACE NEURON_VLLM_IMAGE MODEL_FOLDER MODEL_HF_ID SERVED_NAME NEURON_CORES AWS_REGION
 
 # Use managed node group deployment if --managed-ng flag is set.
 # deployment-managed-ng.yaml targets eks.amazonaws.com/nodegroup: trn2-neuron
@@ -150,7 +150,7 @@ else
     DEPLOY_FILE="${SCRIPT_DIR}/deployment.yaml"
 fi
 
-envsubst '${MODEL_BUCKET} ${BENCHMARK_NAMESPACE} ${NEURON_VLLM_IMAGE} ${MODEL_FOLDER} ${MODEL_HF_ID} ${SERVED_NAME} ${NEURON_CORES}' \
+envsubst '${MODEL_BUCKET} ${BENCHMARK_NAMESPACE} ${NEURON_VLLM_IMAGE} ${MODEL_FOLDER} ${MODEL_HF_ID} ${SERVED_NAME} ${NEURON_CORES} ${AWS_REGION}' \
     < "${DEPLOY_FILE}" | kubectl apply -f -
 
 # ── Step 6: Wait for pod to appear ───────────────────────────────────────────

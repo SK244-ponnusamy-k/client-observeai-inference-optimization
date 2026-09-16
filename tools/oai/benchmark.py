@@ -48,6 +48,23 @@ def _selected_profiles(spec: ModelSpec, profile: str | None, skip_batch: bool) -
     return shorts or ["realtime"]
 
 
+def _profile_arg(profiles: list[str]) -> str:
+    """
+    Collapse the selected profiles into run-benchmark.sh's --profile value.
+
+    When both realtime and batch are selected we pass 'both', which runs them in
+    ONE Job/container (image pulled once, profiles run back-to-back) rather than
+    two separate jobs.
+    """
+    has_rt = "realtime" in profiles
+    has_batch = "batch" in profiles
+    if has_rt and has_batch:
+        return "both"
+    if has_batch:
+        return "batch"
+    return "realtime"
+
+
 def _manifest_hw(spec: ModelSpec) -> str:
     """The <hw> token used in the generated manifest filename."""
     if spec.preferred_instance:
@@ -55,7 +72,14 @@ def _manifest_hw(spec: ModelSpec) -> str:
     return spec.hardware
 
 
-def run(model_id: str, *, profile: str | None = None, dataset: str | None = None, skip_batch: bool = False) -> int:
+def run(
+    model_id: str,
+    *,
+    profile: str | None = None,
+    dataset: str | None = None,
+    skip_batch: bool = False,
+    tag: str | None = None,
+) -> int:
     spec = catalog.load(model_id)
 
     manifest_rel = f"configs/manifests/{spec.manifest_filename}"
@@ -70,6 +94,7 @@ def run(model_id: str, *, profile: str | None = None, dataset: str | None = None
         ui.hint(f"Set it in catalog/models/{model_id}.yaml and re-run 'oai model generate {model_id}' for cost math.")
 
     profiles = _selected_profiles(spec, profile, skip_batch)
+    profile_arg = _profile_arg(profiles)
     ds = dataset if dataset is not None else spec.benchmark.dataset
     hw = _manifest_hw(spec)
 
@@ -77,27 +102,33 @@ def run(model_id: str, *, profile: str | None = None, dataset: str | None = None
     if not script.exists():
         ui.fail("inference/run-benchmark.sh is missing.", "This is part of the base framework - check your checkout.")
 
-    ui.banner(f"Benchmark: {spec.id}")
+    # A --tag means we benchmarked a tagged (concurrent) deploy: point the runner
+    # at that tagged service and isolate its S3 results so parallel runs don't
+    # overwrite each other.
+    svc = None
+    if tag and not spec.is_neuron:
+        svc = f"{spec.service_name}-{tag}"
+
+    ui.banner(f"Benchmark: {spec.id}{f'  (tag={tag})' if tag else ''}")
     ui.kv("Manifest", manifest_rel)
-    ui.kv("Profiles", ", ".join(profiles))
+    ui.kv("Profiles", f"{', '.join(profiles)}  (single job/container)" if profile_arg == "both" else profile_arg)
     ui.kv("Dataset", ds or "built-in random (no PII)")
 
-    overall = 0
-    for prof in profiles:
-        ui.step(f"Running the '{prof}' profile ...")
-        args = ["--model", spec.id, "--profile", prof, "--hw", hw, "--manifest", manifest_rel]
-        if ds:
-            args += ["--dataset", ds]
-        rc = shell.run_bash(script, args)
-        if rc != 0:
-            # run-benchmark.sh exits 1 on SLO violation too - results may still be valid.
-            ui.warn(f"The '{prof}' profile finished non-zero (exit {rc}).")
-            ui.hint("This can mean an SLO threshold was not met (results still uploaded) or a real error.")
-            ui.hint("Check the log above and the S3 results path it printed.")
-            overall = rc
-        else:
-            ui.info(f"'{prof}' profile complete.")
+    # ONE invocation. When profile_arg is 'both', run-benchmark.sh runs realtime
+    # and batch back-to-back inside a single container (image pulled once).
+    args = ["--model", spec.id, "--profile", profile_arg, "--hw", hw, "--manifest", manifest_rel]
+    if ds:
+        args += ["--dataset", ds]
+    if tag and svc:
+        args += ["--tag", tag, "--svc", svc]
 
-    if overall == 0:
-        ui.info("Benchmark complete. Results are in the results bucket (path shown above).")
-    return overall
+    rc = shell.run_bash(script, args)
+    if rc != 0:
+        # run-benchmark.sh exits 1 on SLO violation too - results may still be valid.
+        ui.warn(f"Benchmark finished non-zero (exit {rc}).")
+        ui.hint("This can mean an SLO threshold was not met (results still uploaded) or a real error.")
+        ui.hint("Check the log above and the S3 results path it printed.")
+        return rc
+
+    ui.info("Benchmark complete. Results are in the results bucket (path shown above).")
+    return 0

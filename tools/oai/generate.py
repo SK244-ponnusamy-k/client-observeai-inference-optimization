@@ -217,8 +217,9 @@ def _gen_neuron(spec: ModelSpec, ctx: dict[str, object], cfg: config.Config, res
 
 def _gen_download(spec: ModelSpec, ctx: dict[str, object], result: GenResult, force: bool) -> None:
     ddir = paths.download_dir(spec.id)
-    # For neuron, the download folder is the bf16 SOURCE folder; for gpu it's the id folder.
-    download_folder = spec.neuron.source_folder if (spec.is_neuron and spec.neuron) else spec.id
+    # For neuron, the download folder is the bf16 SOURCE folder; for gpu it's the
+    # S3 folder (id, or source.s3_folder override).
+    download_folder = spec.neuron.source_folder if (spec.is_neuron and spec.neuron) else spec.s3_model_folder
     dctx = dict(ctx)
     if spec.source.gated:
         dctx.update(

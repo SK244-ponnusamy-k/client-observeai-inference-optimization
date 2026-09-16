@@ -160,7 +160,8 @@ else
     # so try the cluster version first, then fall back to known-good versions.
     NEURON_AMI=""
     for AMI_VER in "${EKS_VERSION}" "1.34" "1.33"; do
-        NEURON_AMI=$(aws ssm get-parameter \
+        # MSYS_NO_PATHCONV=1: prevent Git Bash from mangling the leading-slash SSM name.
+        NEURON_AMI=$(MSYS_NO_PATHCONV=1 aws ssm get-parameter \
             --name "/aws/service/eks/optimized-ami/${AMI_VER}/amazon-linux-2023/x86_64/neuron/recommended/image_id" \
             --region "${AWS_REGION}" \
             --query 'Parameter.Value' --output text 2>/dev/null || echo "")

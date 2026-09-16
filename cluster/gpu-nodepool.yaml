@@ -70,10 +70,10 @@ spec:
           operator: In
           values: ["on-demand"]
 
-        # AZs resolved at runtime by bootstrap.sh from the cluster's AZs
-        - key: topology.kubernetes.io/zone
-          operator: In
-          values: ["us-east-2a", "us-east-2b", "us-east-2c"]   # overridden by bootstrap
+        # NOTE: no topology.kubernetes.io/zone constraint — Karpenter uses whatever
+        # AZs the cluster spans, so this NodePool is region-agnostic. (Previously
+        # this was hardcoded to us-east-2a/b/c, which broke GPU scheduling in every
+        # other region. If you must pin AZs, set them to YOUR region's zones.)
 
   # Safety cap — prevents runaway GPU spend; covers up to g6e.48xlarge level
   limits:
