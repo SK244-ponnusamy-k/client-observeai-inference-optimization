@@ -225,6 +225,10 @@ VOLUMES=""
 for P in "${PROFILE_LIST[@]}"; do
     RUN_STEPS="${RUN_STEPS}
               echo \"=== PROFILE: ${P} ===\"
+              # Per-level S3 upload target — load-test.py uploads the cumulative
+              # JSONL to this prefix after EVERY concurrency level, so a failure at
+              # a high level (e.g. 500) still leaves the earlier levels in S3.
+              export RESULTS_S3_PREFIX=\"results/${TIMESTAMP}/${S3_TAG_SEG}${P}/\"
               python3 /app/load-test.py \\
                 --manifest /configs/manifests/manifest.yaml \\
                 --profile  /configs/profiles/${P}/profile.yaml \\
@@ -278,6 +282,11 @@ spec:
         app.kubernetes.io/component: benchmark-runner
         project: observeai-inference-optimization
         model: "${MODEL}"
+      annotations:
+        # Prevent Karpenter from consolidating/evicting the node mid-benchmark.
+        # A single eviction is terminal here (backoffLimit: 0), so the whole
+        # sweep is lost. This pins the node for the lifetime of the run.
+        karpenter.sh/do-not-disrupt: "true"
     spec:
       restartPolicy: Never
       serviceAccountName: oai-infopt-benchmark-sa

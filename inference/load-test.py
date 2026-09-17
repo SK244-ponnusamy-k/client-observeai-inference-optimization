@@ -509,6 +509,60 @@ def _save_results(results: list[BenchmarkResult], output_dir: str, run_id: str) 
     _push_metrics_to_prometheus(results)
 
 
+def _reset_results_file(output_dir: str, run_id: str) -> None:
+    """Truncate/clear the results JSONL before the sweep begins.
+
+    Guarantees incremental appends start from an empty file even if the output
+    directory was reused within the same process/pod.
+    """
+    out = Path(output_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    (out / f"{run_id}.jsonl").write_text("", encoding="utf-8")
+
+
+def _append_result_to_disk(result: BenchmarkResult, output_dir: str, run_id: str) -> str:
+    """Append a single result row to the on-disk JSONL and return the file path.
+
+    Written incrementally (one row per concurrency level) so a crash at a later,
+    higher-concurrency level never discards the levels already completed.
+    """
+    out = Path(output_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    out_file = out / f"{run_id}.jsonl"
+    with out_file.open("a") as f:
+        f.write(json.dumps(asdict(result)) + "\n")
+    return str(out_file)
+
+
+def _upload_file_to_s3(local_path: str) -> None:
+    """Best-effort upload of the results JSONL to S3 after each concurrency level.
+
+    Controlled by env vars set by run-benchmark.sh / the Job:
+      RESULTS_BUCKET      — target bucket (required; skipped if unset)
+      RESULTS_S3_PREFIX   — key prefix, e.g. results/<ts>/<tag>/<profile>/
+      AWS_DEFAULT_REGION  — region for the S3 client
+    Overwrites the same key each level so S3 always holds the latest cumulative
+    JSONL (every completed level so far). Never raises — upload failures must not
+    abort the benchmark.
+    """
+    bucket = os.getenv("RESULTS_BUCKET", "")
+    if not bucket:
+        logger.debug("RESULTS_BUCKET not set — skipping per-level S3 upload")
+        return
+    prefix = os.getenv("RESULTS_S3_PREFIX", "results/")
+    if prefix and not prefix.endswith("/"):
+        prefix += "/"
+    region = os.getenv("AWS_DEFAULT_REGION", "us-east-2")
+    key = f"{prefix}{os.path.basename(local_path)}"
+    try:
+        import boto3
+        s3 = boto3.client("s3", region_name=region)
+        s3.upload_file(local_path, bucket, key)
+        logger.info("Uploaded incremental results to s3://%s/%s", bucket, key)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Per-level S3 upload skipped (will retry next level): %s", exc)
+
+
 def _push_metrics_to_prometheus(results: list[BenchmarkResult]) -> None:
     """Push derived metrics to Prometheus Pushgateway (best effort)."""
     pg_url = os.getenv("PROMETHEUS_PUSHGATEWAY", "http://prometheus-pushgateway.monitoring:9091")
@@ -673,6 +727,10 @@ def _run(args: argparse.Namespace) -> None:
 
     _wait_for_vllm(endpoint, timeout_s=args.wait_timeout)
 
+    # Start from a clean JSONL so incremental appends don't inherit stale rows
+    # from a prior run that reused the same output directory.
+    _reset_results_file(args.output, run_id)
+
     all_results: list[BenchmarkResult] = []
     for conc in concurrency_levels:
         num_prompts = max(conc * int(profile.get("num_prompts_factor", 5)),
@@ -713,6 +771,14 @@ def _run(args: argparse.Namespace) -> None:
         _push_metrics_to_prometheus([result])
         logger.info("Concurrency %d: ttft_p95=%.1fms out=%.1f tok/s status=%s",
                     conc, result.ttft_p95_ms, result.output_throughput_tokens_s, result.status)
+
+        # Persist + upload after EVERY concurrency level so a failure at a later,
+        # higher-concurrency level (e.g. 500) never loses the levels already done.
+        try:
+            level_file = _append_result_to_disk(result, args.output, run_id)
+            _upload_file_to_s3(level_file)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Incremental persist/upload at concurrency=%d skipped: %s", conc, exc)
 
     if not all_results:
         raise SystemExit("No successful benchmark runs — check vLLM endpoint and logs.")

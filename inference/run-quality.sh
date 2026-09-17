@@ -38,6 +38,7 @@ QUANT="mxfp4"
 CONFIG="configs/quality/autoqa_v1.yaml"
 DATASET_S3_KEY="quality-datasets/autoqa_v1.csv"
 STAGE_FILE=""
+SVC_OVERRIDE=""    # optional explicit vLLM service name (for --tag parallel deploys, e.g. -g7e)
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -45,6 +46,7 @@ while [[ $# -gt 0 ]]; do
         --hw)      HW="$2"; shift 2 ;;
         --quant)   QUANT="$2"; shift 2 ;;
         --config)  CONFIG="$2"; shift 2 ;;
+        --svc)     SVC_OVERRIDE="$2"; shift 2 ;;
         --stage-dataset) STAGE_FILE="$2"; shift 2 ;;
         *) log_error "Unknown: $1"; exit 1 ;;
     esac
@@ -65,9 +67,16 @@ case "${MODEL}" in
     gpt-oss-20b)                         SVC="oai-infopt-vllm-gpt-oss-20b" ;;
     qwen3.5-4b|qwen3-5-4b)               SVC="oai-infopt-vllm-qwen3-5-4b" ;;
     gemma-4-26b-a4b|gemma)               SVC="oai-infopt-vllm-gemma-4-26b-a4b" ;;
+    gemma-4-31b|gemma-4-31b-it)          SVC="oai-infopt-vllm-gemma-4-31b" ;;
     qwen-0.5b|qwen-0-5b|qwen)            SVC="oai-infopt-vllm-qwen-0-5b" ;;
     *) log_error "Unknown model: ${MODEL}"; exit 1 ;;
 esac
+
+# --svc overrides the resolved service name (used by tagged parallel deploys,
+# e.g. --svc oai-infopt-vllm-gemma-4-31b-g7e). Default keeps the base name.
+if [[ -n "${SVC_OVERRIDE}" ]]; then
+    SVC="${SVC_OVERRIDE}"
+fi
 
 [[ -f "${FRAMEWORK_ROOT}/${CONFIG}" ]] || { log_error "Config not found: ${CONFIG}"; exit 1; }
 
@@ -119,6 +128,11 @@ spec:
         app.kubernetes.io/component: quality-runner
         project: observeai-inference-optimization
         model: "${MODEL}"
+      annotations:
+        # Prevent Karpenter from consolidating/evicting the node mid-eval.
+        # A single eviction is terminal (backoffLimit: 0), so the whole run is
+        # lost. This pins the node for the lifetime of the eval.
+        karpenter.sh/do-not-disrupt: "true"
     spec:
       restartPolicy: Never
       serviceAccountName: oai-infopt-benchmark-sa

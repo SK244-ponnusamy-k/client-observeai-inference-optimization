@@ -318,7 +318,9 @@ cat > "${TMPDIR_PATH}/benchmark-policy.json" <<EOF
       ],
       "Resource": [
         "arn:aws:s3:::${RESULTS_BUCKET}",
-        "arn:aws:s3:::${RESULTS_BUCKET}/results/*"
+        "arn:aws:s3:::${RESULTS_BUCKET}/results/*",
+        "arn:aws:s3:::${RESULTS_BUCKET}/quality/*",
+        "arn:aws:s3:::${RESULTS_BUCKET}/quality-datasets/*"
       ]
     },
     {
@@ -343,7 +345,7 @@ aws iam put-role-policy \
     --policy-name "oai-infopt-benchmark-policy" \
     --policy-document "$(read_json "${TMPDIR_PATH}/benchmark-policy.json")"
 
-log_info "Benchmark policy attached → s3://${RESULTS_BUCKET}/results/* + CloudWatch"
+log_info "Benchmark policy attached → s3://${RESULTS_BUCKET}/{results,quality,quality-datasets}/* + CloudWatch"
 
 # ==============================================================================
 # Step 5 — Enable Pod Identity addon
@@ -438,7 +440,7 @@ echo "                → s3://${MODEL_BUCKET}/* (rw) + Secrets Manager HF token
 echo "    Serving   : arn:aws:iam::${AWS_ACCOUNT_ID}:role/${SERVING_IAM_ROLE_NAME}"
 echo "                → s3://${MODEL_BUCKET}/* (read-only)"
 echo "    Benchmark : arn:aws:iam::${AWS_ACCOUNT_ID}:role/${BENCHMARK_IAM_ROLE_NAME}"
-echo "                → s3://${RESULTS_BUCKET}/results/* (rw) + CloudWatch"
+echo "                → s3://${RESULTS_BUCKET}/{results,quality,quality-datasets}/* (rw) + CloudWatch"
 echo ""
 echo "  Namespace   : ${BENCHMARK_NAMESPACE}"
 echo "  HF Token    : aws secretsmanager get-secret-value --secret-id ${HF_TOKEN_SECRET_NAME}"
