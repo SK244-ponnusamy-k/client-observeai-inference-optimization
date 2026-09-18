@@ -95,6 +95,7 @@ def deploy(
     profile: str | None = None,
     skip_instance_check: bool = False,
     tag: str | None = None,
+    manifest: str | None = None,
 ) -> int:
     spec = catalog.load(model_id)
 
@@ -125,6 +126,18 @@ def deploy(
             ui.info(f"Selected {chosen} after skipping: {', '.join(selection.checked)}")
         else:
             ui.info(f"Selected {chosen}.")
+
+    # ---- Preflight: tensor-parallel size must fit the instance's accelerators -
+    # A TP=4 model on a 1-GPU instance would OOM / never schedule. Fail fast with
+    # a clear message instead of a confusing Pending/CrashLoop. Neuron TP = cores.
+    tp = spec.instances.neuron_cores if spec.is_neuron else spec.instances.tensor_parallel_size
+    if chosen and tp:
+        tp_err = instances.check_tp_fits(chosen, tp)
+        if tp_err:
+            ui.fail(
+                f"'{spec.id}' cannot run on {chosen}: {tp_err}",
+                "Pick a larger instance with --hw, or adjust tensor_parallel_size in the catalog.",
+            )
 
     # ---- Build args for the generated deploy.sh -----------------------------
     script = paths.model_dir(spec.id) / "deploy.sh"
@@ -172,7 +185,8 @@ def deploy(
         # reads the matching manifest cell (e.g. g7e) and records the correct
         # instance_type + cost instead of the catalog's default instance.
         return bench_mod.run(
-            model_id, profile=profile, skip_batch=spec.benchmark.skip_batch, tag=tag, hw=chosen
+            model_id, profile=profile, skip_batch=spec.benchmark.skip_batch, tag=tag, hw=chosen,
+            manifest=manifest,
         )
     else:
         ui.hint(f"To benchmark: oai benchmark {spec.id}   (or add --benchmark to deploy)")

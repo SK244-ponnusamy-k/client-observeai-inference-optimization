@@ -66,8 +66,7 @@ fi
 case "${MODEL}" in
     gpt-oss-20b)                         SVC="oai-infopt-vllm-gpt-oss-20b" ;;
     qwen3.5-4b|qwen3-5-4b)               SVC="oai-infopt-vllm-qwen3-5-4b" ;;
-    gemma-4-26b-a4b|gemma)               SVC="oai-infopt-vllm-gemma-4-26b-a4b" ;;
-    gemma-4-31b|gemma-4-31b-it)          SVC="oai-infopt-vllm-gemma-4-31b" ;;
+    gemma-4-31b|gemma-4-31b-it|gemma)    SVC="oai-infopt-vllm-gemma-4-31b" ;;
     qwen-0.5b|qwen-0-5b|qwen)            SVC="oai-infopt-vllm-qwen-0-5b" ;;
     *) log_error "Unknown model: ${MODEL}"; exit 1 ;;
 esac

@@ -118,6 +118,7 @@ def _cmd_deploy(args: argparse.Namespace) -> int:
         profile=args.profile,
         skip_instance_check=args.no_instance_check,
         tag=args.tag,
+        manifest=args.manifest,
     )
 
 
@@ -132,7 +133,7 @@ def _cmd_status(_args: argparse.Namespace) -> int:
 def _cmd_benchmark(args: argparse.Namespace) -> int:
     return bench_mod.run(
         args.id, profile=args.profile, dataset=args.dataset, skip_batch=args.skip_batch,
-        tag=args.tag, hw=args.hw,
+        tag=args.tag, hw=args.hw, manifest=args.manifest,
     )
 
 
@@ -206,6 +207,7 @@ def _build_parser() -> argparse.ArgumentParser:
     dp.add_argument("--validate", action="store_true", help="run a smoke test after deploy")
     dp.add_argument("--benchmark", action="store_true", help="benchmark automatically after deploy")
     dp.add_argument("--profile", help="only run this workload profile (e.g. realtime_v1)")
+    dp.add_argument("--manifest", help="explicit benchmark manifest (e.g. a Neuron manifest) passed to the auto-benchmark")
     dp.add_argument(
         "--no-instance-check", action="store_true", help="skip the live availability check (use the preferred instance)"
     )
@@ -261,7 +263,8 @@ def _build_parser() -> argparse.ArgumentParser:
     bm.add_argument("--dataset", help="custom dataset (s3://... or a key in the results bucket)")
     bm.add_argument("--skip-batch", action="store_true", help="run only the realtime profile")
     bm.add_argument("--tag", help="benchmark a specific tagged copy (matches the deploy --tag)")
-    bm.add_argument("--hw", help="instance the model runs on; selects the matching manifest cell (e.g. g7e.2xlarge)")
+    bm.add_argument("--hw", help="instance the model runs on; drives dynamic instance_type + cost (e.g. g7e.2xlarge)")
+    bm.add_argument("--manifest", help="explicit manifest to use (e.g. a Neuron manifest: gpt-oss-20b-neuron-trn2-bf16.yaml)")
     bm.set_defaults(func=_cmd_benchmark)
 
     return p

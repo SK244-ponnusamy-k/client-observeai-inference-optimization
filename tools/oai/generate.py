@@ -146,17 +146,23 @@ def _gen_gpu(spec: ModelSpec, ctx: dict[str, object], cfg: config.Config, result
     _write(mdir / "deploy.sh", render(t_gpu.DEPLOY_SH, ctx), True, result, force)
     _write(mdir / "stop.sh", render(t_gpu.STOP_SH, ctx), True, result, force)
 
-    # Manifest
+    # Manifest — ONE dynamic GPU manifest per model (<id>-gpu.yaml) covering ALL
+    # G instances. Instance/cost resolve dynamically from --hw at run time.
     mctx = dict(ctx)
     mctx.update(
         {
             "manifest_source": "eks_gpu",
             "serving_image": cfg.get("VLLM_IMAGE", "${VLLM_IMAGE}"),
-            "nodepool": "gpu-inf",
             "tp_or_cores": spec.instances.tensor_parallel_size,
         }
     )
-    _write(paths.MANIFESTS_DIR / spec.manifest_filename, render(t_manifest.MANIFEST_YAML, mctx), False, result, force)
+    _write(
+        paths.MANIFESTS_DIR / spec.gpu_manifest_filename,
+        render(t_manifest.GPU_MANIFEST_YAML, mctx),
+        False,
+        result,
+        force,
+    )
 
 
 def _gen_neuron(spec: ModelSpec, ctx: dict[str, object], cfg: config.Config, result: GenResult, force: bool) -> None:

@@ -1,15 +1,18 @@
 # ==============================================================================
-# configs/manifests/qwen3-5-4b-g7e-bf16.yaml  - one-off cell (NOT generated)
+# configs/manifests/qwen3-5-4b-gpu.yaml  - single DYNAMIC GPU manifest
 #
-# Benchmark run manifest for Qwen/Qwen3.5-4B (bf16) on g7e.2xlarge.
-# Created manually for a one-off g7e run (the catalog candidates only cover
-# g5/g6/g6e, so `oai model generate` does not emit this cell). qwen3.5-4b is a
-# dense 4B, TP=1, hardware-agnostic serving config — identical to the g6e cell
-# except instance_type / nodepool / cost. Every field is read by
-# inference/load-test.py.
+# ONE manifest for Qwen/Qwen3.5-4B (bf16) across ALL NVIDIA G instances
+# (g5 / g6 / g6e / g7 / g7e, any size). The actual instance is chosen at deploy
+# time via `--hw`; instance_type, cost, and node placement are resolved
+# DYNAMICALLY (OAI_INSTANCE_TYPE from --hw → EC2 price book in load-test.py).
+# serving.instance_type below is only a FALLBACK label for direct runs with no --hw.
+#
+# Qwen3.5-4B is dense 4B bf16 (~9 GB) and fits a single GPU on every G family
+# (TP=1), so one manifest covers them all.
+# Every field is read by inference/load-test.py.
 # ==============================================================================
-run_id: qwen3-5-4b-g7e-2026-09-18-001
-description: "Qwen/Qwen3.5-4B bf16, g7e.2xlarge"
+run_id: qwen3-5-4b-gpu-2026-09-18-001
+description: "Qwen/Qwen3.5-4B bf16, any NVIDIA G instance (TP=1)"
 
 model:
   hf_id: Qwen/Qwen3.5-4B
@@ -20,11 +23,11 @@ model:
 
 serving:
   image: public.ecr.aws/deep-learning-containers/vllm:0.26.0-gpu-py312-cu130-ubuntu22.04-ec2-v1.0-soci@sha256:e70d649d964dd0b568669453df523e764d23933987ea378d0f423cbe4ae56b81
-  nodepool: gpu-g7-inf
-  instance_type: g7e.2xlarge
+  # Fallback default only. Real instance comes from --hw (OAI_INSTANCE_TYPE).
+  instance_type: g6e.2xlarge
 
 optimization_variants:
-  - label: bf16-g7e
+  - label: bf16-gpu
     quantization: bf16
     tensor_parallel_size: 1
     max_num_seqs: 256
@@ -39,14 +42,13 @@ benchmark:
 
 # cost.instance_hourly_usd is resolved DYNAMICALLY at run time from the deployed
 # instance (OAI_INSTANCE_TYPE / serving.instance_type) against the EC2 price book
-# in load-test.py. Set an explicit value here ONLY to override for a special term
-# (spot, savings plan, etc.).
+# in load-test.py. Set an explicit value here ONLY to override (spot, savings plan).
 
 tags:
   Project: observeai-inference-optimization
   Engagement: shellkode-sow
   Environment: sandbox
-  ManagedBy: manual
+  ManagedBy: oai-cli
   Owner: TBD
   CostCenter: TBD
-  RunId: qwen3-5-4b-g7e-2026-09-18-001
+  RunId: qwen3-5-4b-gpu-2026-09-18-001

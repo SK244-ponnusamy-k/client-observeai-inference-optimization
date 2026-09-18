@@ -1,0 +1,56 @@
+# ==============================================================================
+# configs/manifests/gpt-oss-20b-gpu.yaml  - single DYNAMIC GPU manifest
+#
+# ONE manifest for openai/gpt-oss-20b (mxfp4) across ALL NVIDIA G instances
+# (g5 / g6 / g6e / g7 / g7e, any size). The actual instance is chosen at deploy
+# time via `--hw`; instance_type, cost, and node placement are resolved
+# DYNAMICALLY (OAI_INSTANCE_TYPE from --hw → EC2 price book in load-test.py).
+# serving.instance_type below is only a FALLBACK label for direct runs with no --hw.
+#
+# gpt-oss-20b is MXFP4 (~13 GB) and fits a single GPU on every G family (TP=1),
+# so one manifest covers them all. For Trainium/Neuron use the separate
+# gpt-oss-20b-neuron-*.yaml manifest (different image + compile workflow).
+# Every field is read by inference/load-test.py.
+# ==============================================================================
+run_id: gpt-oss-20b-gpu-2026-09-18-001
+description: "openai/gpt-oss-20b mxfp4, any NVIDIA G instance (TP=1)"
+
+model:
+  hf_id: openai/gpt-oss-20b
+  served_name: gpt-oss-20b
+  tokenizer: openai/gpt-oss-20b
+  s3_prefix: gpt-oss-20b/
+  source: eks_gpu
+
+serving:
+  image: public.ecr.aws/deep-learning-containers/vllm:0.26.0-gpu-py312-cu130-ubuntu22.04-ec2-v1.0-soci@sha256:e70d649d964dd0b568669453df523e764d23933987ea378d0f423cbe4ae56b81
+  # Fallback default only. Real instance comes from --hw (OAI_INSTANCE_TYPE);
+  # node placement is by nodeSelector on this instance type at deploy time.
+  instance_type: g6e.2xlarge
+
+optimization_variants:
+  - label: mxfp4-gpu
+    quantization: mxfp4
+    tensor_parallel_size: 1
+    max_num_seqs: 256
+    max_num_batched_tokens: 8192
+    max_model_len: 16384
+    kv_cache_dtype: auto
+
+benchmark:
+  workload_profiles:
+    - configs/workload_profiles/realtime_v1.yaml
+    - configs/workload_profiles/batch_v1.yaml
+
+# cost.instance_hourly_usd is resolved DYNAMICALLY at run time from the deployed
+# instance (OAI_INSTANCE_TYPE / serving.instance_type) against the EC2 price book
+# in load-test.py. Set an explicit value here ONLY to override (spot, savings plan).
+
+tags:
+  Project: observeai-inference-optimization
+  Engagement: shellkode-sow
+  Environment: sandbox
+  ManagedBy: oai-cli
+  Owner: TBD
+  CostCenter: TBD
+  RunId: gpt-oss-20b-gpu-2026-09-18-001

@@ -38,6 +38,52 @@ _VCPUS = {
     "inf2.xlarge": 4, "inf2.8xlarge": 32, "inf2.24xlarge": 96, "inf2.48xlarge": 192,
 }
 
+# GPU (accelerator) count per instance type — used for the TP-vs-GPU preflight so
+# a model with tensor_parallel_size=N is never deployed on an instance with fewer
+# than N accelerators (which would OOM or fail to schedule). Sizes not listed here
+# skip the check (returns None). For Neuron, the "GPU" count is NeuronCores.
+_GPU_COUNT = {
+    # G5 (A10G), G6 (L4), G6e (L40S): 1 GPU on x/2x/4x/8x/16x; 4 on 12x/24x; 8 on 48x.
+    "g5.xlarge": 1, "g5.2xlarge": 1, "g5.4xlarge": 1, "g5.8xlarge": 1, "g5.16xlarge": 1,
+    "g5.12xlarge": 4, "g5.24xlarge": 4, "g5.48xlarge": 8,
+    "g6.xlarge": 1, "g6.2xlarge": 1, "g6.4xlarge": 1, "g6.8xlarge": 1, "g6.16xlarge": 1,
+    "g6.12xlarge": 4, "g6.24xlarge": 4, "g6.48xlarge": 8,
+    "g6e.xlarge": 1, "g6e.2xlarge": 1, "g6e.4xlarge": 1, "g6e.8xlarge": 1, "g6e.16xlarge": 1,
+    "g6e.12xlarge": 4, "g6e.24xlarge": 4, "g6e.48xlarge": 8,
+    # G7 / G7e (RTX PRO 6000 Blackwell): same size→GPU mapping as G6e.
+    "g7.2xlarge": 1, "g7.4xlarge": 1, "g7.8xlarge": 1, "g7.16xlarge": 1,
+    "g7.12xlarge": 4, "g7.24xlarge": 4, "g7.48xlarge": 8,
+    "g7e.2xlarge": 1, "g7e.4xlarge": 1, "g7e.8xlarge": 1, "g7e.16xlarge": 1,
+    "g7e.12xlarge": 4, "g7e.24xlarge": 4, "g7e.48xlarge": 8,
+    # Trainium NeuronCores (used as the "accelerator" count for TP checks).
+    "trn1.2xlarge": 2, "trn1.32xlarge": 16,
+    "trn2.48xlarge": 16,
+}
+
+
+def gpu_count(instance_type: str) -> int | None:
+    """Accelerators (GPUs / NeuronCores) on an instance type, or None if unknown."""
+    return _GPU_COUNT.get((instance_type or "").strip().lower())
+
+
+def check_tp_fits(instance_type: str, tensor_parallel_size: int) -> str | None:
+    """Return an error message if TP exceeds the instance's accelerator count.
+
+    Returns None when the pairing is valid OR the instance's GPU count is unknown
+    (unknown → skip the check rather than block a legitimate new instance type).
+    """
+    gpus = gpu_count(instance_type)
+    if gpus is None:
+        return None
+    if tensor_parallel_size > gpus:
+        return (
+            f"tensor_parallel_size={tensor_parallel_size} but {instance_type} has only "
+            f"{gpus} accelerator(s). Use an instance with >= {tensor_parallel_size} "
+            f"(e.g. a .12xlarge/.24xlarge for 4, .48xlarge for 8), or lower TP."
+        )
+    return None
+
+
 # Service Quota codes for the on-demand vCPU limit of each family (EC2 = "ec2").
 # G/VT family shares one quota; Trn/Inf have their own.
 _QUOTA_CODE = {

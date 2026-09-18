@@ -150,6 +150,11 @@ class ModelSpec:
         quant = self.serving.quantization
         return f"{self.id}-{hw}-{quant}.yaml"
 
+    @property
+    def gpu_manifest_filename(self) -> str:
+        """Single dynamic GPU manifest name (one file for all G instances)."""
+        return f"{self.id}-gpu.yaml"
+
 
 def _require(d: dict[str, Any], key: str, ctx: str) -> Any:
     if key not in d or d[key] in (None, ""):

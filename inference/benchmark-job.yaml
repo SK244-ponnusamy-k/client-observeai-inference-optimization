@@ -65,7 +65,7 @@ metadata:
 data:
   # ── EDIT before applying ─────────────────────────────────────────────────────
   # MODEL_NAME: short slug → builds the service name  oai-infopt-vllm-<MODEL_NAME>
-  #   gpt-oss-20b | qwen-0-5b | qwen3-5-4b | gemma-4-26b-a4b
+  #   gpt-oss-20b | qwen-0-5b | qwen3-5-4b | gemma-4-31b
   MODEL_NAME: "gpt-oss-20b"
   # Leave VLLM_ENDPOINT empty to derive it from MODEL_NAME.
   VLLM_ENDPOINT: ""

@@ -88,26 +88,34 @@ def run(
     skip_batch: bool = False,
     tag: str | None = None,
     hw: str | None = None,
+    manifest: str | None = None,
 ) -> int:
     spec = catalog.load(model_id)
 
-    # Pick the manifest cell that matches the hardware the model runs on. When
-    # --hw is passed (e.g. g7e.2xlarge), prefer <id>-<hw>-<quant>.yaml so the
-    # result row records the CORRECT instance_type + cost. If that cell does not
-    # exist, fall back to the catalog default and warn (never silently mislabel).
+    # Resolve the benchmark manifest, in priority order:
+    #   1. Explicit --manifest (e.g. a Neuron/Trainium manifest you select by hand).
+    #   2. Single dynamic GPU manifest <id>-gpu.yaml (the standard path — one file
+    #      for ALL G instances; instance_type + cost resolve dynamically from --hw).
+    #   3. Legacy per-hardware cell <id>-<hw>-<quant>.yaml (backward compatibility).
+    #   4. Catalog default (spec.manifest_filename).
     hw_token = _manifest_hw(spec, hw)
+    gpu_rel = f"configs/manifests/{spec.id}-gpu.yaml"
+    legacy_rel = f"configs/manifests/{spec.id}-{hw_token}-{spec.serving.quantization}.yaml"
     default_rel = f"configs/manifests/{spec.manifest_filename}"
-    if hw:
-        hw_rel = f"configs/manifests/{spec.id}-{hw_token}-{spec.serving.quantization}.yaml"
-        if (paths.ROOT / hw_rel).exists():
-            manifest_rel = hw_rel
-        else:
-            ui.warn(
-                f"No manifest for --hw {hw} at {hw_rel}; falling back to catalog default "
-                f"{default_rel} (results will be labeled with the default instance)."
-            )
-            manifest_rel = default_rel
+
+    if manifest:
+        # User picked an explicit manifest (relative to repo root or absolute).
+        manifest_rel = manifest if manifest.startswith("configs/") else f"configs/manifests/{manifest}"
+    elif (paths.ROOT / gpu_rel).exists() and not spec.is_neuron:
+        manifest_rel = gpu_rel
+    elif (paths.ROOT / legacy_rel).exists():
+        manifest_rel = legacy_rel
     else:
+        if hw and not spec.is_neuron:
+            ui.warn(
+                f"No {gpu_rel} or per-hw {legacy_rel}; falling back to catalog default "
+                f"{default_rel}. (Instance/cost still resolve dynamically from --hw.)"
+            )
         manifest_rel = default_rel
 
     if not (paths.ROOT / manifest_rel).exists():

@@ -74,10 +74,8 @@ case "${MODEL}" in
         SVC="oai-infopt-vllm-gpt-oss-20b"; QUANT="mxfp4" ;;
     qwen3.5-4b|qwen3-5-4b)
         SVC="oai-infopt-vllm-qwen3-5-4b"; QUANT="bf16" ;;
-    gemma-4-26b-a4b|gemma-4-26b-a4b-it|gemma)
-        SVC="oai-infopt-vllm-gemma-4-26b-a4b"; QUANT="w4a16" ;;
-    gemma-4-31b|gemma-4-31b-it)
-        SVC="oai-infopt-vllm-gemma-4-31b"; QUANT="" ;;  # single baseline manifest (TP=4), not a matrix cell
+    gemma-4-31b|gemma-4-31b-it|gemma)
+        SVC="oai-infopt-vllm-gemma-4-31b"; QUANT="none" ;;  # dense TP=4; uses gemma-4-31b-gpu.yaml
     qwen-0.5b|qwen-0-5b|qwen)
         SVC="oai-infopt-vllm-qwen-0-5b"; QUANT="" ;;   # smoke uses its own baseline manifest
     *)
@@ -99,15 +97,22 @@ if [[ -n "${SVC_OVERRIDE}" ]]; then
     SVC="${SVC_OVERRIDE}"
 fi
 
-# Resolve the manifest: explicit override > single-manifest baselines > matrix cell <model>-<hw>-<quant>.
-# qwen-0.5b (smoke) and gemma-4-31b (dense TP=4) each ship ONE manifest, not a
-# per-hardware matrix, so they bypass the <model>-<hw>-<quant> naming.
+# Resolve the manifest, in priority order:
+#   1. explicit --manifest override (e.g. a Neuron manifest you select by hand)
+#   2. single dynamic GPU manifest <model-id>-gpu.yaml (standard path — one file
+#      for ALL G instances; instance_type + cost resolve dynamically from --instance)
+#   3. legacy per-hardware matrix cell <model>-<hw>-<quant>.yaml (back-compat)
+#   4. legacy single-manifest baselines (qwen-0.5b smoke)
+# MODEL may use dotted naming (qwen3.5-4b); the gpu manifest uses the k8s-safe
+# dashed id (qwen3-5-4b), so normalize dots to dashes for the -gpu.yaml lookup.
+MODEL_ID_DASHED="${MODEL//./-}"
+GPU_MANIFEST="configs/manifests/${MODEL_ID_DASHED}-gpu.yaml"
 if [[ -n "${MANIFEST_OVERRIDE}" ]]; then
     MANIFEST="${MANIFEST_OVERRIDE}"
+elif [[ -f "${FRAMEWORK_ROOT}/${GPU_MANIFEST}" ]]; then
+    MANIFEST="${GPU_MANIFEST}"
 elif [[ "${MODEL}" == qwen-0.5b || "${MODEL}" == qwen-0-5b || "${MODEL}" == qwen ]]; then
     MANIFEST="configs/manifests/qwen-2.5-0.5b-baseline.yaml"
-elif [[ "${MODEL}" == gemma-4-31b || "${MODEL}" == gemma-4-31b-it ]]; then
-    MANIFEST="configs/manifests/gemma-4-31b-baseline.yaml"
 else
     MANIFEST="configs/manifests/${MODEL}-${HW}-${QUANT}.yaml"
 fi
