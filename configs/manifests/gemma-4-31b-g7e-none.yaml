@@ -35,7 +35,7 @@ benchmark:
     - configs/workload_profiles/batch_v1.yaml
 
 cost:
-  instance_hourly_usd: 6.0    # VERIFY before run
+  instance_hourly_usd: 3.3631    # g7e.2xlarge on-demand us-east-1/us-east-2 (NVIDIA RTX PRO 6000 Blackwell) — updated 2026-09-18
 
 tags:
   Project: observeai-inference-optimization

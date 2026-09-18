@@ -342,6 +342,89 @@ def _g(d: dict[str, Any], *keys: str, default: float = 0.0) -> float:
 
 
 # ---------------------------------------------------------------------------
+# EC2 on-demand $/hr price book — us-east-1 / us-east-2 (identical for these
+# GPU/accelerator families). Keyed by "<family>.<size>". Any instance type in a
+# manifest resolves automatically from serving.instance_type; a manifest may
+# still override by setting cost.instance_hourly_usd explicitly.
+#
+# Sources: AWS EC2 G5/G6/G6e/G7e/Trn pricing (verified 2026-09-18). Values are
+# on-demand, Linux. VERIFY for your region/term before a billed run.
+# ---------------------------------------------------------------------------
+EC2_HOURLY_USD: dict[str, float] = {
+    # G5  — NVIDIA A10G
+    "g5.xlarge": 1.0060,
+    "g5.2xlarge": 1.2120,
+    "g5.4xlarge": 1.6240,
+    "g5.8xlarge": 2.4480,
+    "g5.12xlarge": 5.6720,
+    "g5.16xlarge": 4.0960,
+    "g5.24xlarge": 8.1440,
+    "g5.48xlarge": 16.2880,
+    # G6  — NVIDIA L4
+    "g6.xlarge": 0.8048,
+    "g6.2xlarge": 0.9776,
+    "g6.4xlarge": 1.3232,
+    "g6.8xlarge": 2.0144,
+    "g6.12xlarge": 4.6016,
+    "g6.16xlarge": 3.3968,
+    "g6.24xlarge": 6.6752,
+    "g6.48xlarge": 13.3504,
+    # G6e — NVIDIA L40S
+    "g6e.xlarge": 1.8610,
+    "g6e.2xlarge": 2.2420,
+    "g6e.4xlarge": 3.0042,
+    "g6e.8xlarge": 4.5286,
+    "g6e.12xlarge": 10.6032,
+    "g6e.16xlarge": 7.5772,
+    "g6e.24xlarge": 15.0656,
+    "g6e.48xlarge": 30.1312,
+    # G7e — NVIDIA RTX PRO 6000 Blackwell
+    "g7e.2xlarge": 3.3631,
+    "g7e.4xlarge": 3.9982,
+    "g7e.8xlarge": 5.2682,
+    "g7e.12xlarge": 8.2861,
+    "g7e.24xlarge": 16.5722,
+    "g7e.48xlarge": 33.1443,
+    # G7  — (retained from prior manifest value; not in G-family price sheet above)
+    "g7.2xlarge": 2.52,
+    # Trainium — carried over from manifests; VERIFY (not covered by G-family sheet)
+    "trn1.32xlarge": 21.50,
+    "trn2.48xlarge": 12.0,
+}
+
+
+def _resolve_instance_hourly_usd(manifest: dict[str, Any]) -> float:
+    """Resolve the on-demand $/hr for a run.
+
+    Priority:
+      1. Explicit override:  cost.instance_hourly_usd in the manifest.
+      2. Dynamic lookup:     serving.instance_type against EC2_HOURLY_USD.
+      3. Fallback:           0.0 (cost fields emit null, with a warning).
+
+    The lookup is case-insensitive and tolerant of stray whitespace so any
+    instance type / size (xlarge, 2xlarge, 4xlarge, ...) resolves the same way.
+    """
+    override = manifest.get("cost", {}).get("instance_hourly_usd")
+    if override is not None:
+        try:
+            return float(override)
+        except (TypeError, ValueError):
+            logger.warning("cost.instance_hourly_usd=%r is not a number; falling back to lookup", override)
+
+    instance_type = str(manifest.get("serving", {}).get("instance_type", "")).strip().lower()
+    price = EC2_HOURLY_USD.get(instance_type)
+    if price is not None:
+        return price
+
+    logger.warning(
+        "No price for instance_type=%r and no cost.instance_hourly_usd override; "
+        "cost metrics will be null. Add it to EC2_HOURLY_USD or the manifest.",
+        instance_type,
+    )
+    return 0.0
+
+
+# ---------------------------------------------------------------------------
 # Cost derivation (guarded — never divide by ~zero)
 # ---------------------------------------------------------------------------
 def _derive_cost(
@@ -408,7 +491,7 @@ def _build_result(
     total_tokens = total_in + total_out
     completed = int(_g(bench, "completed", "num_prompts"))
     completed_per_min = completed / max(runtime_s / 60.0, 1e-9)
-    instance_usd = float(manifest.get("cost", {}).get("instance_hourly_usd", 0.0))
+    instance_usd = _resolve_instance_hourly_usd(manifest)
 
     cost = _derive_cost(instance_usd, runtime_s, total_tokens, total_out, completed,
                         gpu.get("gpu_power_watts"))

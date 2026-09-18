@@ -35,7 +35,7 @@ benchmark:
     - configs/workload_profiles/batch_v1.yaml
 
 cost:
-  instance_hourly_usd: 10.49    # VERIFY before run
+  instance_hourly_usd: 10.6032    # g6e.12xlarge on-demand us-east-1/us-east-2 (4x NVIDIA L40S) — updated 2026-09-18
 
 tags:
   Project: observeai-inference-optimization

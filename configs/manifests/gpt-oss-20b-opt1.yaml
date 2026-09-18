@@ -71,7 +71,7 @@ benchmark:
     - configs/workload_profiles/batch_v1.yaml
 
 cost:
-  instance_hourly_usd: 2.17   # g6e.2xlarge on-demand us-east-2
+  instance_hourly_usd: 2.2420   # g6e.2xlarge on-demand us-east-1/us-east-2 (NVIDIA L40S) — updated 2026-09-18
 
 # Comparison baseline for regression detection
 baseline_run_id: oai-infopt-2026-09-01-gpt-oss-20b-baseline-001
