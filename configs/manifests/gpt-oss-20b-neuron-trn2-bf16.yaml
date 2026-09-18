@@ -34,8 +34,9 @@ benchmark:
     - configs/workload_profiles/realtime_v1.yaml
     - configs/workload_profiles/batch_v1.yaml
 
-cost:
-  instance_hourly_usd: 12.0    # VERIFY before run
+# cost.instance_hourly_usd is resolved DYNAMICALLY from the deployed instance
+# against the EC2 price book in load-test.py (trn2.48xlarge = 12.0 there).
+# Set an explicit value here ONLY to override. VERIFY the Trainium price before a run.
 
 tags:
   Project: observeai-inference-optimization

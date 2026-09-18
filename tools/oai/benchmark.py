@@ -65,8 +65,16 @@ def _profile_arg(profiles: list[str]) -> str:
     return "realtime"
 
 
-def _manifest_hw(spec: ModelSpec) -> str:
-    """The <hw> token used in the generated manifest filename."""
+def _manifest_hw(spec: ModelSpec, hw_override: str | None = None) -> str:
+    """The <hw> token used in the manifest filename.
+
+    When hw_override is given (the instance the model was actually deployed on,
+    e.g. 'g7e.2xlarge'), use its family ('g7e') so the benchmark reads the cell
+    that MATCHES the hardware — otherwise results get mislabeled with the
+    catalog's default (preferred) instance. No override → catalog default.
+    """
+    if hw_override:
+        return hw_override.split(".")[0]
     if spec.preferred_instance:
         return spec.preferred_instance.split(".")[0]
     return spec.hardware
@@ -79,10 +87,29 @@ def run(
     dataset: str | None = None,
     skip_batch: bool = False,
     tag: str | None = None,
+    hw: str | None = None,
 ) -> int:
     spec = catalog.load(model_id)
 
-    manifest_rel = f"configs/manifests/{spec.manifest_filename}"
+    # Pick the manifest cell that matches the hardware the model runs on. When
+    # --hw is passed (e.g. g7e.2xlarge), prefer <id>-<hw>-<quant>.yaml so the
+    # result row records the CORRECT instance_type + cost. If that cell does not
+    # exist, fall back to the catalog default and warn (never silently mislabel).
+    hw_token = _manifest_hw(spec, hw)
+    default_rel = f"configs/manifests/{spec.manifest_filename}"
+    if hw:
+        hw_rel = f"configs/manifests/{spec.id}-{hw_token}-{spec.serving.quantization}.yaml"
+        if (paths.ROOT / hw_rel).exists():
+            manifest_rel = hw_rel
+        else:
+            ui.warn(
+                f"No manifest for --hw {hw} at {hw_rel}; falling back to catalog default "
+                f"{default_rel} (results will be labeled with the default instance)."
+            )
+            manifest_rel = default_rel
+    else:
+        manifest_rel = default_rel
+
     if not (paths.ROOT / manifest_rel).exists():
         ui.fail(
             f"Benchmark manifest not found: {manifest_rel}",
@@ -96,7 +123,10 @@ def run(
     profiles = _selected_profiles(spec, profile, skip_batch)
     profile_arg = _profile_arg(profiles)
     ds = dataset if dataset is not None else spec.benchmark.dataset
-    hw = _manifest_hw(spec)
+    # hw token (family, e.g. 'g7e') selects the manifest cell; the FULL instance
+    # type (e.g. 'g7e.24xlarge') is passed separately for dynamic cost/label.
+    hw_family = hw_token
+    full_instance = hw if (hw and "." in hw) else None
 
     script = paths.ROOT / "inference" / "run-benchmark.sh"
     if not script.exists():
@@ -114,9 +144,11 @@ def run(
     ui.kv("Profiles", f"{', '.join(profiles)}  (single job/container)" if profile_arg == "both" else profile_arg)
     ui.kv("Dataset", ds or "built-in random (no PII)")
 
-    # ONE invocation. When profile_arg is 'both', run-benchmark.sh runs realtime
-    # and batch back-to-back inside a single container (image pulled once).
-    args = ["--model", spec.id, "--profile", profile_arg, "--hw", hw, "--manifest", manifest_rel]
+    args = ["--model", spec.id, "--profile", profile_arg, "--hw", hw_family, "--manifest", manifest_rel]
+    if full_instance:
+        # Pass the real deployed instance so cost/instance_type resolve dynamically
+        # from the EC2 price book — no per-instance manifest edits needed.
+        args += ["--instance", full_instance]
     if ds:
         args += ["--dataset", ds]
     if tag and svc:

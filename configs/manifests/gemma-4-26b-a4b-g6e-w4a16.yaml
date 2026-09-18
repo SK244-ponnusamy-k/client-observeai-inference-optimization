@@ -33,8 +33,10 @@ benchmark:
     - configs/workload_profiles/realtime_v1.yaml
     - configs/workload_profiles/batch_v1.yaml
 
-cost:
-  instance_hourly_usd: 2.2420    # g6e.2xlarge on-demand us-east-1/us-east-2 (NVIDIA L40S) — updated 2026-09-18
+# cost.instance_hourly_usd is resolved DYNAMICALLY at run time from the deployed
+# instance (OAI_INSTANCE_TYPE / serving.instance_type) against the EC2 price book
+# in load-test.py. Set an explicit value here ONLY to override for a special term
+# (spot, savings plan, etc.).
 
 tags:
   Project: observeai-inference-optimization

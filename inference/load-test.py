@@ -411,7 +411,14 @@ def _resolve_instance_hourly_usd(manifest: dict[str, Any]) -> float:
         except (TypeError, ValueError):
             logger.warning("cost.instance_hourly_usd=%r is not a number; falling back to lookup", override)
 
-    instance_type = str(manifest.get("serving", {}).get("instance_type", "")).strip().lower()
+    # Dynamic lookup by instance type. Prefer the ACTUAL deployed instance passed
+    # via OAI_INSTANCE_TYPE (set from `--hw` by run-benchmark.sh) over the
+    # manifest's static serving.instance_type — so one manifest works for every
+    # size and the cost always matches the hardware the run really used.
+    instance_type = (
+        os.getenv("OAI_INSTANCE_TYPE", "").strip()
+        or str(manifest.get("serving", {}).get("instance_type", "")).strip()
+    ).lower()
     price = EC2_HOURLY_USD.get(instance_type)
     if price is not None:
         return price
@@ -507,7 +514,7 @@ def _build_result(
         correlation_id=correlation_id,
         hf_id=manifest["model"]["hf_id"],
         model_version=manifest["model"].get("s3_prefix", manifest["model"].get("s3_uri", "")),
-        instance_type=manifest["serving"]["instance_type"],
+        instance_type=(os.getenv("OAI_INSTANCE_TYPE", "").strip() or manifest["serving"]["instance_type"]),
         vllm_image=manifest["serving"]["image"],
         quantization=opt.get("quantization", "none"),
         tensor_parallel_size=int(opt.get("tensor_parallel_size", 1)),

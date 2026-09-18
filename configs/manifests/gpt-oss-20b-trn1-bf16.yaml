@@ -48,10 +48,10 @@ benchmark:
     - configs/workload_profiles/realtime_v1.yaml
     - configs/workload_profiles/batch_v1.yaml
 
-cost:
-  # trn1.32xlarge on-demand us-east-1 — VERIFY before run.
-  # https://aws.amazon.com/ec2/instance-types/trn1/
-  instance_hourly_usd: 21.50
+# cost.instance_hourly_usd is resolved DYNAMICALLY from the deployed instance
+# against the EC2 price book in load-test.py (trn1.32xlarge = 21.50 there).
+# Set an explicit value here ONLY to override for a special term. VERIFY the
+# Trainium price for your region before a billed run.
 
 tags:
   Project: observeai-inference-optimization

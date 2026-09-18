@@ -43,6 +43,7 @@ DATASET_OVERRIDE=""      # optional explicit dataset path / S3 key
 IMAGE_OVERRIDE=""        # optional explicit benchmark runner image
 SVC_OVERRIDE=""          # optional explicit vLLM service name (for --tag parallel deploys)
 TAG=""                   # optional deploy tag — isolates the S3 results subfolder
+INSTANCE_TYPE=""         # optional FULL instance type (e.g. g7e.24xlarge) for dynamic cost/label
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -54,9 +55,16 @@ while [[ $# -gt 0 ]]; do
         --image)    IMAGE_OVERRIDE="$2";    shift 2 ;;
         --svc)      SVC_OVERRIDE="$2";      shift 2 ;;
         --tag)      TAG="$2";               shift 2 ;;
+        --instance) INSTANCE_TYPE="$2";     shift 2 ;;
         *) log_error "Unknown: $1"; exit 1 ;;
     esac
 done
+
+# Full instance type the model was deployed on (e.g. g7e.24xlarge). Passed into
+# the benchmark pod as OAI_INSTANCE_TYPE so load-test.py records the REAL instance
+# and resolves its cost from the EC2 price book dynamically — no per-instance
+# manifest edits. Falls back to the manifest's serving.instance_type when unset.
+: "${INSTANCE_TYPE:=}"
 
 BENCHMARK_RUNNER_IMAGE="${IMAGE_OVERRIDE:-${BENCHMARK_IMAGE:-$VLLM_IMAGE}}"
 
@@ -425,6 +433,11 @@ ${MARK_STEP}
               value: "${RESULTS_BUCKET}"
             - name: DCGM_METRICS_URL
               value: "http://dcgm-exporter.monitoring.svc.cluster.local:9400/metrics"
+            # Full deployed instance type (e.g. g7e.24xlarge). load-test.py records
+            # this and looks up its $/hr from the EC2 price book — dynamic cost,
+            # no per-instance manifest edits. Empty → falls back to the manifest.
+            - name: OAI_INSTANCE_TYPE
+              value: "${INSTANCE_TYPE}"
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true

@@ -131,7 +131,8 @@ def _cmd_status(_args: argparse.Namespace) -> int:
 
 def _cmd_benchmark(args: argparse.Namespace) -> int:
     return bench_mod.run(
-        args.id, profile=args.profile, dataset=args.dataset, skip_batch=args.skip_batch, tag=args.tag
+        args.id, profile=args.profile, dataset=args.dataset, skip_batch=args.skip_batch,
+        tag=args.tag, hw=args.hw,
     )
 
 
@@ -260,6 +261,7 @@ def _build_parser() -> argparse.ArgumentParser:
     bm.add_argument("--dataset", help="custom dataset (s3://... or a key in the results bucket)")
     bm.add_argument("--skip-batch", action="store_true", help="run only the realtime profile")
     bm.add_argument("--tag", help="benchmark a specific tagged copy (matches the deploy --tag)")
+    bm.add_argument("--hw", help="instance the model runs on; selects the matching manifest cell (e.g. g7e.2xlarge)")
     bm.set_defaults(func=_cmd_benchmark)
 
     return p

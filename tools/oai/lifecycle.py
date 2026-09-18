@@ -168,7 +168,12 @@ def deploy(
         from . import benchmark as bench_mod
 
         ui.banner(f"Auto-benchmark: {spec.id}")
-        return bench_mod.run(model_id, profile=profile, skip_batch=spec.benchmark.skip_batch, tag=tag)
+        # Pass the instance we actually deployed on ('chosen') so the benchmark
+        # reads the matching manifest cell (e.g. g7e) and records the correct
+        # instance_type + cost instead of the catalog's default instance.
+        return bench_mod.run(
+            model_id, profile=profile, skip_batch=spec.benchmark.skip_batch, tag=tag, hw=chosen
+        )
     else:
         ui.hint(f"To benchmark: oai benchmark {spec.id}   (or add --benchmark to deploy)")
     return 0
