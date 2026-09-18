@@ -786,8 +786,27 @@ def _run(args: argparse.Namespace) -> None:
     _save_results(all_results, args.output, run_id)
     _print_summary(all_results)
 
-    if any(r.status != "passed" for r in all_results):
+    # Exit non-zero ONLY on a real error (status == "error" = zero output tokens,
+    # i.e. a broken/invalid measurement). An SLO miss (status == "failed_slo") is
+    # a VALID result — the benchmark ran and the numbers are correct, the model
+    # just didn't meet a threshold — so it must NOT fail the job/pod. Otherwise a
+    # normal low-concurrency throughput miss shows the pod as "Error" even though
+    # results are complete and uploaded to S3.
+    errored = [r for r in all_results if r.status == "error"]
+    if errored:
+        logger.error(
+            "%d level(s) produced no output tokens — measurement invalid (exiting non-zero).",
+            len(errored),
+        )
         raise SystemExit(1)
+
+    slo_missed = [r for r in all_results if r.status == "failed_slo"]
+    if slo_missed:
+        logger.info(
+            "%d level(s) did not meet an SLO threshold. Results are VALID and uploaded; "
+            "this is not an error — exiting 0.",
+            len(slo_missed),
+        )
 
 
 def main() -> None:
