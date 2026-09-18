@@ -130,24 +130,37 @@ TAG_SEG=""
 if [[ -n "${TAG}" ]]; then
     TAG_SEG="-${TAG}"
 fi
-JOB_NAME="oai-infopt-bench-${MODEL//\./-}${TAG_SEG}-${PROFILE}-${TIMESTAMP}"
+# Base name shared by all per-profile Jobs. Each profile becomes its OWN Job
+# object: <base>-realtime and <base>-batch. They are separate k8s Jobs so a
+# batch failure never discards the completed realtime results (and vice-versa).
+JOB_NAME_BASE="oai-infopt-bench-${MODEL//\./-}${TAG_SEG}-${TIMESTAMP}"
 # S3 result prefix segment: results/<ts>/<tag>/<profile>/ when tagged, else results/<ts>/<profile>/
 S3_TAG_SEG=""
 if [[ -n "${TAG}" ]]; then
     S3_TAG_SEG="${TAG}/"
 fi
+# In-cluster ordering gate (no k8s RBAC needed): the realtime Job writes this
+# marker to S3 when it finishes; the batch Job's init container blocks until the
+# marker appears, so batch only starts loading the GPU AFTER realtime is done.
+# Both Jobs are submitted up front, so closing the terminal / Ctrl+C is safe.
+S3_MARKER_KEY="results/${TIMESTAMP}/${S3_TAG_SEG}_markers/realtime.done"
+
+# Per-profile hard caps. Batch (high-concurrency sweep, up to 10k prompts) is the
+# long pole, so it gets a bigger deadline than the latency-bound realtime run.
+REALTIME_DEADLINE=5400    # 1.5 h
+BATCH_DEADLINE=14400      # 4 h
 
 echo ""
 echo "======================================================"
-echo "  BENCHMARK JOB"
+echo "  BENCHMARK JOB(S)"
 echo "  Model    : ${MODEL}"
 echo "  Hardware : ${HW}"
 echo "  Manifest : ${MANIFEST}"
 echo "  Profile  : ${PROFILE}"
 echo "  Endpoint : ${ENDPOINT}"
 echo "  Image    : ${BENCHMARK_RUNNER_IMAGE}"
-echo "  Job      : ${JOB_NAME}"
-echo "  Profiles : ${PROFILE_LIST[*]}  (single job/container)"
+echo "  Job base : ${JOB_NAME_BASE}"
+echo "  Profiles : ${PROFILE_LIST[*]}  (one SEPARATE Job each, run sequentially)"
 echo "  Tag      : ${TAG:-<none>}"
 echo "  Results  : s3://${RESULTS_BUCKET}/results/${TIMESTAMP}/${S3_TAG_SEG}<profile>/"
 echo "======================================================"
@@ -186,8 +199,8 @@ fi
 # ==============================================================================
 log_info "Creating ConfigMaps..."
 
-SCRIPT_CM="${JOB_NAME}-script"
-MANIFEST_CM="${JOB_NAME}-manifest"
+SCRIPT_CM="${JOB_NAME_BASE}-script"
+MANIFEST_CM="${JOB_NAME_BASE}-manifest"
 
 kubectl create configmap "${SCRIPT_CM}" \
     --from-file=load-test.py="${FRAMEWORK_ROOT}/inference/load-test.py" \
@@ -198,9 +211,9 @@ kubectl create configmap "${MANIFEST_CM}" \
     -n "${BENCHMARK_NAMESPACE}" --dry-run=client -o yaml | kubectl apply -f - >/dev/null
 
 # One ConfigMap per profile, each holding its own profile.yaml. Mounted at
-# /configs/profiles/<profile>/profile.yaml inside the single job container.
+# /configs/profiles/profile.yaml inside that profile's own Job container.
 for P in "${PROFILE_LIST[@]}"; do
-    kubectl create configmap "${JOB_NAME}-profile-${P}" \
+    kubectl create configmap "${JOB_NAME_BASE}-profile-${P}" \
         --from-file=profile.yaml="${FRAMEWORK_ROOT}/configs/workload_profiles/${P}_v1.yaml" \
         -n "${BENCHMARK_NAMESPACE}" --dry-run=client -o yaml | kubectl apply -f - >/dev/null
 done
@@ -216,51 +229,107 @@ if [[ -n "${DATASET_OVERRIDE:-}" ]]; then
     DATASET_JOB_ARG="--dataset ${DATASET_OVERRIDE}"
 fi
 
-# ── Build the per-profile run commands, volume mounts, and volumes ───────────
-# Each profile runs load-test.py against the SAME endpoint inside the ONE
-# container, then its results are uploaded to its own S3 subfolder.
-RUN_STEPS=""
-VOL_MOUNTS=""
-VOLUMES=""
-for P in "${PROFILE_LIST[@]}"; do
-    RUN_STEPS="${RUN_STEPS}
-              echo \"=== PROFILE: ${P} ===\"
-              # Per-level S3 upload target — load-test.py uploads the cumulative
-              # JSONL to this prefix after EVERY concurrency level, so a failure at
-              # a high level (e.g. 500) still leaves the earlier levels in S3.
-              export RESULTS_S3_PREFIX=\"results/${TIMESTAMP}/${S3_TAG_SEG}${P}/\"
-              python3 /app/load-test.py \\
-                --manifest /configs/manifests/manifest.yaml \\
-                --profile  /configs/profiles/${P}/profile.yaml \\
-                --endpoint \"${ENDPOINT}\" \\
-                --output   /results/${P} \\
-                --wait-timeout 600 ${DATASET_JOB_ARG} || TEST_EXIT=\\\$?
-              echo \"=== Uploading ${P} results to S3 ===\"
-              python3 -c \"
-              import boto3, os, glob
+# ==============================================================================
+# Step 2 — Submit ONE Job per profile (each its own k8s object, run sequentially)
+#
+# submit_profile_job <profile> — renders and applies a single-profile Job.
+#   * realtime : runs immediately; on success writes an S3 "done" marker.
+#   * batch    : an init container polls S3 for the realtime marker and blocks
+#                until it appears, so batch never loads the GPU while realtime is
+#                still measuring latency. If realtime is NOT in this run, the gate
+#                is skipped so batch starts right away.
+# Every Job runs from the vLLM DLC image, CPU-only, off the GPU node.
+# ==============================================================================
+submit_profile_job() {
+    local P="$1"
+    local JOB_NAME="${JOB_NAME_BASE}-${P}"
+    local DEADLINE_S; local GATE_ON_REALTIME="false"
+    if [[ "${P}" == "batch" ]]; then
+        DEADLINE_S="${BATCH_DEADLINE}"
+        # Only gate batch on realtime when realtime is actually part of this run.
+        for _p in "${PROFILE_LIST[@]}"; do [[ "${_p}" == "realtime" ]] && GATE_ON_REALTIME="true"; done
+    else
+        DEADLINE_S="${REALTIME_DEADLINE}"
+    fi
+
+    # --- init container: S3 marker gate (batch only, when realtime is in the run) ---
+    local INIT_CONTAINER=""
+    if [[ "${GATE_ON_REALTIME}" == "true" ]]; then
+        INIT_CONTAINER=$(cat <<INITEOF
+      initContainers:
+        - name: wait-for-realtime
+          image: ${BENCHMARK_RUNNER_IMAGE}
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              set -uo pipefail
+              export HOME=/tmp
+              export PYTHONPATH="/tmp/pip-packages:\${PYTHONPATH:-}"
+              python3 -c "import boto3" 2>/dev/null || \\
+                pip install --quiet --no-cache-dir --target=/tmp/pip-packages boto3==1.34.0 || true
+              echo "Gate: waiting for realtime completion marker s3://${RESULTS_BUCKET}/${S3_MARKER_KEY}"
+              python3 -c "
+              import boto3, os, sys, time
               s3 = boto3.client('s3', region_name='${AWS_REGION}')
-              for f in glob.glob('/results/${P}/*.jsonl'):
-                  key = 'results/${TIMESTAMP}/${S3_TAG_SEG}${P}/' + os.path.basename(f)
-                  s3.upload_file(f, '${RESULTS_BUCKET}', key)
-                  print('Uploaded: s3://${RESULTS_BUCKET}/' + key)
-              \" || true
-"
-    VOL_MOUNTS="${VOL_MOUNTS}
-            - name: profile-${P}
-              mountPath: /configs/profiles/${P}
-              readOnly: true"
-    VOLUMES="${VOLUMES}
-        - name: profile-${P}
-          configMap:
-            name: ${JOB_NAME}-profile-${P}"
-done
+              deadline = time.time() + ${REALTIME_DEADLINE} + 600
+              while time.time() < deadline:
+                  try:
+                      s3.head_object(Bucket='${RESULTS_BUCKET}', Key='${S3_MARKER_KEY}')
+                      print('Realtime marker found — starting batch.'); sys.exit(0)
+                  except Exception:
+                      print('...realtime not done yet; sleeping 20s'); time.sleep(20)
+              print('Gate timed out waiting for realtime — starting batch anyway.'); sys.exit(0)
+              "
+          env:
+            - name: AWS_DEFAULT_REGION
+              value: "${AWS_REGION}"
+            - name: RESULTS_BUCKET
+              value: "${RESULTS_BUCKET}"
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            runAsUser: 65534
+            runAsGroup: 65534
+            capabilities:
+              drop: ["ALL"]
+            seccompProfile:
+              type: RuntimeDefault
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "256Mi"
+            limits:
+              cpu: "500m"
+              memory: "512Mi"
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+INITEOF
+)
+    fi
 
-# ==============================================================================
-# Step 2 — Submit Job (runs from the vLLM DLC image, CPU-only)
-# ==============================================================================
-log_info "Submitting benchmark Job: ${JOB_NAME}..."
+    # --- main container: run load-test for THIS profile, upload, mark done ------
+    # realtime writes the S3 marker after a successful (or SLO-only) run so the
+    # gated batch Job can proceed. batch writes no marker.
+    local MARK_STEP=""
+    if [[ "${P}" == "realtime" ]]; then
+        MARK_STEP=$(cat <<MARKEOF
+              echo "=== Writing realtime completion marker ==="
+              python3 -c "
+              import boto3
+              s3 = boto3.client('s3', region_name='${AWS_REGION}')
+              s3.put_object(Bucket='${RESULTS_BUCKET}', Key='${S3_MARKER_KEY}', Body=b'done')
+              print('Marker written: s3://${RESULTS_BUCKET}/${S3_MARKER_KEY}')
+              " || echo "WARN: failed to write realtime marker (batch gate will time out and proceed)"
+MARKEOF
+)
+    fi
 
-cat <<EOF | kubectl apply -f -
+    log_info "Submitting ${P} Job: ${JOB_NAME} (deadline ${DEADLINE_S}s, gate=${GATE_ON_REALTIME})..."
+
+    cat <<EOF | kubectl apply -f -
 apiVersion: batch/v1
 kind: Job
 metadata:
@@ -270,11 +339,11 @@ metadata:
     app.kubernetes.io/component: benchmark-runner
     project: observeai-inference-optimization
     model: "${MODEL}"
-    profile: "${PROFILE}"
+    profile: "${P}"
 spec:
   backoffLimit: 0
-  activeDeadlineSeconds: 10800
-  ttlSecondsAfterFinished: 3600
+  activeDeadlineSeconds: ${DEADLINE_S}
+  ttlSecondsAfterFinished: 86400
   template:
     metadata:
       labels:
@@ -282,6 +351,7 @@ spec:
         app.kubernetes.io/component: benchmark-runner
         project: observeai-inference-optimization
         model: "${MODEL}"
+        profile: "${P}"
       annotations:
         # Prevent Karpenter from consolidating/evicting the node mid-benchmark.
         # A single eviction is terminal here (backoffLimit: 0), so the whole
@@ -310,6 +380,7 @@ spec:
                   app.kubernetes.io/component: inference-server
               topologyKey: kubernetes.io/hostname
       tolerations: []
+${INIT_CONTAINER}
       containers:
         - name: benchmark
           image: ${BENCHMARK_RUNNER_IMAGE}
@@ -321,12 +392,31 @@ spec:
               export HOME=/tmp
               export PYTHONPATH="/tmp/pip-packages:\${PYTHONPATH:-}"
               # Install required runner packages if not already present in the image
-              python3 -c "import boto3, vllm, yaml" 2>/dev/null || \
+              python3 -c "import boto3, vllm, yaml" 2>/dev/null || \\
                 pip install --quiet --no-cache-dir --target=/tmp/pip-packages boto3==1.34.0 pyyaml vllm || true
 
               TEST_EXIT=0
-              # ── one block per profile (realtime/batch); container built ONCE ──
-${RUN_STEPS}
+              echo "=== PROFILE: ${P} ==="
+              # Per-level S3 upload target — load-test.py uploads the cumulative
+              # JSONL after EVERY concurrency level, so a failure at a high level
+              # still leaves the earlier levels in S3.
+              export RESULTS_S3_PREFIX="results/${TIMESTAMP}/${S3_TAG_SEG}${P}/"
+              python3 /app/load-test.py \\
+                --manifest /configs/manifests/manifest.yaml \\
+                --profile  /configs/profiles/profile.yaml \\
+                --endpoint "${ENDPOINT}" \\
+                --output   /results/${P} \\
+                --wait-timeout 600 ${DATASET_JOB_ARG} || TEST_EXIT=\$?
+              echo "=== Uploading ${P} results to S3 ==="
+              python3 -c "
+              import boto3, os, glob
+              s3 = boto3.client('s3', region_name='${AWS_REGION}')
+              for f in glob.glob('/results/${P}/*.jsonl'):
+                  key = 'results/${TIMESTAMP}/${S3_TAG_SEG}${P}/' + os.path.basename(f)
+                  s3.upload_file(f, '${RESULTS_BUCKET}', key)
+                  print('Uploaded: s3://${RESULTS_BUCKET}/' + key)
+              " || true
+${MARK_STEP}
               exit \${TEST_EXIT}
           env:
             - name: AWS_DEFAULT_REGION
@@ -358,7 +448,10 @@ ${RUN_STEPS}
               readOnly: true
             - name: manifest
               mountPath: /configs/manifests
-              readOnly: true${VOL_MOUNTS}
+              readOnly: true
+            - name: profile-${P}
+              mountPath: /configs/profiles
+              readOnly: true
             - name: results
               mountPath: /results
             - name: tmp
@@ -369,7 +462,10 @@ ${RUN_STEPS}
             name: ${SCRIPT_CM}
         - name: manifest
           configMap:
-            name: ${MANIFEST_CM}${VOLUMES}
+            name: ${MANIFEST_CM}
+        - name: profile-${P}
+          configMap:
+            name: ${JOB_NAME_BASE}-profile-${P}
         - name: results
           emptyDir:
             sizeLimit: 1Gi
@@ -377,15 +473,56 @@ ${RUN_STEPS}
           emptyDir:
             sizeLimit: 4Gi
 EOF
+    log_info "${P} Job submitted: ${JOB_NAME}"
+}
 
-log_info "Job submitted."
+# Submit realtime FIRST so its marker-writing Job exists before batch's gate
+# starts polling. Order within PROFILE_LIST already puts realtime before batch.
+SUBMITTED_JOBS=()
+for P in "${PROFILE_LIST[@]}"; do
+    submit_profile_job "${P}"
+    SUBMITTED_JOBS+=("${JOB_NAME_BASE}-${P}")
+done
 
 # ==============================================================================
-# Step 3 — Wait for pod and stream logs
+# Step 3 — Detach. All Jobs are now running server-side; the terminal is free.
+# The batch Job self-gates on realtime via the S3 marker, so ordering holds even
+# if this script exits right now (Ctrl+C or closing the shell is safe).
 # ==============================================================================
-log_info "Waiting for pod to start..."
+echo ""
+echo "======================================================"
+echo "  BENCHMARK JOB(S) SUBMITTED — running in-cluster"
+echo "  Profiles : ${PROFILE_LIST[*]}  (separate Jobs, batch gated on realtime)"
+for J in "${SUBMITTED_JOBS[@]}"; do
+    echo "    • ${J}"
+done
+echo "  Results  : s3://${RESULTS_BUCKET}/results/${TIMESTAMP}/"
+echo "======================================================"
+echo ""
+echo "  These Jobs run on the cluster independently of this terminal."
+echo "  Closing the shell or pressing Ctrl+C does NOT stop them."
+echo ""
+echo "  Follow logs:"
+for J in "${SUBMITTED_JOBS[@]}"; do
+    echo "    kubectl logs -n ${BENCHMARK_NAMESPACE} -l job-name=${J} -f --tail=50"
+done
+echo ""
+echo "  Job status:"
+echo "    kubectl get jobs -n ${BENCHMARK_NAMESPACE} -l model=${MODEL} -w"
+echo ""
+echo "  Results (as they upload, per concurrency level):"
+echo "    aws s3 ls s3://${RESULTS_BUCKET}/results/${TIMESTAMP}/ --recursive --region ${AWS_REGION}"
+echo "    aws s3 cp s3://${RESULTS_BUCKET}/results/${TIMESTAMP}/ results/ --recursive --region ${AWS_REGION}"
+echo ""
+echo "  Grafana  : kubectl port-forward svc/kube-prometheus-stack-grafana 3000:80 -n monitoring"
+echo ""
+
+# Optional best-effort log tail of the FIRST (realtime) Job so an attended run
+# still sees live output. Detaching here (Ctrl+C) leaves all Jobs running.
+FIRST_JOB="${SUBMITTED_JOBS[0]}"
+log_info "Tailing ${FIRST_JOB} (Ctrl+C detaches — Jobs keep running in cluster)..."
 for i in $(seq 1 30); do
-    POD=$(kubectl get pods -l "job-name=${JOB_NAME}" \
+    POD=$(kubectl get pods -l "job-name=${FIRST_JOB}" \
         -n "${BENCHMARK_NAMESPACE}" \
         -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || echo "")
     [[ -n "${POD}" ]] && break
@@ -393,57 +530,8 @@ for i in $(seq 1 30); do
     sleep 5
 done
 echo ""
-log_info "Pod: ${POD:-not found}"
-
 if [[ -n "${POD:-}" ]]; then
-    log_info "Streaming logs (Ctrl+C detaches — job keeps running in cluster)..."
-    echo ""
     kubectl logs "${POD}" -n "${BENCHMARK_NAMESPACE}" -f 2>/dev/null || true
 fi
 
-# ==============================================================================
-# Step 4 — Wait for completion
-# ==============================================================================
-log_info "Waiting for job completion..."
-JOB_TIMEOUT=10800   # matches activeDeadlineSeconds
-JOB_DONE="false"
-DEADLINE=$((SECONDS + JOB_TIMEOUT))
-while [[ ${SECONDS} -lt ${DEADLINE} ]]; do
-    JOB_COMPLETE=$(kubectl get job "${JOB_NAME}" -n "${BENCHMARK_NAMESPACE}" \
-        -o jsonpath='{.status.conditions[?(@.type=="Complete")].status}' 2>/dev/null || echo "")
-    JOB_FAILED=$(kubectl get job "${JOB_NAME}" -n "${BENCHMARK_NAMESPACE}" \
-        -o jsonpath='{.status.conditions[?(@.type=="Failed")].status}' 2>/dev/null || echo "")
-    JOB_SUCCEEDED=$(kubectl get job "${JOB_NAME}" -n "${BENCHMARK_NAMESPACE}" \
-        -o jsonpath='{.status.succeeded}' 2>/dev/null || echo "")
-
-    if [[ "${JOB_COMPLETE}" == "True" || "${JOB_SUCCEEDED}" == "1" ]]; then
-        STATUS="PASSED"; JOB_DONE="true"; break
-    elif [[ "${JOB_FAILED}" == "True" ]]; then
-        # Failed job exit=1 can mean SLO violation (results still valid) or a real error.
-        STATUS="FAILED_OR_SLO"; JOB_DONE="true"; break
-    fi
-    sleep 10
-done
-[[ "${JOB_DONE}" != "true" ]] && STATUS="TIMEOUT"
-
-echo ""
-echo "======================================================"
-echo "  BENCHMARK ${STATUS}"
-echo "  Profiles: ${PROFILE_LIST[*]}"
-echo "  Results : s3://${RESULTS_BUCKET}/results/${TIMESTAMP}/"
-echo "======================================================"
-
-# ==============================================================================
-# Step 5 — Show S3 results
-# ==============================================================================
-log_info "S3 results:"
-aws s3 ls "s3://${RESULTS_BUCKET}/results/${TIMESTAMP}/" \
-    --recursive --human-readable --region "${AWS_REGION}" 2>/dev/null || \
-    log_warn "No results found in S3 yet — may still be uploading"
-
-echo ""
-echo "  Grafana  : kubectl port-forward svc/kube-prometheus-stack-grafana 3000:80 -n monitoring"
-echo "  Download : aws s3 cp s3://${RESULTS_BUCKET}/results/${TIMESTAMP}/ results/ --recursive --region ${AWS_REGION}"
-echo ""
-
-[[ "${STATUS}" == "PASSED" ]] || exit 1
+exit 0

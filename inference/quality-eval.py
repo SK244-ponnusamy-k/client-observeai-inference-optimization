@@ -203,8 +203,8 @@ def _guided_supported(endpoint: str, served_model: str, labels: list[str]) -> bo
 
 def _classify_one(
     *, endpoint: str, served_model: str, prompt: str, labels: list[str],
-    dcfg: dict[str, Any], mcfg: dict[str, Any],
-) -> str:
+    dcfg: dict[str, Any], mcfg: dict[str, Any], return_text: bool = False,
+) -> str | tuple[str, str]:
     messages: list[dict[str, str]] = []
     sys_prompt = (mcfg.get("system_prompt") or "").strip()
     if sys_prompt:
@@ -238,7 +238,10 @@ def _classify_one(
         str(msg.get("reasoning") or ""),
         str(msg.get("text") or ""),
     ]).strip()
-    return _parse_label(full_text, labels)
+    label = _parse_label(full_text, labels)
+    # Only the MODEL OUTPUT is ever returned for dumping — never the input
+    # transcript/prompt (customer-data policy: transcripts are not persisted).
+    return (label, full_text) if return_text else label
 
 
 def _parse_label(content: str, labels: list[str]) -> str:
@@ -337,15 +340,30 @@ def _run(args: argparse.Namespace) -> None:
 
     started_at = datetime.now(tz=timezone.utc).isoformat()
 
+    # Optional per-row sample capture (opt-in via --dump-samples). Captures the
+    # MODEL OUTPUT only — never the input transcript — capped at
+    # --max-dump-samples rows to keep the file tiny (customer-data policy).
+    dump_samples = bool(getattr(args, "dump_samples", False))
+    max_dump = int(getattr(args, "max_dump_samples", 200))
+
     def _worker(row: dict[str, str]) -> dict[str, str]:
+        raw_out = ""
         try:
-            pred = _classify_one(endpoint=endpoint, served_model=served_model,
-                                 prompt=row["prompt"], labels=labels, dcfg=dcfg, mcfg=mcfg)
+            res = _classify_one(endpoint=endpoint, served_model=served_model,
+                                prompt=row["prompt"], labels=labels, dcfg=dcfg, mcfg=mcfg,
+                                return_text=dump_samples)
+            if dump_samples:
+                pred, raw_out = res  # type: ignore[misc]
+            else:
+                pred = res  # type: ignore[assignment]
         except Exception as exc:  # noqa: BLE001
             logger.warning("Request failed for data_id=%s: %s", row["data_id"], type(exc).__name__)
             pred = "UNKNOWN"
-        return {"data_id": row["data_id"], "gold": row["gold"],
-                "pred": pred, "question": row["question"]}
+        out = {"data_id": row["data_id"], "gold": row["gold"],
+               "pred": pred, "question": row["question"]}
+        if dump_samples:
+            out["output"] = raw_out
+        return out
 
     results: list[dict[str, str]] = []
     with ThreadPoolExecutor(max_workers=concurrency) as ex:
@@ -405,6 +423,27 @@ def _run(args: argparse.Namespace) -> None:
         f.write(json.dumps(asdict(result)) + "\n")
     logger.info("Wrote %s", out_file)
 
+    # Optional per-row sample dump (opt-in). Writes at most --max-dump-samples
+    # rows of {data_id, question, gold, pred, output} — MODEL OUTPUT only, never
+    # the input transcript. Tiny by design (~1-2 MB for the full 1200-row set at
+    # the free_parse 256-token cap), so no storage/eviction risk.
+    if dump_samples:
+        samples_file = out_dir / f"samples-{result.eval_id}-{served_model.replace('/', '_')}.jsonl"
+        written = 0
+        with samples_file.open("w") as f:
+            for r in results:
+                if written >= max_dump:
+                    break
+                f.write(json.dumps({
+                    "data_id": r.get("data_id", ""),
+                    "question": r.get("question", ""),
+                    "gold": r.get("gold", ""),
+                    "pred": r.get("pred", ""),
+                    "output": r.get("output", ""),
+                }) + "\n")
+                written += 1
+        logger.info("Wrote %d sample rows (model output only) to %s", written, samples_file)
+
     _print_summary(result)
 
 
@@ -434,6 +473,13 @@ def main() -> None:
     ap.add_argument("--quantization", default="unknown", help="Quant label for the result row")
     ap.add_argument("--hardware", default="unknown", help="Hardware/instance type label (e.g. g5, g6, g6e)")
     ap.add_argument("--wait-timeout", type=int, default=300)
+    # Opt-in per-row sample capture. OFF by default (customer-data policy).
+    # Captures MODEL OUTPUT only (never the input transcript), capped by
+    # --max-dump-samples to keep the file small.
+    ap.add_argument("--dump-samples", action="store_true",
+                    help="Also write samples-*.jsonl with per-row model OUTPUT (not the input). Off by default.")
+    ap.add_argument("--max-dump-samples", type=int, default=200,
+                    help="Cap on rows written when --dump-samples is set (default 200).")
     _run(ap.parse_args())
 
 

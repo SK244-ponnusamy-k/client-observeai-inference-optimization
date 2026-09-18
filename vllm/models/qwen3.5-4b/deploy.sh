@@ -27,13 +27,19 @@ log_info()  { echo -e "${GREEN}[INFO]  $(date +'%H:%M:%S')${NC} $1"; }
 log_warn()  { echo -e "${YELLOW}[WARN]  $(date +'%H:%M:%S')${NC} $1"; }
 log_error() { echo -e "${RED}[ERROR] $(date +'%H:%M:%S')${NC} $1"; }
 
-# ── Parse flags: --hw <instance-type>, --tp <n>, --validate ──────────────────
+# ── Parse flags: --hw <type> --tp <n> --validate --benchmark [--profile --dataset] ─
 VALIDATE="false"
+RUN_BENCHMARK="false"
+BENCH_PROFILE="both"          # both | realtime | batch
+BENCH_DATASET=""              # optional custom dataset (S3 key / path)
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --hw)       NODE_INSTANCE_TYPE="$2"; shift 2 ;;
-        --tp)       TP_SIZE="$2"; shift 2 ;;
-        --validate) VALIDATE="true"; shift ;;
+        --hw)        NODE_INSTANCE_TYPE="$2"; shift 2 ;;
+        --tp)        TP_SIZE="$2"; shift 2 ;;
+        --validate)  VALIDATE="true"; shift ;;
+        --benchmark) RUN_BENCHMARK="true"; shift ;;
+        --profile)   BENCH_PROFILE="$2"; shift 2 ;;
+        --dataset)   BENCH_DATASET="$2"; shift 2 ;;
         *) log_warn "Unknown arg: $1"; shift ;;
     esac
 done
@@ -84,11 +90,14 @@ echo ""
 log_info "Pod: ${POD:-not found yet}"
 
 log_info "Waiting for Ready (model loading from S3 — up to 10 min)..."
-kubectl wait "deployment/${DEPLOYMENT_NAME}" \
-    --for=condition=Available --timeout=600s -n "${BENCHMARK_NAMESPACE}" || {
+DEPLOY_READY="false"
+if kubectl wait "deployment/${DEPLOYMENT_NAME}" \
+    --for=condition=Available --timeout=600s -n "${BENCHMARK_NAMESPACE}"; then
+    DEPLOY_READY="true"
+else
     log_warn "Deployment not ready yet — check logs:"
     log_warn "  kubectl logs deployment/${DEPLOYMENT_NAME} -n ${BENCHMARK_NAMESPACE} | tail -30"
-}
+fi
 
 echo ""
 echo "══════════════════════════════════════════════════"
@@ -108,4 +117,49 @@ if [[ "${VALIDATE}" == "true" ]]; then
         --model "${MODEL_ID}" \
         --manifest "${MANIFEST_PATH}" \
         --endpoint "http://${SERVICE_NAME}:8000"
+fi
+
+# ==============================================================================
+# Auto-benchmark — runs after a successful deploy when --benchmark is passed.
+#   --benchmark                     → runs BOTH realtime and batch (default)
+#   --benchmark --profile realtime  → realtime only
+#   --benchmark --profile batch     → batch only
+#
+# 'both' submits realtime and batch as TWO SEPARATE k8s Jobs that run
+# SEQUENTIALLY: batch's init container waits (via an S3 marker) for realtime to
+# finish before it loads the GPU. Both Jobs are submitted up front, so a batch
+# failure never discards the realtime results, and closing this terminal / Ctrl+C
+# does not stop either Job — they run to completion in the cluster.
+#
+# NOTE: run-benchmark.sh resolves manifests as <model>-<hw>-bf16.yaml. The qwen
+# manifests use the dotted name (qwen3.5-4b-*), so pass that, not MODEL_ID.
+# ==============================================================================
+if [[ "${RUN_BENCHMARK}" == "true" ]]; then
+    HW_SUFFIX="${NODE_INSTANCE_TYPE%%.*}"     # g6e.2xlarge -> g6e
+    if [[ "${DEPLOY_READY}" != "true" ]]; then
+        log_warn "Skipping auto-benchmark: deployment never became Ready."
+        log_warn "Once the pod is 1/1, run manually:"
+        log_warn "  bash inference/run-benchmark.sh --model qwen3.5-4b --hw ${HW_SUFFIX} --profile ${BENCH_PROFILE}"
+        exit 0
+    fi
+
+    BENCH_DATASET_ARGS=()
+    if [[ -n "${BENCH_DATASET}" ]]; then
+        BENCH_DATASET_ARGS=(--dataset "${BENCH_DATASET}")
+    fi
+
+    echo ""
+    echo "══════════════════════════════════════════════════"
+    echo "  AUTO-BENCHMARK — qwen3.5-4b / ${HW_SUFFIX} / ${BENCH_PROFILE}"
+    echo "  (realtime + batch = two separate sequential Jobs)"
+    echo "══════════════════════════════════════════════════"
+    bash "${FRAMEWORK_ROOT}/inference/run-benchmark.sh" \
+        --model "qwen3.5-4b" \
+        --hw "${HW_SUFFIX}" \
+        --profile "${BENCH_PROFILE}" \
+        "${BENCH_DATASET_ARGS[@]}" || \
+        log_warn "Benchmark submit reported non-zero — check output/S3 results above."
+
+    echo ""
+    log_info "Auto-benchmark submitted (profile: ${BENCH_PROFILE}). Jobs run in-cluster."
 fi
