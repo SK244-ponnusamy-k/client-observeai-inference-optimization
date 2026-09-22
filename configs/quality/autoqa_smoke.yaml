@@ -1,0 +1,47 @@
+# ==============================================================================
+# configs/quality/autoqa_smoke.yaml
+#
+# 50-row SMOKE variant of autoqa_v1.yaml. Same decoding, prompt and parsing —
+# only run.max_samples differs — so it answers one question cheaply before a full
+# 1200-row run is committed:
+#
+#   "Is the model reaching its own verdict, or is the constrained retry doing it?"
+#
+# Read these lines in the summary:
+#   truncated=        should be LOW (run 20260922-120738 had 1047/1200)
+#   Verdict source:   should be mostly answer/conclusion, NOT retry
+#
+# Takes about a minute. NOT for reporting — 50 rows is far too few for an
+# accuracy figure. Use autoqa_v1.yaml for anything published.
+# ==============================================================================
+
+eval_id: autoqa_smoke
+task_type: binary_classification
+
+dataset:
+  version: autoqa_v1           # same dataset file as the full run
+  format: csv
+  text_field: input_prompt
+  label_field: answer
+  question_field: question
+
+labels: ["Yes", "No"]
+positive_label: "Yes"
+
+decoding:
+  mode: free_parse
+  temperature: 0.0
+  seed: 42
+  max_tokens: 8
+  reasoning_max_tokens: 1024
+  fallback_max_tokens: 16
+  truncation_fallback: true
+
+model:
+  served_name: gpt-oss-20b     # overridden per run by --served-name
+  reasoning_effort: "low"
+  system_prompt: "You grade a call transcript against one QA question. Give at most two short sentences of justification, then put the single word Yes or No on the final line by itself. Do not restate or discuss these instructions."
+
+run:
+  max_samples: 50              # the only difference from autoqa_v1.yaml
+  concurrency: 32

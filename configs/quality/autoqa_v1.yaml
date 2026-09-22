@@ -31,12 +31,37 @@ decoding:
   temperature: 0.0            # deterministic
   seed: 42
   max_tokens: 8               # guided_choice mode only (non-reasoning models)
-  reasoning_max_tokens: 256   # free_parse budget — concise CoT + verdict
+  # free_parse budget: the model must fit its reasoning AND its verdict in here.
+  # 256 was too small for thinking models — Qwen3.5-4B spent the entire budget
+  # restating the task, so 1200/1200 replies hit the cap and never stated a
+  # verdict (finish_reason=length). Raised to 1024. Tune per model if needed.
+  reasoning_max_tokens: 1024
+  # Budget for the constrained retry below (a bare label needs very little).
+  fallback_max_tokens: 16
+  # Safety net: when a reply runs out of tokens WITHOUT stating a verdict, retry
+  # that row once with generation constrained to a bare label (guided decoding,
+  # falling back to thinking-off + an explicit one-word instruction). Those rows
+  # are scored and counted in n_fallback so they stay visible in the report.
+  # Set to false to leave truncated rows as unparseable instead.
+  truncation_fallback: true
 
 model:
   served_name: gpt-oss-20b    # must match --served-model-name / manifest served_name
   reasoning_effort: "low"     # gpt-oss: keep CoT short/cheap for a Yes/No verdict; "" = omit
-  system_prompt: "You are grading a call transcript against a single QA question. Think briefly, then end your reply with exactly one word on its own line: Yes or No."
+  # The earlier wording ("Think briefly, then end your reply with exactly one
+  # word on its own line") made Qwen3.5-4B spend its entire budget deliberating
+  # about the output FORMAT — the samples show it repeatedly re-reading the
+  # instruction ("Wait, looking at the instruction again...") until it ran out of
+  # tokens. This version states the format once, caps the reasoning explicitly,
+  # and forbids restating the instructions.
+  system_prompt: "You grade a call transcript against one QA question. Give at most two short sentences of justification, then put the single word Yes or No on the final line by itself. Do not restate or discuss these instructions."
+  # Optional per-request chat-template arguments, sent verbatim to vLLM. Qwen3
+  # enables thinking by default; uncomment to turn it off so the model answers
+  # directly and a small token budget is enough. Leave commented for gpt-oss,
+  # which already keeps its reasoning short via reasoning_effort.
+  # See https://docs.vllm.ai/en/stable/features/reasoning_outputs/
+  # chat_template_kwargs:
+  #   enable_thinking: false
 
 run:
   max_samples: 0              # 0 = all 1200

@@ -7,9 +7,10 @@ or syncs from S3, then generates a multi-model comparison table and Excel/CSV re
 
 Usage:
   python scripts/compare_models.py
-  python scripts/compare_models.py --date today
-  python scripts/compare_models.py --date 2026-09-15
-  python scripts/compare_models.py --s3-bucket shellkode-ai-results
+  python report-gen/report_generator.py --date today
+  python report-gen/report_generator.py --date 2026-09-15
+  python report-gen/report_generator.py --from-date 2026-09-18 --to-date today
+  python report-gen/report_generator.py --s3-bucket shellkode-ai-results
   python scripts/compare_models.py --export-excel results/model_comparison.xlsx
 """
 
@@ -29,7 +30,15 @@ def load_results_local(results_dir: Path) -> list[dict[str, Any]]:
         return rows
 
     for f in results_dir.rglob("*.jsonl"):
-        if "quality" in f.parts or f.name.startswith("comparison") or f.name.startswith("summary"):
+        if (
+            "quality" in f.parts
+            or f.name.startswith("comparison")
+            or f.name.startswith("summary")
+            # Per-row quality samples carry no perf metrics; without this they
+            # would pass the "no f1/accuracy key" test below and pollute the
+            # performance sheet.
+            or f.name.startswith("samples-")
+        ):
             continue
         with f.open("r", encoding="utf-8") as file:
             for line in file:
@@ -68,6 +77,8 @@ def load_quality_results(results_dir: Path) -> list[dict[str, Any]]:
         return rows
 
     for f in results_dir.rglob("*.jsonl"):
+        if f.name.startswith("samples-"):
+            continue  # per-row samples are loaded separately by load_quality_samples
         with f.open("r", encoding="utf-8") as file:
             for line in file:
                 if line.strip():
@@ -88,27 +99,113 @@ def load_quality_results(results_dir: Path) -> list[dict[str, Any]]:
     return rows
 
 
-def resolve_date_filter(date_arg: str | None) -> str | None:
+def _run_label_from_path(path: Path) -> str:
+    """'quality/20260922-104321/g5/samples-x.jsonl' -> '20260922-104321/g5'.
+
+    Identifies the run by its timestamp folder plus any tag folder beneath it, so
+    several runs of the same model on the same hardware stay distinguishable.
     """
-    Turns the --date argument into a YYYY-MM-DD string to filter on.
-    Accepts: None (no filtering), 'today' (current UTC date), or an
-    explicit 'YYYY-MM-DD' string (validated).
+    import re
+
+    segs = str(path).replace("\\", "/").split("/")[:-1]  # drop the filename
+    for i, seg in enumerate(segs):
+        if re.match(r"^\d{8}-\d{6}$", seg.strip()):
+            return "/".join(segs[i:])
+    return segs[-1] if segs else "-"
+
+
+def _model_from_samples_filename(name: str) -> str:
+    """'samples-autoqa_v1-Qwen3.5-4B.jsonl' -> 'Qwen3.5-4B'.
+
+    Only used for sample files written before the served_model field was added to
+    each row; current files carry the model inline.
     """
+    stem = name[len("samples-"):] if name.startswith("samples-") else name
+    stem = stem.rsplit(".jsonl", 1)[0]
+    parts = stem.split("-", 1)
+    return parts[1] if len(parts) == 2 and parts[1] else stem or "-"
+
+
+def load_quality_samples(results_dir: Path) -> list[dict[str, Any]]:
+    """Read per-row quality samples written by quality-eval.py --dump-samples.
+
+    Pure reader: every value shown in the report comes from the sample row as
+    written by the evaluator. Nothing is recomputed here. Files are only present
+    for runs that opted in, so an empty list simply means no run dumped samples.
+    """
+    rows: list[dict[str, Any]] = []
+    if not results_dir.exists():
+        return rows
+
+    for f in sorted(results_dir.rglob("samples-*.jsonl")):
+        fallback_model = _model_from_samples_filename(f.name)
+        run_label = _run_label_from_path(f)
+        with f.open("r", encoding="utf-8") as file:
+            for line in file:
+                if not line.strip():
+                    continue
+                try:
+                    data = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                data["_source_path"] = str(f)
+                data["_run"] = run_label
+                data["_clean_model"] = data.get("served_model") or fallback_model
+                data["_clean_hw"] = data.get("hardware") or "-"
+                data["_clean_quant"] = data.get("quantization") or "-"
+                rows.append(data)
+    return rows
+
+
+def _resolve_date_value(date_arg: str | None, option_name: str) -> str | None:
+    """Resolve ``today`` or validate an ISO YYYY-MM-DD CLI date value."""
     if not date_arg:
         return None
-
     if date_arg.lower() == "today":
         return datetime.now(timezone.utc).strftime("%Y-%m-%d")
-
     try:
-        # Validate format, but keep the original string for prefix matching.
         datetime.strptime(date_arg, "%Y-%m-%d")
     except ValueError:
         raise SystemExit(
-            f"Invalid --date value: '{date_arg}'. Use 'today' or 'YYYY-MM-DD' (e.g. 2026-09-15)."
+            f"Invalid {option_name} value: '{date_arg}'. Use 'today' or YYYY-MM-DD "
+            "(e.g. 2026-09-18)."
         )
-
     return date_arg
+
+
+def resolve_date_filter(date_arg: str | None) -> str | None:
+    """Backward-compatible resolver for the exact ``--date`` filter."""
+    return _resolve_date_value(date_arg, "--date")
+
+
+def resolve_date_range(
+    date_arg: str | None,
+    from_date_arg: str | None,
+    to_date_arg: str | None,
+) -> tuple[str | None, str | None]:
+    """Resolve exact-date or inclusive range arguments.
+
+    ``--date`` is mutually exclusive with ``--from-date``/``--to-date``.
+    When only ``--from-date`` is supplied, the upper bound defaults to today
+    (UTC), making ``--from-date YYYY-MM-DD`` the convenient "through now" form.
+    ``--to-date`` alone means all available results up to that date.
+    """
+    if date_arg and (from_date_arg or to_date_arg):
+        raise SystemExit("Use either --date OR --from-date/--to-date, not both.")
+
+    if date_arg:
+        exact = resolve_date_filter(date_arg)
+        return exact, exact
+
+    from_date = _resolve_date_value(from_date_arg, "--from-date")
+    to_date = _resolve_date_value(to_date_arg, "--to-date")
+    if from_date and not to_date:
+        to_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    if from_date and to_date and from_date > to_date:
+        raise SystemExit(
+            f"Invalid date range: --from-date {from_date} is after --to-date {to_date}."
+        )
+    return from_date, to_date
 
 
 def _folder_date_from_path(path: str) -> str | None:
@@ -127,25 +224,40 @@ def _folder_date_from_path(path: str) -> str | None:
     return None
 
 
-def filter_by_date(results: list[dict[str, Any]], date_str: str | None) -> list[dict[str, Any]]:
-    """Keep rows for date_str (YYYY-MM-DD).
+def _row_dates(row: dict[str, Any]) -> set[str]:
+    """Return valid dates associated with a row (payload date and run-folder date)."""
+    dates: set[str] = set()
+    ts = str(row.get("started_at") or row.get("timestamp") or "")
+    payload_date = ts[:10]
+    try:
+        datetime.strptime(payload_date, "%Y-%m-%d")
+        dates.add(payload_date)
+    except ValueError:
+        pass
+    folder_date = _folder_date_from_path(row.get("_source_path", ""))
+    if folder_date:
+        dates.add(folder_date)
+    return dates
 
-    A row matches if EITHER its own started_at/timestamp OR its S3 run-folder
-    timestamp (results/<YYYYMMDD-HHMMSS>/...) falls on date_str. The folder date
-    is the fallback because a run's started_at can land on a different UTC day
-    than the folder it was uploaded under (e.g. a long batch that crossed midnight,
-    or a manifest run_id embedding an older date).
-    """
-    if not date_str:
+
+def filter_by_date_range(
+    results: list[dict[str, Any]],
+    from_date: str | None,
+    to_date: str | None,
+) -> list[dict[str, Any]]:
+    """Keep rows with any associated date inside the inclusive range."""
+    if not from_date and not to_date:
         return results
 
-    filtered = []
-    for r in results:
-        ts = str(r.get("started_at") or r.get("timestamp") or "")
-        folder_date = _folder_date_from_path(r.get("_source_path", ""))
-        if ts.startswith(date_str) or folder_date == date_str:
-            filtered.append(r)
-    return filtered
+    def in_range(date_value: str) -> bool:
+        return (not from_date or date_value >= from_date) and (not to_date or date_value <= to_date)
+
+    return [row for row in results if any(in_range(d) for d in _row_dates(row))]
+
+
+def filter_by_date(results: list[dict[str, Any]], date_str: str | None) -> list[dict[str, Any]]:
+    """Backward-compatible exact-date filter."""
+    return filter_by_date_range(results, date_str, date_str)
 
 
 def get_all_headers(results: list[dict[str, Any]]) -> list[str]:
@@ -296,9 +408,17 @@ def fix_instance_labels(results: list[dict[str, Any]]) -> int:
     return fixed
 
 
-def export_excel(perf_results: list[dict[str, Any]], qual_results: list[dict[str, Any]], xlsx_path: Path) -> None:
-    """Generates a formatted Excel (.xlsx) report with Performance, Quality, and Detail sheets."""
-    if not perf_results and not qual_results:
+def export_excel(
+    perf_results: list[dict[str, Any]],
+    qual_results: list[dict[str, Any]],
+    xlsx_path: Path,
+    sample_results: list[dict[str, Any]] | None = None,
+    max_sample_rows: int = 2000,
+) -> None:
+    """Generates a formatted Excel (.xlsx) report with Performance, Quality,
+    Quality Samples, and Detail sheets."""
+    sample_results = sample_results or []
+    if not perf_results and not qual_results and not sample_results:
         print("No benchmark or quality results to export.")
         return
 
@@ -379,6 +499,8 @@ def export_excel(perf_results: list[dict[str, Any]], qual_results: list[dict[str
 
     # ── Sheet 2: Quality & Accuracy Evaluation ──────────────────────────────
     ws_qual = wb.create_sheet(title="Quality Evaluation")
+    # Confusion cells, unparseable and truncated counts come straight from the
+    # evaluator's result row (quality-eval.py writes them); nothing is derived here.
     headers_qual = [
         "Model",
         "Instance Type / HW",
@@ -388,6 +510,20 @@ def export_excel(perf_results: list[dict[str, Any]], qual_results: list[dict[str
         "Precision",
         "Recall",
         "AutoQA F1 Score",
+        "Macro F1",
+        "TP",
+        "FP",
+        "FN",
+        "TN",
+        "Unparseable (gold Yes)",
+        "Unparseable (gold No)",
+        "Other Unscored",
+        "Matrix Total",
+        "Unparseable",
+        "Truncated",
+        "Recovered by Retry",
+        "Verdict Sources",
+        "Decoding Mode",
         "Timestamp",
     ]
 
@@ -407,6 +543,9 @@ def export_excel(perf_results: list[dict[str, Any]], qual_results: list[dict[str
             unique_qual.append(q)
 
     for q in sorted(unique_qual, key=lambda x: (x.get("_clean_model", ""), x.get("_clean_quant", ""))):
+        conf = q.get("confusion") or {}
+        if not isinstance(conf, dict):
+            conf = {}
         ws_qual.append([
             q.get("_clean_model", "gpt-oss-20b"),
             q.get("_clean_hw", "-"),
@@ -416,10 +555,120 @@ def export_excel(perf_results: list[dict[str, Any]], qual_results: list[dict[str
             round(_v(q, "precision"), 4),
             round(_v(q, "recall"), 4),
             round(q.get("_clean_f1", 0.0), 4),
+            # Absent field shows "-" rather than 0, so an older result row is not
+            # read as a genuine macro-F1 of zero.
+            round(_v(q, "macro_f1"), 4) if q.get("macro_f1") is not None else "-",
+            conf.get("tp", "-"),
+            conf.get("fp", "-"),
+            conf.get("fn", "-"),
+            conf.get("tn", "-"),
+            conf.get("unparseable_pos", "-"),
+            conf.get("unparseable_neg", "-"),
+            conf.get("unscored_other", "-"),
+            q.get("confusion_total", "-"),
+            q.get("n_unparseable", "-"),
+            q.get("n_truncated", "-"),
+            q.get("n_fallback", "-"),
+            # Compact provenance string, e.g. "answer=120 conclusion=940 retry=140".
+            (
+                " ".join(f"{k}={v}" for k, v in sorted((q.get("verdict_sources") or {}).items()))
+                if isinstance(q.get("verdict_sources"), dict) and q.get("verdict_sources")
+                else "-"
+            ),
+            q.get("decoding_mode", "-"),
             str(q.get("started_at", q.get("timestamp", "-")))[:19].replace("T", " "),
         ])
 
-    # ── Sheet 3: All Detailed Runs ──────────────────────────────────────────
+    # ── Sheet 3: Quality Samples (per-row model output) ─────────────────────
+    # Present only when a run was submitted with --dump-samples. Every column is
+    # a field written by quality-eval.py; the report does not re-judge anything.
+    ws_samples = None
+    if sample_results:
+        ws_samples = wb.create_sheet(title="Quality Samples")
+        headers_samples = [
+            "Model",
+            "Instance Type / HW",
+            "Quantization",
+            "Run",
+            "Data ID",
+            "Question (rubric)",
+            "Prompt Chars",
+            "Expected (gold)",
+            "Actual (predicted)",
+            "Match",
+            "Truncated",
+            "Finish Reason",
+            "Retry Used",
+            "Verdict From",
+            "Model Answer",
+            "Model Reasoning",
+        ]
+        # The input prompt is only present when a run used --dump-inputs, so the
+        # column appears only when at least one row actually carries it.
+        has_inputs = any(s.get("input_prompt") for s in sample_results)
+        if has_inputs:
+            headers_samples.append("Input Prompt (transcript)")
+        ws_samples.append(headers_samples)
+        for col_num in range(1, len(headers_samples) + 1):
+            cell = ws_samples.cell(row=1, column=col_num)
+            cell.font = header_font
+            cell.fill = PatternFill(start_color="7F4F24", end_color="7F4F24", fill_type="solid")
+            cell.alignment = Alignment(horizontal="center", vertical="center")
+
+        # Excel caps a cell at 32767 characters. Reasoning is trimmed to stay
+        # readable; the input prompt gets a much larger budget because a partial
+        # transcript cannot be used to audit a verdict.
+        cell_cap = 4000
+        input_cap = 32000
+
+        def _fit(value: Any, cap: int) -> str:
+            text = str(value or "")
+            return text if len(text) <= cap else text[:cap] + " ...[truncated for Excel]"
+
+        written = 0
+        for s in sorted(
+            sample_results,
+            key=lambda x: (x.get("_clean_model", ""), x.get("_run", ""), str(x.get("data_id", ""))),
+        ):
+            if written >= max_sample_rows:
+                break
+            # Newer runs split the reply into answer + reasoning. Older sample
+            # files only have the glued "output", which is shown as the answer.
+            answer = _fit(s.get("answer", s.get("output", "")), cell_cap)
+            reasoning = _fit(s.get("reasoning", ""), cell_cap)
+            match_val = s.get("match")
+            row_cells = [
+                s.get("_clean_model", "-"),
+                s.get("_clean_hw", "-"),
+                s.get("_clean_quant", "-"),
+                s.get("_run", "-"),
+                s.get("data_id", "-"),
+                str(s.get("question", "") or "-"),
+                s.get("prompt_chars", "-") or "-",
+                s.get("gold", "-"),
+                s.get("pred", "-"),
+                ("MATCH" if match_val else "MISMATCH") if match_val is not None else "-",
+                # "-" when the sample predates the truncation field, so an unknown
+                # state is never displayed as confirmed not-truncated.
+                ("YES" if s.get("truncated") else "no") if s.get("truncated") is not None else "-",
+                s.get("finish_reason", "-"),
+                ("YES" if s.get("fallback") else "no") if s.get("fallback") is not None else "-",
+                s.get("verdict_source", "-") or "-",
+                answer or "-",
+                reasoning or "-",
+            ]
+            if has_inputs:
+                row_cells.append(_fit(s.get("input_prompt", ""), input_cap) or "-")
+            ws_samples.append(row_cells)
+            written += 1
+
+        if len(sample_results) > written:
+            print(
+                f"[NOTE] Quality Samples sheet capped at {written} of "
+                f"{len(sample_results)} rows (raise --max-sample-rows to include more)."
+            )
+
+    # ── Sheet 4: All Detailed Runs ──────────────────────────────────────────
     ws_detail = wb.create_sheet(title="All Detailed Perf Runs")
     if unique_perf:
         all_keys = get_all_headers(unique_perf)
@@ -440,12 +689,13 @@ def export_excel(perf_results: list[dict[str, Any]], qual_results: list[dict[str
                     row_vals.append(v)
             ws_detail.append(row_vals)
 
-    # Auto-adjust column widths
-    for ws in [ws_perf, ws_qual, ws_detail]:
+    # Auto-adjust column widths. Capped so a long model-output cell cannot stretch
+    # a column past the width of the screen.
+    for ws in [s for s in (ws_perf, ws_qual, ws_samples, ws_detail) if s is not None]:
         for col in ws.columns:
             max_len = max(len(str(cell.value or "")) for cell in col)
             col_letter = openpyxl.utils.get_column_letter(col[0].column)
-            ws.column_dimensions[col_letter].width = max(max_len + 3, 12)
+            ws.column_dimensions[col_letter].width = min(max(max_len + 3, 12), 80)
 
     xlsx_path.parent.mkdir(parents=True, exist_ok=True)
     wb.save(xlsx_path)
@@ -453,10 +703,18 @@ def export_excel(perf_results: list[dict[str, Any]], qual_results: list[dict[str
     print(f"[REPORT]  File Location: {xlsx_path.resolve()}\n")
 
 
-def print_comparison_table(perf_results: list[dict[str, Any]], qual_results: list[dict[str, Any]]) -> None:
+def print_comparison_table(
+    perf_results: list[dict[str, Any]],
+    qual_results: list[dict[str, Any]],
+    sample_results: list[dict[str, Any]] | None = None,
+) -> None:
+    sample_results = sample_results or []
     sep = "=" * 105
     print(f"\n{sep}")
-    print(f"  LLM BENCHMARK MODEL COMPARISON SUMMARY ({len(perf_results)} perf runs, {len(qual_results)} quality runs)")
+    print(
+        f"  LLM BENCHMARK MODEL COMPARISON SUMMARY ({len(perf_results)} perf runs, "
+        f"{len(qual_results)} quality runs, {len(sample_results)} quality sample rows)"
+    )
     print(sep)
 
     # ── Section 1: Load Test Performance Results ─────────────────────────────
@@ -500,9 +758,10 @@ def print_comparison_table(perf_results: list[dict[str, Any]], qual_results: lis
         print("\n  [ QUALITY & ACCURACY BENCHMARKS (AutoQA F1 Score) ]")
         print(
             f"  {'Model':<22} {'HW':<8} {'Quant':<8} {'Rows':>6} "
-            f"{'Accuracy':>10} {'Precision':>10} {'Recall':>9} {'F1 Score':>10}"
+            f"{'Accuracy':>10} {'Precision':>10} {'Recall':>9} {'F1 Score':>10} "
+            f"{'Unparse':>8} {'Trunc':>6}"
         )
-        print(f"  {'-'*90}")
+        print(f"  {'-'*106}")
 
         seen_q = set()
         unique_qual = []
@@ -521,11 +780,35 @@ def print_comparison_table(perf_results: list[dict[str, Any]], qual_results: lis
             prec = f"{_v(q, 'precision'):.4f}"
             rec = f"{_v(q, 'recall'):.4f}"
             f1 = f"{q.get('_clean_f1', 0.0):.4f}"
+            unparse = str(q.get("n_unparseable", "-"))
+            trunc = str(q.get("n_truncated", "-"))
 
             print(
                 f"  {model:<22} {hw:<8} {quant:<8} {rows:>6} "
-                f"{acc:>10} {prec:>10} {rec:>9} {f1:>10}"
+                f"{acc:>10} {prec:>10} {rec:>9} {f1:>10} "
+                f"{unparse:>8} {trunc:>6}"
             )
+
+            # Confusion matrix straight from the evaluator, with the reconciliation
+            # check so a matrix that does not add up to the row count is obvious.
+            conf = q.get("confusion") if isinstance(q.get("confusion"), dict) else None
+            if conf:
+                total = q.get("confusion_total")
+                recon = ""
+                if isinstance(total, int):
+                    recon = f"   total={total}/{rows} {'OK' if total == rows else 'MISMATCH'}"
+                print(
+                    f"      confusion: TP={conf.get('tp', '-')} FP={conf.get('fp', '-')} "
+                    f"FN={conf.get('fn', '-')} TN={conf.get('tn', '-')} "
+                    f"unparse(Yes)={conf.get('unparseable_pos', '-')} "
+                    f"unparse(No)={conf.get('unparseable_neg', '-')}{recon}"
+                )
+            if isinstance(q.get("n_truncated"), int) and q["n_truncated"] > 0:
+                print(
+                    f"      NOTE: {q['n_truncated']} repl{'y' if q['n_truncated'] == 1 else 'ies'} "
+                    f"hit the token budget — treat this run as an integration issue, "
+                    f"not model quality."
+                )
 
     print(f"\n{sep}\n")
 
@@ -556,9 +839,30 @@ def main() -> None:
         "--date",
         default=None,
         help=(
-            "Only include results whose 'started_at' OR S3 run-folder timestamp "
-            "falls on this date. Pass 'today' for the current UTC date, or an explicit "
-            "'YYYY-MM-DD' value (e.g. 2026-09-15). Omit to include all dates."
+            "Include one exact date based on started_at or S3 run-folder timestamp. "
+            "Use 'today' (UTC) or YYYY-MM-DD. Cannot be combined with date-range options."
+        ),
+    )
+    parser.add_argument(
+        "--from-date",
+        default=None,
+        help=(
+            "Inclusive range start: 'today' or YYYY-MM-DD. If --to-date is omitted, "
+            "the range ends today (UTC)."
+        ),
+    )
+    parser.add_argument(
+        "--to-date",
+        default=None,
+        help="Inclusive range end: 'today' or YYYY-MM-DD.",
+    )
+    parser.add_argument(
+        "--max-sample-rows",
+        type=int,
+        default=2000,
+        help=(
+            "Cap on rows written to the Quality Samples sheet (default 2000). "
+            "Samples exist only for runs launched with --dump-samples."
         ),
     )
     parser.add_argument(
@@ -581,29 +885,42 @@ def main() -> None:
 
     perf_results = load_results_local(results_path)
     qual_results = load_quality_results(results_path)
+    sample_results = load_quality_samples(results_path)
 
     if args.fix_instance_labels:
         n = fix_instance_labels(perf_results) + fix_instance_labels(qual_results)
         print(f"[FIX] Corrected {n} mislabeled row(s) (instance_type + cost) from S3 folder family.")
 
-    date_filter = resolve_date_filter(args.date)
-    if date_filter:
+    from_date, to_date = resolve_date_range(args.date, args.from_date, args.to_date)
+    if from_date or to_date:
         before_perf, before_qual = len(perf_results), len(qual_results)
-        perf_results = filter_by_date(perf_results, date_filter)
-        qual_results = filter_by_date(qual_results, date_filter)
+        before_samples = len(sample_results)
+        perf_results = filter_by_date_range(perf_results, from_date, to_date)
+        qual_results = filter_by_date_range(qual_results, from_date, to_date)
+        # Sample rows have no started_at of their own, so they are matched on the
+        # S3 run-folder date by the same range filter.
+        sample_results = filter_by_date_range(sample_results, from_date, to_date)
+        label = from_date if from_date == to_date else f"{from_date or 'earliest'} through {to_date or 'latest'}"
         print(
-            f"[FILTER] Date = {date_filter}: "
+            f"[FILTER] Date = {label} (inclusive): "
             f"perf runs {before_perf} -> {len(perf_results)}, "
-            f"quality runs {before_qual} -> {len(qual_results)}"
+            f"quality runs {before_qual} -> {len(qual_results)}, "
+            f"quality samples {before_samples} -> {len(sample_results)}"
         )
 
-    print_comparison_table(perf_results, qual_results)
+    print_comparison_table(perf_results, qual_results, sample_results)
 
     if args.export_csv and perf_results:
         export_csv(perf_results, Path(args.export_csv))
 
     if args.export_excel:
-        export_excel(perf_results, qual_results, Path(args.export_excel))
+        export_excel(
+            perf_results,
+            qual_results,
+            Path(args.export_excel),
+            sample_results=sample_results,
+            max_sample_rows=args.max_sample_rows,
+        )
 
 
 if __name__ == "__main__":

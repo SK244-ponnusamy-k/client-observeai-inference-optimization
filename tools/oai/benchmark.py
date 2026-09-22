@@ -49,12 +49,10 @@ def _selected_profiles(spec: ModelSpec, profile: str | None, skip_batch: bool) -
 
 
 def _profile_arg(profiles: list[str]) -> str:
-    """
-    Collapse the selected profiles into run-benchmark.sh's --profile value.
+    """Collapse selected profiles into run-benchmark.sh's --profile value.
 
-    When both realtime and batch are selected we pass 'both', which runs them in
-    ONE Job/container (image pulled once, profiles run back-to-back) rather than
-    two separate jobs.
+    ``both`` submits two separate Jobs. The batch Job waits for realtime's S3
+    completion marker, so the profiles execute sequentially against one server.
     """
     has_rt = "realtime" in profiles
     has_batch = "batch" in profiles
@@ -63,6 +61,17 @@ def _profile_arg(profiles: list[str]) -> str:
     if has_batch:
         return "batch"
     return "realtime"
+
+
+def selected_profiles(spec: ModelSpec, profile: str | None, skip_batch: bool) -> list[str]:
+    """Public normalized profile order used by deploy pipeline orchestration."""
+    return _selected_profiles(spec, profile, skip_batch)
+
+
+def completion_profile(spec: ModelSpec, profile: str | None, skip_batch: bool) -> str:
+    """Profile whose completion marker represents the end of performance work."""
+    profiles = selected_profiles(spec, profile, skip_batch)
+    return "batch" if "batch" in profiles else "realtime"
 
 
 def _manifest_hw(spec: ModelSpec, hw_override: str | None = None) -> str:
@@ -89,6 +98,8 @@ def run(
     tag: str | None = None,
     hw: str | None = None,
     manifest: str | None = None,
+    run_timestamp: str | None = None,
+    detach: bool = False,
 ) -> int:
     spec = catalog.load(model_id)
 
@@ -149,7 +160,7 @@ def run(
 
     ui.banner(f"Benchmark: {spec.id}{f'  (tag={tag})' if tag else ''}")
     ui.kv("Manifest", manifest_rel)
-    ui.kv("Profiles", f"{', '.join(profiles)}  (single job/container)" if profile_arg == "both" else profile_arg)
+    ui.kv("Profiles", f"{', '.join(profiles)}  (separate sequential Jobs)" if profile_arg == "both" else profile_arg)
     ui.kv("Dataset", ds or "built-in random (no PII)")
 
     args = ["--model", spec.id, "--profile", profile_arg, "--hw", hw_family, "--manifest", manifest_rel]
@@ -157,6 +168,10 @@ def run(
         # Pass the real deployed instance so cost/instance_type resolve dynamically
         # from the EC2 price book — no per-instance manifest edits needed.
         args += ["--instance", full_instance]
+    if run_timestamp:
+        args += ["--run-timestamp", run_timestamp]
+    if detach:
+        args += ["--detach"]
     if ds:
         args += ["--dataset", ds]
     if tag and svc:
@@ -170,5 +185,8 @@ def run(
         ui.hint("Check the log above and the S3 results path it printed.")
         return rc
 
-    ui.info("Benchmark complete. Results are in the results bucket (path shown above).")
+    if detach:
+        ui.info("Performance Jobs submitted in-cluster. They continue independently of this terminal.")
+    else:
+        ui.info("Benchmark complete. Results are in the results bucket (path shown above).")
     return 0

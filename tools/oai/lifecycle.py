@@ -8,6 +8,8 @@ of kubectl/aws/bash invocations. Every failure path explains the next step.
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
+
 from . import catalog, config, generate, instances, paths, shell, ui
 from .catalog import ModelSpec
 
@@ -92,10 +94,16 @@ def deploy(
     managed_ng: bool = False,
     validate: bool = False,
     do_benchmark: bool = False,
+    do_quality: bool = False,
     profile: str | None = None,
     skip_instance_check: bool = False,
     tag: str | None = None,
     manifest: str | None = None,
+    quality_config: str | None = None,
+    quality_dataset_key: str | None = None,
+    dump_samples: bool = False,
+    max_dump_samples: int = 200,
+    dump_inputs: bool = False,
 ) -> int:
     spec = catalog.load(model_id)
 
@@ -176,20 +184,81 @@ def deploy(
 
     ui.info(f"'{spec.id}' deployed on {chosen}{f' (tag={tag})' if tag else ''}.")
 
-    # ---- Optional benchmark --------------------------------------------------
-    if do_benchmark or spec.benchmark.auto:
+    # ---- Optional performance + quality pipeline ----------------------------
+    want_benchmark = do_benchmark or spec.benchmark.auto
+    if not want_benchmark and not do_quality:
+        ui.hint(
+            f"To evaluate: oai benchmark {spec.id} and/or oai quality {spec.id} "
+            "(or add --benchmark / --quality to deploy)"
+        )
+        return 0
+
+    # One timestamp groups realtime, batch, and quality. It also makes the exact
+    # marker key deterministic before any Job is submitted.
+    run_timestamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    ui.kv("Run group", run_timestamp)
+
+    bench_mod = None
+    if want_benchmark:
         from . import benchmark as bench_mod
 
-        ui.banner(f"Auto-benchmark: {spec.id}")
-        # Pass the instance we actually deployed on ('chosen') so the benchmark
-        # reads the matching manifest cell (e.g. g7e) and records the correct
-        # instance_type + cost instead of the catalog's default instance.
-        return bench_mod.run(
-            model_id, profile=profile, skip_batch=spec.benchmark.skip_batch, tag=tag, hw=chosen,
-            manifest=manifest,
+    if want_benchmark and do_quality and bench_mod is not None:
+        stages = [
+            *bench_mod.selected_profiles(spec, profile, spec.benchmark.skip_batch),
+            "quality",
+        ]
+        ui.info(
+            f"Submitting an asynchronous pipeline: {' -> '.join(stages)}. "
+            "The command returns after all Jobs are created; use the printed run group to monitor it."
         )
-    else:
-        ui.hint(f"To benchmark: oai benchmark {spec.id}   (or add --benchmark to deploy)")
+
+    if want_benchmark and bench_mod is not None:
+
+        ui.banner(f"Auto-benchmark: {spec.id}")
+        rc = bench_mod.run(
+            model_id,
+            profile=profile,
+            skip_batch=spec.benchmark.skip_batch,
+            tag=tag,
+            hw=chosen,
+            manifest=manifest,
+            run_timestamp=run_timestamp,
+            # When quality follows, return immediately after submitting both
+            # performance Jobs so the quality Job can also be submitted up front.
+            detach=do_quality,
+        )
+        if rc != 0:
+            return rc
+
+    if do_quality:
+        from . import benchmark as bench_mod
+        from . import quality as quality_mod
+
+        wait_for_marker = None
+        if want_benchmark:
+            last_profile = bench_mod.completion_profile(spec, profile, spec.benchmark.skip_batch)
+            tag_segment = f"{tag}/" if tag else ""
+            wait_for_marker = (
+                f"results/{run_timestamp}/{tag_segment}_markers/{spec.id}/{last_profile}.done"
+            )
+
+        ui.banner(f"Auto-quality: {spec.id}")
+        return quality_mod.run(
+            model_id,
+            tag=tag,
+            hw=chosen,
+            config=quality_config,
+            dataset_key=quality_dataset_key,
+            dump_samples=dump_samples,
+            max_dump_samples=max_dump_samples,
+            dump_inputs=dump_inputs,
+            run_timestamp=run_timestamp,
+            wait_for_marker=wait_for_marker,
+            # Combined pipeline must survive terminal closure; all three Jobs
+            # have already been submitted and ordering is enforced in-cluster.
+            detach=want_benchmark,
+        )
+
     return 0
 
 

@@ -36,7 +36,7 @@ log_error() { echo -e "${RED}[ERROR] $(date +'%H:%M:%S')${NC} $1"; }
 
 # Defaults
 MODEL="gpt-oss-20b"
-PROFILE="both"           # realtime | batch | both — 'both' runs the two profiles in ONE job/container
+PROFILE="both"           # realtime | batch | both — 'both' submits two sequential Jobs
 HW="g6e"                 # matrix cell suffix: g5 | g6 | g6e
 MANIFEST_OVERRIDE=""     # optional explicit manifest path
 DATASET_OVERRIDE=""      # optional explicit dataset path / S3 key
@@ -44,6 +44,8 @@ IMAGE_OVERRIDE=""        # optional explicit benchmark runner image
 SVC_OVERRIDE=""          # optional explicit vLLM service name (for --tag parallel deploys)
 TAG=""                   # optional deploy tag — isolates the S3 results subfolder
 INSTANCE_TYPE=""         # optional FULL instance type (e.g. g7e.24xlarge) for dynamic cost/label
+RUN_TIMESTAMP=""         # optional shared YYYYMMDD-HHMMSS run group from deploy orchestration
+DETACH="false"           # submit all Jobs and return without tailing logs
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -56,6 +58,8 @@ while [[ $# -gt 0 ]]; do
         --svc)      SVC_OVERRIDE="$2";      shift 2 ;;
         --tag)      TAG="$2";               shift 2 ;;
         --instance) INSTANCE_TYPE="$2";     shift 2 ;;
+        --run-timestamp) RUN_TIMESTAMP="$2"; shift 2 ;;
+        --detach)   DETACH="true";          shift ;;
         *) log_error "Unknown: $1"; exit 1 ;;
     esac
 done
@@ -65,6 +69,10 @@ done
 # and resolves its cost from the EC2 price book dynamically — no per-instance
 # manifest edits. Falls back to the manifest's serving.instance_type when unset.
 : "${INSTANCE_TYPE:=}"
+if [[ -n "${RUN_TIMESTAMP}" && ! "${RUN_TIMESTAMP}" =~ ^[0-9]{8}-[0-9]{6}$ ]]; then
+    log_error "--run-timestamp must use YYYYMMDD-HHMMSS (got '${RUN_TIMESTAMP}')."
+    exit 1
+fi
 
 BENCHMARK_RUNNER_IMAGE="${IMAGE_OVERRIDE:-${BENCHMARK_IMAGE:-$VLLM_IMAGE}}"
 
@@ -134,7 +142,7 @@ for P in "${PROFILE_LIST[@]}"; do
 done
 
 ENDPOINT="http://${SVC}:8000"
-TIMESTAMP=$(date +%Y%m%d-%H%M%S)
+TIMESTAMP="${RUN_TIMESTAMP:-$(date +%Y%m%d-%H%M%S)}"
 
 # Optional tag isolates parallel runs of the SAME model on different instances.
 # It is folded into the Job name (unique k8s object) and the S3 result key
@@ -152,11 +160,11 @@ S3_TAG_SEG=""
 if [[ -n "${TAG}" ]]; then
     S3_TAG_SEG="${TAG}/"
 fi
-# In-cluster ordering gate (no k8s RBAC needed): the realtime Job writes this
-# marker to S3 when it finishes; the batch Job's init container blocks until the
-# marker appears, so batch only starts loading the GPU AFTER realtime is done.
-# Both Jobs are submitted up front, so closing the terminal / Ctrl+C is safe.
-S3_MARKER_KEY="results/${TIMESTAMP}/${S3_TAG_SEG}_markers/realtime.done"
+# Completion markers share a stable prefix. Batch waits for realtime.done; a
+# deploy-triggered quality Job waits for the final selected profile marker.
+S3_MARKER_PREFIX="results/${TIMESTAMP}/${S3_TAG_SEG}_markers/${MODEL_ID_DASHED}"
+REALTIME_MARKER_KEY="${S3_MARKER_PREFIX}/realtime.done"
+BATCH_MARKER_KEY="${S3_MARKER_PREFIX}/batch.done"
 
 # Per-profile hard caps. Batch (high-concurrency sweep, up to 10k prompts) is the
 # long pole, so it gets a bigger deadline than the latency-bound realtime run.
@@ -261,6 +269,11 @@ submit_profile_job() {
         DEADLINE_S="${BATCH_DEADLINE}"
         # Only gate batch on realtime when realtime is actually part of this run.
         for _p in "${PROFILE_LIST[@]}"; do [[ "${_p}" == "realtime" ]] && GATE_ON_REALTIME="true"; done
+        if [[ "${GATE_ON_REALTIME}" == "true" ]]; then
+            # activeDeadlineSeconds includes init-container time. Preserve the
+            # full batch budget after up to REALTIME_DEADLINE+600s of waiting.
+            DEADLINE_S=$((BATCH_DEADLINE + REALTIME_DEADLINE + 600))
+        fi
     else
         DEADLINE_S="${REALTIME_DEADLINE}"
     fi
@@ -281,18 +294,35 @@ submit_profile_job() {
               export PYTHONPATH="/tmp/pip-packages:\${PYTHONPATH:-}"
               python3 -c "import boto3" 2>/dev/null || \\
                 pip install --quiet --no-cache-dir --target=/tmp/pip-packages boto3==1.34.0 || true
-              echo "Gate: waiting for realtime completion marker s3://${RESULTS_BUCKET}/${S3_MARKER_KEY}"
+              echo "Gate: waiting for realtime completion marker s3://${RESULTS_BUCKET}/${REALTIME_MARKER_KEY}"
               python3 -c "
-              import boto3, os, sys, time
+              import boto3, sys, time
+              from botocore.exceptions import ClientError
               s3 = boto3.client('s3', region_name='${AWS_REGION}')
               deadline = time.time() + ${REALTIME_DEADLINE} + 600
               while time.time() < deadline:
                   try:
-                      s3.head_object(Bucket='${RESULTS_BUCKET}', Key='${S3_MARKER_KEY}')
-                      print('Realtime marker found — starting batch.'); sys.exit(0)
-                  except Exception:
+                      obj = s3.get_object(Bucket='${RESULTS_BUCKET}', Key='${REALTIME_MARKER_KEY}')
+                      exit_code = obj['Body'].read().decode().strip()
+                      if exit_code != '0':
+                          print('Realtime stage failed (exit=' + exit_code + '); batch will NOT start.')
+                          s3.put_object(
+                              Bucket='${RESULTS_BUCKET}', Key='${BATCH_MARKER_KEY}',
+                              Body=exit_code.encode(),
+                          )
+                          print('Published failed batch marker for downstream quality gate.')
+                          sys.exit(1)
+                      print('Realtime marker found (success) — starting batch.'); sys.exit(0)
+                  except ClientError as exc:
+                      code = str(exc.response.get('Error', {}).get('Code', ''))
+                      if code not in ('404', 'NoSuchKey', 'NotFound'):
+                          raise
                       print('...realtime not done yet; sleeping 20s'); time.sleep(20)
-              print('Gate timed out waiting for realtime — starting batch anyway.'); sys.exit(0)
+              print('Gate timed out waiting for realtime; batch will NOT start.')
+              s3.put_object(
+                  Bucket='${RESULTS_BUCKET}', Key='${BATCH_MARKER_KEY}', Body=b'124'
+              )
+              sys.exit(1)
               "
           env:
             - name: AWS_DEFAULT_REGION
@@ -324,21 +354,23 @@ INITEOF
     fi
 
     # --- main container: run load-test for THIS profile, upload, mark done ------
-    # realtime writes the S3 marker after a successful (or SLO-only) run so the
-    # gated batch Job can proceed. batch writes no marker.
-    local MARK_STEP=""
-    if [[ "${P}" == "realtime" ]]; then
-        MARK_STEP=$(cat <<MARKEOF
-              echo "=== Writing realtime completion marker ==="
-              python3 -c "
-              import boto3
+    # Every profile writes its completion marker after its final upload attempt.
+    # Markers mean "stage finished" (the result JSONL retains passed/failed_slo/error).
+    # This allows the next in-cluster stage to start without depending on this shell.
+    local PROFILE_MARKER_KEY="${REALTIME_MARKER_KEY}"
+    [[ "${P}" == "batch" ]] && PROFILE_MARKER_KEY="${BATCH_MARKER_KEY}"
+    local MARK_STEP
+    MARK_STEP=$(cat <<MARKEOF
+              echo "=== Writing ${P} completion marker ==="
+              MARKER_STATUS="\${TEST_EXIT}" python3 -c "
+              import boto3, os
+              status = os.environ['MARKER_STATUS']
               s3 = boto3.client('s3', region_name='${AWS_REGION}')
-              s3.put_object(Bucket='${RESULTS_BUCKET}', Key='${S3_MARKER_KEY}', Body=b'done')
-              print('Marker written: s3://${RESULTS_BUCKET}/${S3_MARKER_KEY}')
-              " || echo "WARN: failed to write realtime marker (batch gate will time out and proceed)"
+              s3.put_object(Bucket='${RESULTS_BUCKET}', Key='${PROFILE_MARKER_KEY}', Body=status.encode())
+              print('Marker written: s3://${RESULTS_BUCKET}/${PROFILE_MARKER_KEY} (exit=' + status + ')')
+              " || echo "WARN: failed to write ${P} completion marker"
 MARKEOF
 )
-    fi
 
     log_info "Submitting ${P} Job: ${JOB_NAME} (deadline ${DEADLINE_S}s, gate=${GATE_ON_REALTIME})..."
 
@@ -534,6 +566,11 @@ echo "    aws s3 cp s3://${RESULTS_BUCKET}/results/${TIMESTAMP}/ results/ --recu
 echo ""
 echo "  Grafana  : kubectl port-forward svc/kube-prometheus-stack-grafana 3000:80 -n monitoring"
 echo ""
+
+if [[ "${DETACH}" == "true" ]]; then
+    log_info "Detached. All performance Jobs continue in-cluster."
+    exit 0
+fi
 
 # Optional best-effort log tail of the FIRST (realtime) Job so an attended run
 # still sees live output. Detaching here (Ctrl+C) leaves all Jobs running.
