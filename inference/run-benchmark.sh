@@ -470,6 +470,13 @@ ${MARK_STEP}
               value: "${RESULTS_BUCKET}"
             - name: DCGM_METRICS_URL
               value: "http://dcgm-exporter.monitoring.svc.cluster.local:9400/metrics"
+            # Scope DCGM GPU telemetry to the vLLM pod under test. The DCGM Service
+            # load-balances across GPU nodes; without this, rows mix other nodes' GPUs.
+            # Deployment name == Service name (oai-infopt-vllm-<id>[-<tag>]).
+            - name: OAI_VLLM_DEPLOYMENT
+              value: "${SVC}"
+            - name: OAI_VLLM_NAMESPACE
+              value: "${BENCHMARK_NAMESPACE}"
             # Full deployed instance type (e.g. g7e.24xlarge). load-test.py records
             # this and looks up its $/hr from the EC2 price book — dynamic cost,
             # no per-instance manifest edits. Empty → falls back to the manifest.

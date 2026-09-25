@@ -131,3 +131,71 @@ Applied the official gpt-oss recipe to `vllm/models/gpt-oss-20b/deployment.yaml`
 - L40S/Ada is **not** gpt-oss's optimal-kernel tier (FlashInfer MXFP4 is Hopper/Blackwell);
   vLLM falls back to the Triton/Marlin path here → lower throughput than H100 recipe
   figures. Expected, documented — not a bug.
+
+---
+
+## [Unreleased] — 2026-09-25 — Optimization round 2: trustworthy telemetry + Gemma-4-31B KV/batch tuning
+
+Follow-up to the 24-Sep weekly sweep (gpt-oss-20b / Qwen3.5-4B / Gemma-4-31B ×
+g5 / g6 / g6e / g7e). Before tuning further we had to fix the harness: two of the
+columns on the result sheet were not measuring what they claimed.
+
+### Fixed — benchmark telemetry (`inference/load-test.py`)
+- **KV-cache usage read 0 % on every row.** `/metrics` was scraped once *after*
+  `vllm bench serve` returned — by then the queue has drained and the KV cache is
+  empty. A new `_TelemetrySampler` polls vLLM `/metrics` and DCGM every 2 s **while
+  the level runs** and records the peak (`kv_cache_utilization_pct`) and mean
+  (`kv_cache_utilization_mean_pct`) KV usage, and the peak waiting-queue depth.
+- **Impossible GPU util / memory (e.g. 400 %, 164 GB on a single 24 GB L4).** The
+  in-cluster `dcgm-exporter` Service load-balances across one exporter pod *per GPU
+  node*, and the harness summed every GPU on whichever node answered. GPU samples are
+  now **scoped to the vLLM pod under test** via DCGM's `pod`/`namespace`/`container`
+  labels (exact `<deployment>-<rs>-<pod>` match, so a tagged parallel deploy is not
+  mixed in); scrapes that land on another node are discarded. Across a pod's GPUs:
+  util = mean, memory = sum, power = sum. Over the run: util/power = mean, memory = peak.
+  If no sample matched, the GPU fields are `null` (with a warning), never a wrong number.
+- Removed `vllm:gpu_memory_utilization` from the KV-usage aliases — it is the static
+  `--gpu-memory-utilization` setting, not KV usage. `vllm:kv_cache_usage_perc` (V1) is
+  now tried first.
+- `energy_per_1m_tokens_wh` now uses **mean in-run power** instead of one post-run
+  (idle) reading.
+
+### Added
+- Result rows gain `kv_cache_utilization_mean_pct`, `telemetry_samples` and
+  `gpu_telemetry_samples` (0 ⇒ GPU columns are null, not measured). Additive — existing
+  consumers are unaffected.
+- `OAI_VLLM_DEPLOYMENT` / `OAI_VLLM_NAMESPACE` env on the benchmark Job
+  (`inference/run-benchmark.sh` sets them from the resolved Service name;
+  `inference/benchmark-job.yaml` derives them from `MODEL_NAME`).
+- **`tests/test_telemetry.py`** — stdlib `unittest` regression tests with fake vLLM /
+  DCGM endpoints covering both bugs (`python -m unittest discover -s tests`).
+- **`catalog/models/gemma-4-31b-opt2.yaml`** + generated files
+  (`vllm/models/gemma-4-31b-opt2/`, `configs/manifests/gemma-4-31b-opt2-gpu.yaml`,
+  `model-download/gemma-4-31b-opt2/`) — an A/B **candidate**, deployed side-by-side with
+  the baseline under its own names and sharing the same S3 weights (no re-download).
+
+  | Knob | Baseline | opt2 | Why (from the 24-Sep data) |
+  |---|---|---|---|
+  | `--gpu-memory-utilization` | 0.85 | **0.92** | g5.12xlarge: throughput flat at ~130 tok/s from C=16→64 with constant ITL while TTFT climbs 24 s→208 s — the running batch can't grow. After ~15.8 GB/GPU of weights, 0.85 leaves only ~2–3 GB KV per 24 GB GPU; 0.92 gives ~1.7× the KV blocks. |
+  | `--max-num-seqs` | 128 | **256** | g6e.12xlarge: 484 tok/s at both C=128 and C=256 (SLO ≥ 500) with TTFT p95 173 s at C=256 — half the requests queue behind a 128-seq cap while ~100 GB of KV is free. |
+  | prefix caching | on | **off** | Same policy as gpt-oss/Qwen so rows are comparable (random dataset ⇒ ~0 hits). |
+
+### Findings recorded (no config change)
+- **gpt-oss-20b on g5.2xlarge / g6.2xlarge cannot meet the batch SLO (≥ 500 tok/s)
+  by tuning.** Throughput plateaus at ~297 / ~229 tok/s from C=128 up — a
+  memory-bandwidth ceiling of A10G / L4 on the Marlin/Triton MXFP4 fallback path, not
+  a scheduler limit. g6e.2xlarge (≥ C=64) and g7e.2xlarge (≥ C=32) pass; recommend
+  g6e/g7e for gpt-oss batch and keep g5/g6 for realtime only (they pass realtime).
+- Historic GPU Util / GPU Mem / KV Cache columns in the 24-Sep sheet are **not valid**
+  and should be re-collected with this harness; latency, throughput and cost columns
+  come from `vllm bench serve` and are unaffected.
+
+### Not yet done / next
+- **opt2 is untested** — run it on g6e.12xlarge and g5.12xlarge
+  (`oai deploy gemma-4-31b-opt2 --hw g6e.12xlarge --benchmark`), compare with
+  `gemma-4-31b`, and fold the winning knobs back into `gemma-4-31b.yaml`.
+- Separate A/Bs, deliberately left out of opt2 so each effect is attributable:
+  `--kv-cache-dtype fp8` on g6e/g7e only (Ampere/g5 has no FP8), and
+  `--async-scheduling` for Gemma4 at TP=4.
+- `prefix_cache_hit_rate` is still a cumulative counter ratio since server start,
+  not a per-level delta.
