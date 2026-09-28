@@ -124,6 +124,9 @@ def _cmd_deploy(args: argparse.Namespace) -> int:
         manifest=args.manifest,
         quality_config=args.quality_config,
         quality_dataset_key=args.quality_dataset_key,
+        quality_dataset_file=args.quality_dataset_file,
+        quality_force_stage=args.quality_force_stage,
+        quality_sheets=args.quality_sheet,
         dump_samples=args.dump_samples,
         max_dump_samples=args.max_dump_samples,
         dump_inputs=args.dump_inputs,
@@ -153,6 +156,9 @@ def _cmd_quality(args: argparse.Namespace) -> int:
         quant=args.quant,
         config=args.config,
         dataset_key=args.dataset_key,
+        dataset_file=args.dataset_file,
+        force_stage=args.force_stage,
+        sheets=args.sheet,
         service=args.svc,
         served_name=args.served_name,
         dump_samples=args.dump_samples,
@@ -234,8 +240,21 @@ def _build_parser() -> argparse.ArgumentParser:
     dp.add_argument("--quality", action="store_true", help="run AutoQA quality after deploy; with --benchmark it runs third")
     dp.add_argument("--profile", help="only run this performance profile (e.g. realtime_v1)")
     dp.add_argument("--manifest", help="explicit benchmark manifest (e.g. a Neuron manifest) passed to the auto-benchmark")
-    dp.add_argument("--quality-config", help="quality config path (default: configs/quality/autoqa_v1.yaml)")
-    dp.add_argument("--quality-dataset-key", help="quality dataset key in the results bucket")
+    dp.add_argument("--quality-config", help="quality config path; only valid with a single --quality-sheet")
+    dp.add_argument("--quality-dataset-key", help="quality dataset key in the results bucket; only with a single --quality-sheet")
+    dp.add_argument(
+        "--quality-dataset-file",
+        help="local quality dataset workbook (.xlsx); auto-uploaded to S3 on first use and reused afterwards",
+    )
+    dp.add_argument(
+        "--quality-force-stage", action="store_true",
+        help="re-upload --quality-dataset-file even if it already exists in S3",
+    )
+    dp.add_argument(
+        "--quality-sheet", action="append",
+        help="which quality sheet(s) to score after deploy: 'org', 'xl', or a worksheet name. "
+             "Repeatable. Default: both.",
+    )
     dp.add_argument("--dump-samples", action="store_true", help="save capped quality answers + reasoning per row")
     dp.add_argument("--max-dump-samples", type=int, default=200, help="quality sample rows to save (default 200)")
     dp.add_argument("--dump-inputs", action="store_true",
@@ -305,8 +324,21 @@ def _build_parser() -> argparse.ArgumentParser:
     ql.add_argument("--hw", help="hardware/instance label for the quality result (e.g. g5.2xlarge)")
     ql.add_argument("--quant", help="quantization result label (defaults to catalog value)")
     ql.add_argument("--tag", help="quality-check a tagged deployment (matches deploy --tag)")
-    ql.add_argument("--config", help="quality config path (default: configs/quality/autoqa_v1.yaml)")
-    ql.add_argument("--dataset-key", help="dataset key in the results bucket")
+    ql.add_argument("--config", help="quality config path; only with a single --sheet (else per-sheet default is used)")
+    ql.add_argument("--dataset-key", help="dataset key in the results bucket; only with a single --sheet")
+    ql.add_argument(
+        "--dataset-file",
+        help="local dataset workbook (.xlsx); auto-uploaded to S3 on first use and reused afterwards",
+    )
+    ql.add_argument(
+        "--force-stage", action="store_true",
+        help="re-upload the --dataset-file even if it already exists in S3 (use after editing the workbook)",
+    )
+    ql.add_argument(
+        "--sheet", action="append",
+        help="which sheet to score: 'org' (Test-ORG) or 'xl' (Test-XL), or the exact worksheet name. "
+             "Repeatable. Default: run both. Each sheet runs as its own Job with separate results.",
+    )
     ql.add_argument("--svc", help="explicit Kubernetes Service name override")
     ql.add_argument("--served-name", help="explicit vLLM served-model-name override")
     ql.add_argument("--dump-samples", action="store_true", help="save capped per-row rubric question, answer and reasoning")

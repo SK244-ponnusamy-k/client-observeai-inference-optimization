@@ -19,9 +19,25 @@ task_type: binary_classification
 dataset:
   version: autoqa_v1
   format: csv                 # csv | jsonl
-  text_field: input_prompt    # the ready-made prompt column
+  text_field: input_prompt    # the ready-made prompt column sent to the model
   label_field: answer         # ground-truth column (Yes/No)
-  question_field: question    # used for per-criterion F1 breakdown
+  question_field: question    # full rubric question (fallback grouping key)
+  # Stable question id column. When present, per-question metrics are grouped by
+  # this QID instead of the (rewordable) question text, so the Test-ORG and
+  # Test-XL breakdowns line up. Falls back to question_field if the column is
+  # missing.
+  question_id_field: question_id
+  # --- Multi-sheet .xlsx source (Test-ORG / Test-XL) -------------------------
+  # The prompt is the prebuilt input_prompt column verbatim (transcript +
+  # question are already rolled into it by the dataset author). No transcript
+  # assembly and no QIDs-sheet lookup for scoring: transcript_field is left EMPTY
+  # so the loader uses input_prompt directly. The QIDs sheet, if present, is only
+  # used to enrich the report's per-question label with the full question text.
+  transcript_field: ""                  # empty -> use input_prompt as-is
+  sheet: synthetic_autoqa_transcripts   # Test-ORG worksheet (overridden by --sheet)
+  qid_sheet: QIDs                       # worksheet holding QID -> question text (report labels)
+  qid_id_column: "Question Id"          # QID column header in the QIDs sheet
+  qid_text_column: "Question Text"      # question-text column header in the QIDs sheet
 
 labels: ["Yes", "No"]
 positive_label: "Yes"

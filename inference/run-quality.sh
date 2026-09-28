@@ -38,6 +38,9 @@ QUANT="unknown"
 CONFIG="configs/quality/autoqa_v1.yaml"
 DATASET_S3_KEY="quality-datasets/autoqa_v1.csv"
 STAGE_FILE=""
+DATASET_FILE=""                        # local dataset path; auto-staged to S3 if the key is missing
+FORCE_STAGE="false"                    # re-upload even when the S3 key already exists
+SHEET=""                               # xlsx worksheet to score (Test-ORG / Test-XL); empty = first/default
 SVC_OVERRIDE=""
 TAG=""
 RUN_TIMESTAMP=""
@@ -64,6 +67,9 @@ while [[ $# -gt 0 ]]; do
         --dump-inputs)      DUMP_INPUTS="true"; shift ;;
         --detach)           DETACH="true"; shift ;;
         --stage-dataset)    STAGE_FILE="$2"; shift 2 ;;
+        --dataset-file)     DATASET_FILE="$2"; shift 2 ;;
+        --force-stage)      FORCE_STAGE="true"; shift ;;
+        --sheet)            SHEET="$2"; shift 2 ;;
         *) log_error "Unknown: $1"; exit 1 ;;
     esac
 done
@@ -81,6 +87,38 @@ if [[ -n "${STAGE_FILE}" ]]; then
         --sse aws:kms --region "${AWS_REGION}"
     log_info "Dataset staged successfully."
     exit 0
+fi
+
+# Auto-stage-if-missing. When a local dataset file is given, upload it ONCE and
+# reuse it on every later run. The whole workbook (both Test-ORG and Test-XL
+# sheets) is one S3 object; --sheet selects which worksheet to score in-cluster,
+# so the two runs share a single upload.
+#
+# The S3 key defaults to the file's basename under quality-datasets/ unless the
+# caller pinned one with --dataset-key. Existence is checked with head-object:
+#   missing        -> upload (SSE-KMS)
+#   already there  -> skip (reuse), unless --force-stage forces a fresh copy
+#                     (use it after editing the workbook locally).
+if [[ -n "${DATASET_FILE}" ]]; then
+    [[ -f "${DATASET_FILE}" ]] || { log_error "Dataset file not found: ${DATASET_FILE}"; exit 1; }
+    if [[ "${DATASET_S3_KEY}" == "quality-datasets/autoqa_v1.csv" ]]; then
+        # Caller did not pin a key: derive a stable one from the filename.
+        DATASET_S3_KEY="quality-datasets/$(basename "${DATASET_FILE}")"
+    fi
+    if [[ "${FORCE_STAGE}" != "true" ]] && \
+       aws s3api head-object --bucket "${RESULTS_BUCKET}" --key "${DATASET_S3_KEY}" \
+           --region "${AWS_REGION}" >/dev/null 2>&1; then
+        log_info "Dataset already in S3 (s3://${RESULTS_BUCKET}/${DATASET_S3_KEY}) — reusing, no upload."
+    else
+        if [[ "${FORCE_STAGE}" == "true" ]]; then
+            log_info "Re-staging dataset (--force-stage) -> s3://${RESULTS_BUCKET}/${DATASET_S3_KEY} (SSE-KMS)..."
+        else
+            log_info "Dataset not in S3 yet — staging -> s3://${RESULTS_BUCKET}/${DATASET_S3_KEY} (SSE-KMS)..."
+        fi
+        aws s3 cp "${DATASET_FILE}" "s3://${RESULTS_BUCKET}/${DATASET_S3_KEY}" \
+            --sse aws:kms --region "${AWS_REGION}"
+        log_info "Dataset staged."
+    fi
 fi
 
 # Generic convention works for newly onboarded models. Known aliases are kept for
@@ -136,6 +174,17 @@ if [[ "${DUMP_SAMPLES}" == "true" ]]; then
 elif [[ "${DUMP_INPUTS}" == "true" ]]; then
     log_error "--dump-inputs requires --dump-samples."; exit 1
 fi
+# Pass the worksheet selector through to the evaluator (xlsx only; ignored for
+# csv/jsonl). Quoted so a sheet name with spaces survives.
+if [[ -n "${SHEET}" ]]; then
+    QUALITY_EXTRA_ARGS="${QUALITY_EXTRA_ARGS} --sheet '${SHEET}'"
+fi
+
+# Preserve the dataset's file extension in-cluster so the evaluator can detect
+# xlsx vs csv/jsonl from the suffix. Derived from the S3 key.
+DATASET_EXT="${DATASET_S3_KEY##*.}"
+[[ "${DATASET_EXT}" == "${DATASET_S3_KEY}" ]] && DATASET_EXT="csv"   # no extension -> assume csv
+DATASET_LOCAL="/tmp/autoqa.${DATASET_EXT}"
 
 # Optional strict gate. Unlike the historical benchmark gate, this fails closed:
 # quality must never overlap the performance stage it is meant to follow.
@@ -218,6 +267,8 @@ echo "  Quantization : ${QUANT}"
 echo "  Endpoint     : ${ENDPOINT}"
 echo "  Config       : ${CONFIG}"
 echo "  Dataset      : s3://${RESULTS_BUCKET}/${DATASET_S3_KEY}"
+echo "  Local source : ${DATASET_FILE:-<none> (using existing S3 object)}"
+echo "  Sheet        : ${SHEET:-<default/first>}"
 echo "  Tag          : ${TAG:-<none>}"
 echo "  Starts after : ${WAIT_FOR_MARKER:-<immediately>}"
 echo "  Samples      : ${DUMP_SAMPLES} (max ${MAX_DUMP_SAMPLES})"
@@ -305,19 +356,21 @@ ${INIT_CONTAINER}
               set -euo pipefail
               export HOME=/tmp
               export PYTHONPATH="/tmp/pip-packages:\${PYTHONPATH:-}"
-              pip install --quiet --no-cache-dir --target=/tmp/pip-packages boto3==1.34.0 pyyaml==6.0.1
+              # openpyxl is needed to read the .xlsx workbook (multi-sheet dataset);
+              # harmless for csv/jsonl datasets.
+              pip install --quiet --no-cache-dir --target=/tmp/pip-packages boto3==1.34.0 pyyaml==6.0.1 openpyxl==3.1.5
               echo "Downloading dataset from s3://${RESULTS_BUCKET}/${DATASET_S3_KEY} ..."
               python3 -c "
               import boto3
               boto3.client('s3', region_name='${AWS_REGION}').download_file(
-                  '${RESULTS_BUCKET}', '${DATASET_S3_KEY}', '/tmp/autoqa.csv')
+                  '${RESULTS_BUCKET}', '${DATASET_S3_KEY}', '${DATASET_LOCAL}')
               print('dataset ready')
               "
 
               TEST_EXIT=0
               python3 /app/quality-eval.py \
                 --config /configs/quality/config.yaml \
-                --dataset /tmp/autoqa.csv \
+                --dataset ${DATASET_LOCAL} \
                 --endpoint "${ENDPOINT}" \
                 --model "${SERVED_NAME}" \
                 --quantization "${QUANT}" \

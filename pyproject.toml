@@ -1,6 +1,6 @@
 [build-system]
 requires = ["setuptools>=68", "wheel"]
-build-backend = "setuptools.backends.legacy:build"
+build-backend = "setuptools.build_meta"
 
 [project]
 name = "oai-infopt"
@@ -14,7 +14,22 @@ dependencies = [
     "boto3==1.34.0",
     "pydantic==2.7.4",
     "httpx==0.24.1",
+    "openpyxl==3.1.5",
 ]
+
+# Installs the `oai` command. After `pip install -e .` the CLI is on PATH and
+# `oai deploy ...` / `oai quality ...` work directly.
+[project.scripts]
+oai = "oai.cli:main"
+
+# The oai package lives under tools/ (not the repo root), so point setuptools at
+# it explicitly.
+[tool.setuptools]
+package-dir = {"" = "tools"}
+
+[tool.setuptools.packages.find]
+where = ["tools"]
+include = ["oai*"]
 
 [project.optional-dependencies]
 dev = [

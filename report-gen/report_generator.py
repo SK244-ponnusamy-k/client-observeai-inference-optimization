@@ -91,12 +91,38 @@ def load_quality_results(results_dir: Path) -> list[dict[str, Any]]:
                             data["_clean_hw"] = data.get("hardware") or data.get("instance_type") or "-"
                             data["_clean_quant"] = data.get("quantization") or "-"
                             data["_clean_rows"] = int(_v(data, "n_total", "total_rows", "n_scored"))
+                            data["_clean_testset"] = _testset_label(
+                                data.get("dataset_version", ""), data.get("_source_path", "")
+                            )
                             data["_clean_acc"] = _v(data, "accuracy") * (100.0 if _v(data, "accuracy") <= 1.0 else 1.0)
                             data["_clean_f1"] = _v(data, "f1", "f1_score", "macro_f1")
                             rows.append(data)
                     except json.JSONDecodeError:
                         pass
     return rows
+
+
+def _testset_label(dataset_version: str, source_path: str) -> str:
+    """Human label for which sheet a quality run scored: 'Test-ORG' / 'Test-XL'.
+
+    The evaluator stamps dataset_version as '<version>:<sheet>' (e.g.
+    'autoqa_xl:synthetic_autoqa_transcripts-v2'), and the S3 results live under a
+    '/org/' or '/xl/' tag folder. Either source resolves the label; the version
+    is preferred because it is inside the row, and the path is the fallback.
+    """
+    dv = str(dataset_version or "").lower()
+    path = str(source_path or "").replace("\\", "/").lower()
+    # Version-based (most reliable): the config eval_id / sheet suffix.
+    if "autoqa_xl" in dv or "transcripts-v2" in dv:
+        return "Test-XL"
+    if "autoqa_v1" in dv or ("transcripts" in dv and "v2" not in dv):
+        return "Test-ORG"
+    # Path-based fallback: the tag folder in quality/<ts>/<tag>/...
+    if "/xl/" in path:
+        return "Test-XL"
+    if "/org/" in path:
+        return "Test-ORG"
+    return dv.split(":", 1)[-1] if ":" in dv else "-"
 
 
 def _run_label_from_path(path: Path) -> str:
@@ -150,6 +176,9 @@ def load_quality_samples(results_dir: Path) -> list[dict[str, Any]]:
                     continue
                 data["_source_path"] = str(f)
                 data["_run"] = run_label
+                data["_clean_testset"] = _testset_label(
+                    data.get("dataset_version") or data.get("eval_id", ""), str(f)
+                )
                 data["_clean_model"] = data.get("served_model") or fallback_model
                 data["_clean_hw"] = data.get("hardware") or "-"
                 data["_clean_quant"] = data.get("quantization") or "-"
@@ -503,6 +532,7 @@ def export_excel(
     # evaluator's result row (quality-eval.py writes them); nothing is derived here.
     headers_qual = [
         "Model",
+        "Test Set",
         "Instance Type / HW",
         "Quantization",
         "Total Transcripts",
@@ -537,17 +567,18 @@ def export_excel(
     seen_qual = set()
     unique_qual = []
     for q in qual_results:
-        key = (q.get("_clean_model", ""), q.get("_clean_quant", ""), q.get("_clean_hw", ""), q.get("started_at", ""))
+        key = (q.get("_clean_model", ""), q.get("_clean_testset", ""), q.get("_clean_quant", ""), q.get("_clean_hw", ""), q.get("started_at", ""))
         if key not in seen_qual:
             seen_qual.add(key)
             unique_qual.append(q)
 
-    for q in sorted(unique_qual, key=lambda x: (x.get("_clean_model", ""), x.get("_clean_quant", ""))):
+    for q in sorted(unique_qual, key=lambda x: (x.get("_clean_model", ""), x.get("_clean_testset", ""), x.get("_clean_quant", ""))):
         conf = q.get("confusion") or {}
         if not isinstance(conf, dict):
             conf = {}
         ws_qual.append([
             q.get("_clean_model", "gpt-oss-20b"),
+            q.get("_clean_testset", "-"),
             q.get("_clean_hw", "-"),
             q.get("_clean_quant", "-"),
             q.get("_clean_rows", 1200),
@@ -587,10 +618,12 @@ def export_excel(
         ws_samples = wb.create_sheet(title="Quality Samples")
         headers_samples = [
             "Model",
+            "Test Set",
             "Instance Type / HW",
             "Quantization",
             "Run",
             "Data ID",
+            "Question ID",
             "Question (rubric)",
             "Prompt Chars",
             "Expected (gold)",
@@ -628,7 +661,7 @@ def export_excel(
         written = 0
         for s in sorted(
             sample_results,
-            key=lambda x: (x.get("_clean_model", ""), x.get("_run", ""), str(x.get("data_id", ""))),
+            key=lambda x: (x.get("_clean_model", ""), x.get("_clean_testset", ""), x.get("_run", ""), str(x.get("data_id", ""))),
         ):
             if written >= max_sample_rows:
                 break
@@ -639,10 +672,12 @@ def export_excel(
             match_val = s.get("match")
             row_cells = [
                 s.get("_clean_model", "-"),
+                s.get("_clean_testset", "-"),
                 s.get("_clean_hw", "-"),
                 s.get("_clean_quant", "-"),
                 s.get("_run", "-"),
                 s.get("data_id", "-"),
+                s.get("question_id", "-") or "-",
                 str(s.get("question", "") or "-"),
                 s.get("prompt_chars", "-") or "-",
                 s.get("gold", "-"),
