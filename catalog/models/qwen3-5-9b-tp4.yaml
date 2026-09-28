@@ -12,6 +12,8 @@ source:
 serving:
   quantization: none
   max_model_len: 16384
+  extra_args:
+    - "--reasoning-parser=qwen3"   # enable reasoning: split <think> tokens into reasoning_content
 instances:
   candidates:
   - g6.12xlarge
