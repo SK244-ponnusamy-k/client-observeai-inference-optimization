@@ -155,6 +155,25 @@ fi
 # object: <base>-realtime and <base>-batch. They are separate k8s Jobs so a
 # batch failure never discards the completed realtime results (and vice-versa).
 JOB_NAME_BASE="oai-infopt-bench-${MODEL//\./-}${TAG_SEG}-${TIMESTAMP}"
+
+# Kubernetes copies a Job's metadata.name into the auto-injected pod label
+# `batch.kubernetes.io/job-name`, whose VALUE is capped at 63 bytes. A long
+# model id + tag + timestamp + profile suffix can push the Job name past 63,
+# which makes the pod template invalid ("spec.template.labels ... must be no
+# more than 63 bytes"). Keep every Job name <=63 with a stable checksum suffix
+# so realtime/batch stay distinct. Mirrors run-quality.sh's k8s_name().
+k8s_name() {
+    local raw="$1"
+    if [[ ${#raw} -le 63 ]]; then
+        printf '%s' "${raw}"
+        return
+    fi
+    local digest prefix
+    digest=$(printf '%s' "${raw}" | cksum | awk '{print $1}' | cut -c1-8)
+    prefix="${raw:0:54}"
+    prefix="${prefix%-}"
+    printf '%s-%s' "${prefix}" "${digest}"
+}
 # S3 result prefix segment: results/<ts>/<tag>/<profile>/ when tagged, else results/<ts>/<profile>/
 S3_TAG_SEG=""
 if [[ -n "${TAG}" ]]; then
@@ -263,16 +282,13 @@ fi
 # ==============================================================================
 submit_profile_job() {
     local P="$1"
-    local JOB_NAME="${JOB_NAME_BASE}-${P}"
-    # K8s label values are capped at 63 bytes. The Job's metadata.name allows 253
-    # chars, but the pod-template label app.kubernetes.io/name uses the same string
-    # and can overflow for long model ids + tag + timestamp + profile. Truncate the
-    # label value only (the Job/resource names are unchanged).
-    local JOB_LABEL="${JOB_NAME}"
-    if (( ${#JOB_LABEL} > 63 )); then
-        JOB_LABEL="${JOB_LABEL:0:63}"
-        JOB_LABEL="${JOB_LABEL%-}"   # avoid a trailing '-' which is an invalid label char
-    fi
+    # Cap the Job name at 63 bytes: Kubernetes copies metadata.name into the
+    # auto pod label batch.kubernetes.io/job-name (value limit 63). k8s_name()
+    # keeps realtime/batch distinct via a checksum suffix when truncation is needed.
+    local JOB_NAME; JOB_NAME=$(k8s_name "${JOB_NAME_BASE}-${P}")
+    # Short, always-valid value for our own app.kubernetes.io/name label; the
+    # model / profile labels already make pods filterable.
+    local JOB_LABEL="oai-infopt-bench-runner"
     local DEADLINE_S; local GATE_ON_REALTIME="false"
     if [[ "${P}" == "batch" ]]; then
         DEADLINE_S="${BATCH_DEADLINE}"
@@ -547,7 +563,7 @@ EOF
 SUBMITTED_JOBS=()
 for P in "${PROFILE_LIST[@]}"; do
     submit_profile_job "${P}"
-    SUBMITTED_JOBS+=("${JOB_NAME_BASE}-${P}")
+    SUBMITTED_JOBS+=("$(k8s_name "${JOB_NAME_BASE}-${P}")")
 done
 
 # ==============================================================================
