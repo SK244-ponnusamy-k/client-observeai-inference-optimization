@@ -28,12 +28,14 @@ log_error() { echo -e "${RED}[ERROR] $(date +'%H:%M:%S')${NC} $1"; }
 
 VALIDATE="false"
 DEPLOY_TAG=""
+NO_WAIT="false"
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --hw)       NODE_INSTANCE_TYPE="$2"; shift 2 ;;
         --tp)       TP_SIZE="$2"; shift 2 ;;
         --validate) VALIDATE="true"; shift ;;
         --tag)      DEPLOY_TAG="$2"; shift 2 ;;
+        --no-wait)  NO_WAIT="true"; shift ;;
         *) log_warn "Unknown arg: $1"; shift ;;
     esac
 done
@@ -89,6 +91,20 @@ log_info "Applying deployment: ${DEPLOYMENT_NAME} on ${NODE_INSTANCE_TYPE}..."
 export MODEL_BUCKET BENCHMARK_NAMESPACE VLLM_IMAGE
 envsubst '${MODEL_BUCKET} ${BENCHMARK_NAMESPACE} ${VLLM_IMAGE} ${MODEL_FOLDER} ${SERVED_NAME} ${NODE_INSTANCE_TYPE} ${TP_SIZE} ${GPU_COUNT}' \
     < "${SCRIPT_DIR}/deployment.yaml" | sed "${NAME_REWRITE}" | kubectl apply -f -
+
+# --no-wait (detach mode): the Deployment is applied; do NOT block on readiness.
+# The caller (oai deploy --detach) submits the benchmark/quality Jobs right away
+# and those wait for the endpoint in-cluster. Return success immediately so the
+# whole pipeline is server-side and the terminal can be closed.
+if [[ "${NO_WAIT}" == "true" ]]; then
+    echo ""
+    echo "=================================================="
+    echo "  DEPLOY SUBMITTED (no-wait) - qwen3-5-9b-tp1 on ${NODE_INSTANCE_TYPE}"
+    echo "  The model may still be provisioning; Jobs wait for it in-cluster."
+    echo "  Monitor: kubectl get pods -l app=${DEPLOYMENT_NAME} -n ${BENCHMARK_NAMESPACE} -o wide"
+    echo "=================================================="
+    exit 0
+fi
 
 log_info "Waiting for pod (Karpenter provisioning ${NODE_INSTANCE_TYPE} ~2-4 min)..."
 sleep 10

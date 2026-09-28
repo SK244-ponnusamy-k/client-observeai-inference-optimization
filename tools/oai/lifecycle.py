@@ -107,6 +107,8 @@ def deploy(
     dump_samples: bool = False,
     max_dump_samples: int = 200,
     dump_inputs: bool = False,
+    detach: bool = False,
+    auto_stop: bool = False,
 ) -> int:
     spec = catalog.load(model_id)
 
@@ -177,7 +179,18 @@ def deploy(
             ui.step(f"Deploying as an independent tagged copy: tag={tag} (resource names suffixed -{tag}).")
 
     if validate:
-        args += ["--validate"]
+        if detach:
+            ui.warn("--validate is ignored with --detach (nothing waits locally to run the smoke test).")
+        else:
+            args += ["--validate"]
+
+    # --detach: apply the Deployment and return immediately WITHOUT blocking on
+    # readiness, so the whole pipeline can be submitted server-side and the user
+    # can close their terminal. deploy.sh's --no-wait skips the kubectl wait and
+    # exits 0 even though the model may still be provisioning; the benchmark and
+    # quality Jobs each wait for the endpoint in-cluster.
+    if detach and not spec.is_neuron:
+        args += ["--no-wait"]
 
     ui.banner(f"Deploy: {spec.id}  ({chosen}){f'  tag={tag}' if tag else ''}")
     rc = shell.run_bash(script, args)
@@ -185,16 +198,32 @@ def deploy(
         _explain_deploy_failure(spec, chosen)
         return rc
 
-    ui.info(f"'{spec.id}' deployed on {chosen}{f' (tag={tag})' if tag else ''}.")
+    if detach:
+        ui.info(
+            f"'{spec.id}' submitted on {chosen}{f' (tag={tag})' if tag else ''}. "
+            "The model may still be provisioning; Jobs will wait for it in-cluster."
+        )
+    else:
+        ui.info(f"'{spec.id}' deployed on {chosen}{f' (tag={tag})' if tag else ''}.")
 
     # ---- Optional performance + quality pipeline ----------------------------
     want_benchmark = do_benchmark or spec.benchmark.auto
     if not want_benchmark and not do_quality:
+        if auto_stop:
+            ui.warn(
+                "--auto-stop has no pipeline to wait for (no --benchmark/--quality). "
+                "Skipping auto-stop; the model stays up. Stop it with "
+                f"'oai stop {spec.id}{f' --tag {tag}' if tag else ''}'."
+            )
         ui.hint(
             f"To evaluate: oai benchmark {spec.id} and/or oai quality {spec.id} "
             "(or add --benchmark / --quality to deploy)"
         )
         return 0
+
+    if auto_stop and spec.is_neuron:
+        ui.warn("--auto-stop is not supported for Neuron models (managed node group lifecycle); ignoring it.")
+        auto_stop = False
 
     # One timestamp groups realtime, batch, and quality. It also makes the exact
     # marker key deterministic before any Job is submitted.
@@ -246,7 +275,7 @@ def deploy(
             )
 
         ui.banner(f"Auto-quality: {spec.id}")
-        return quality_mod.run(
+        rc = quality_mod.run(
             model_id,
             tag=tag,
             hw=chosen,
@@ -262,10 +291,79 @@ def deploy(
             wait_for_marker=wait_for_marker,
             # Combined pipeline must survive terminal closure; all three Jobs
             # have already been submitted and ordering is enforced in-cluster.
-            detach=want_benchmark,
+            detach=want_benchmark or auto_stop,
         )
+        if rc != 0 and not auto_stop:
+            return rc
+
+    # ---- Optional auto-stop cleanup Job -------------------------------------
+    # Submits an in-cluster Job that waits for the whole pipeline to finish, then
+    # stops this model+tag (frees its GPU node). Runs server-side so it works
+    # even with --detach and a closed terminal.
+    if auto_stop:
+        _submit_auto_stop(spec, chosen, tag, run_timestamp, want_benchmark, do_quality,
+                          profile, quality_sheets)
 
     return 0
+
+
+def _submit_auto_stop(
+    spec: ModelSpec,
+    instance: str | None,
+    tag: str | None,
+    run_timestamp: str,
+    want_benchmark: bool,
+    do_quality: bool,
+    profile: str | None,
+    quality_sheets: list[str] | None,
+) -> None:
+    """Submit an in-cluster cleanup Job that stops the model after the pipeline.
+
+    The Job waits for the final stage to finish (quality Jobs if quality was
+    requested, otherwise the benchmark completion marker), then stops this
+    model+tag to free its GPU node. It runs server-side so it survives the
+    local terminal closing (works with --detach).
+    """
+    script = paths.ROOT / "inference" / "run-autostop.sh"
+    if not script.exists():
+        ui.warn(
+            "inference/run-autostop.sh is missing; skipping auto-stop. "
+            f"Stop manually later: oai stop {spec.id}{f' --tag {tag}' if tag else ''}."
+        )
+        return
+
+    # Determine what the cleanup Job should wait on.
+    #   - quality requested  -> wait for the quality Job(s) to complete (no marker exists)
+    #   - benchmark only     -> wait for the final benchmark completion marker
+    args = ["--model", spec.id, "--run-timestamp", run_timestamp]
+    if tag:
+        args += ["--tag", tag]
+    if do_quality:
+        args += ["--wait-mode", "quality-jobs"]
+        # Which sheets run decides how many quality Jobs the cleanup must await.
+        for sheet in (quality_sheets or ["org", "xl"]):
+            args += ["--quality-sheet", sheet]
+    elif want_benchmark:
+        from . import benchmark as bench_mod
+
+        last_profile = bench_mod.completion_profile(spec, profile, spec.benchmark.skip_batch)
+        tag_segment = f"{tag}/" if tag else ""
+        marker = f"results/{run_timestamp}/{tag_segment}_markers/{spec.id}/{last_profile}.done"
+        args += ["--wait-mode", "marker", "--wait-for-marker", marker]
+
+    ui.banner(f"Auto-stop: {spec.id}{f'  (tag={tag})' if tag else ''}")
+    rc = shell.run_bash(script, args)
+    if rc != 0:
+        ui.warn(
+            f"Auto-stop Job submission returned non-zero (exit {rc}). "
+            f"If the model is not stopped when the pipeline ends, run "
+            f"'oai stop {spec.id}{f' --tag {tag}' if tag else ''}' manually."
+        )
+    else:
+        ui.info(
+            "Auto-stop Job submitted. It will stop this model automatically once the "
+            "pipeline finishes, freeing the GPU node - even if you close this terminal."
+        )
 
 
 def _explain_deploy_failure(spec: ModelSpec, instance: str) -> None:

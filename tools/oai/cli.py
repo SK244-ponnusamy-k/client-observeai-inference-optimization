@@ -130,6 +130,8 @@ def _cmd_deploy(args: argparse.Namespace) -> int:
         dump_samples=args.dump_samples,
         max_dump_samples=args.max_dump_samples,
         dump_inputs=args.dump_inputs,
+        detach=args.detach,
+        auto_stop=args.auto_stop,
     )
 
 
@@ -259,6 +261,15 @@ def _build_parser() -> argparse.ArgumentParser:
     dp.add_argument("--max-dump-samples", type=int, default=200, help="quality sample rows to save (default 200)")
     dp.add_argument("--dump-inputs", action="store_true",
                     help="include quality input transcripts in the saved samples (needs --dump-samples)")
+    dp.add_argument(
+        "--detach", action="store_true",
+        help="submit the deployment AND all benchmark/quality Jobs up front without waiting for the model "
+             "to become Ready, then return immediately. The cluster runs everything server-side, so you can "
+             "close your terminal. Jobs wait for the endpoint in-cluster.")
+    dp.add_argument(
+        "--auto-stop", action="store_true",
+        help="after the full pipeline finishes, automatically stop this model (frees its GPU node). "
+             "Runs as an in-cluster cleanup Job, so it works even with --detach and a closed terminal.")
     dp.add_argument(
         "--no-instance-check", action="store_true", help="skip the live availability check (use the preferred instance)"
     )
