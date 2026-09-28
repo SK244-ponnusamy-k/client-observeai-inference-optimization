@@ -36,9 +36,14 @@ SERVED_NAME=""                         # exact vLLM --served-model-name
 HW="unknown"                           # result metadata (prefer full instance type)
 QUANT="unknown"
 CONFIG="configs/quality/autoqa_v1.yaml"
-DATASET_S3_KEY="quality-datasets/autoqa_v1.csv"
+# Default dataset = the shared multi-sheet AutoQA workbook (Test-ORG + Test-XL +
+# QIDs). DATASET_FILE is the local copy that is auto-staged to S3 if the key is
+# missing; DATASET_S3_KEY is where it lives in the results bucket. Both default
+# to the workbook so `oai quality <model>` needs no --dataset-file. Override
+# either with --dataset-file / --dataset-key.
+DATASET_S3_KEY="quality-datasets/AWS - Synthetic QA Data.xlsx"
 STAGE_FILE=""
-DATASET_FILE=""                        # local dataset path; auto-staged to S3 if the key is missing
+DATASET_FILE="configs/workload_profiles/datasets/AWS - Synthetic QA Data.xlsx"  # local dataset path; auto-staged to S3 if the key is missing
 FORCE_STAGE="false"                    # re-upload even when the S3 key already exists
 SHEET=""                               # xlsx worksheet to score (Test-ORG / Test-XL); empty = first/default
 SVC_OVERRIDE=""
@@ -49,6 +54,7 @@ DUMP_SAMPLES="false"
 MAX_DUMP_SAMPLES=200
 DUMP_INPUTS="false"                    # include input transcripts in the samples file
 DETACH="false"
+DATASET_KEY_EXPLICIT="false"           # set true when --dataset-key is passed
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -57,7 +63,7 @@ while [[ $# -gt 0 ]]; do
         --hw)               HW="$2"; shift 2 ;;
         --quant)            QUANT="$2"; shift 2 ;;
         --config)           CONFIG="$2"; shift 2 ;;
-        --dataset-key)      DATASET_S3_KEY="$2"; shift 2 ;;
+        --dataset-key)      DATASET_S3_KEY="$2"; DATASET_KEY_EXPLICIT="true"; shift 2 ;;
         --svc)              SVC_OVERRIDE="$2"; shift 2 ;;
         --tag)              TAG="$2"; shift 2 ;;
         --run-timestamp)    RUN_TIMESTAMP="$2"; shift 2 ;;
@@ -101,8 +107,9 @@ fi
 #                     (use it after editing the workbook locally).
 if [[ -n "${DATASET_FILE}" ]]; then
     [[ -f "${DATASET_FILE}" ]] || { log_error "Dataset file not found: ${DATASET_FILE}"; exit 1; }
-    if [[ "${DATASET_S3_KEY}" == "quality-datasets/autoqa_v1.csv" ]]; then
-        # Caller did not pin a key: derive a stable one from the filename.
+    if [[ "${DATASET_KEY_EXPLICIT}" != "true" ]]; then
+        # Caller did not pin a key: derive a stable one from the filename so a
+        # custom --dataset-file lands under a matching S3 key.
         DATASET_S3_KEY="quality-datasets/$(basename "${DATASET_FILE}")"
     fi
     if [[ "${FORCE_STAGE}" != "true" ]] && \
