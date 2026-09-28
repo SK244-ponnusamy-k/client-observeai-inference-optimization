@@ -1,0 +1,21 @@
+# catalog/models/qwen3-5-9b-tp1.yaml
+# Created by 'oai model new'. Edit freely; see catalog/SCHEMA.md for all options.
+
+id: qwen3-5-9b-tp1
+display_name: qwen3-5-9b-tp1
+hardware: gpu
+source:
+  hf_id: Qwen/Qwen3.5-9B
+  gated: false
+  size_gb: 20.0
+serving:
+  quantization: none
+  max_model_len: 16384
+instances:
+  candidates:
+  - g6e.2xlarge
+  - g7e.2xlarge
+  tensor_parallel_size: 1
+benchmark:
+  auto: false
+  instance_hourly_usd: 0.0

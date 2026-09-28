@@ -1,0 +1,23 @@
+# catalog/models/phi-4-mini-instruct.yaml
+# Created by 'oai model new'. Edit freely; see catalog/SCHEMA.md for all options.
+
+id: phi-4-mini-instruct
+display_name: Phi-4-mini-instruct
+hardware: gpu
+source:
+  hf_id: microsoft/Phi-4-mini-instruct
+  gated: false
+  size_gb: 10.0
+serving:
+  quantization: none
+  max_model_len: 16384
+instances:
+  candidates:
+  - g6e.2xlarge
+  - g6.2xlarge
+  - g7e.2xlarge
+  - g5.2xlarge
+  tensor_parallel_size: 1
+benchmark:
+  auto: true
+  instance_hourly_usd: 0.0
