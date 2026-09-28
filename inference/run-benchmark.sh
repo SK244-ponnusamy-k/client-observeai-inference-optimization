@@ -264,6 +264,15 @@ fi
 submit_profile_job() {
     local P="$1"
     local JOB_NAME="${JOB_NAME_BASE}-${P}"
+    # K8s label values are capped at 63 bytes. The Job's metadata.name allows 253
+    # chars, but the pod-template label app.kubernetes.io/name uses the same string
+    # and can overflow for long model ids + tag + timestamp + profile. Truncate the
+    # label value only (the Job/resource names are unchanged).
+    local JOB_LABEL="${JOB_NAME}"
+    if (( ${#JOB_LABEL} > 63 )); then
+        JOB_LABEL="${JOB_LABEL:0:63}"
+        JOB_LABEL="${JOB_LABEL%-}"   # avoid a trailing '-' which is an invalid label char
+    fi
     local DEADLINE_S; local GATE_ON_REALTIME="false"
     if [[ "${P}" == "batch" ]]; then
         DEADLINE_S="${BATCH_DEADLINE}"
@@ -392,7 +401,7 @@ spec:
   template:
     metadata:
       labels:
-        app.kubernetes.io/name: ${JOB_NAME}
+        app.kubernetes.io/name: ${JOB_LABEL}
         app.kubernetes.io/component: benchmark-runner
         project: observeai-inference-optimization
         model: "${MODEL}"
