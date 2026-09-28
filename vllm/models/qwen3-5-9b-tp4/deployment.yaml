@@ -137,12 +137,12 @@ spec:
 
           resources:
             requests:
-              cpu: "4"
-              memory: "24Gi"
+              cpu: "8"
+              memory: "64Gi"
               nvidia.com/gpu: "${GPU_COUNT}"
             limits:
-              cpu: "8"
-              memory: "30Gi"
+              cpu: "16"
+              memory: "120Gi"
               nvidia.com/gpu: "${GPU_COUNT}"
 
           readinessProbe:
