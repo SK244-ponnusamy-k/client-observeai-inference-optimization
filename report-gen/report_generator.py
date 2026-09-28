@@ -437,6 +437,72 @@ def fix_instance_labels(results: list[dict[str, Any]]) -> int:
     return fixed
 
 
+def build_per_qid_metrics(sample_results: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Per-QID metrics as one record per (run, question_id), from the samples.
+
+    Each quality run's samples carry gold + pred + question_id per row, so the
+    full binary metric set (accuracy / precision / recall / F1 + confusion) is
+    derived here PER QID. Positive class is "Yes", matching the evaluator. A run
+    is identified by model + test set + hardware + quant + run label so the same
+    QID from Test-ORG and Test-XL (or two models) stays on separate rows.
+
+    Returns [] when no samples were dumped (nothing to segment).
+    """
+    if not sample_results:
+        return []
+    # Group rows by (run identity, qid).
+    groups: dict[tuple, list[dict[str, Any]]] = {}
+    for s in sample_results:
+        qid = str(s.get("question_id") or "").strip() or "(no QID)"
+        key = (
+            s.get("_clean_model", "-"),
+            s.get("_clean_testset", "-"),
+            s.get("_clean_hw", "-"),
+            s.get("_clean_quant", "-"),
+            s.get("_run", "-"),
+            qid,
+        )
+        groups.setdefault(key, []).append(s)
+
+    def _norm(v: Any) -> str:
+        t = str(v or "").strip().lower()
+        return "Yes" if t == "yes" else "No" if t == "no" else str(v or "").strip()
+
+    out: list[dict[str, Any]] = []
+    pos = "Yes"
+    for key, rows in groups.items():
+        model, testset, hw, quant, run, qid = key
+        tp = fp = fn = tn = other = 0
+        for r in rows:
+            g = _norm(r.get("gold"))
+            p = _norm(r.get("pred"))
+            if g == pos and p == pos:
+                tp += 1
+            elif g != pos and p == pos:
+                fp += 1
+            elif g == pos and p != pos:
+                fn += 1
+            elif g != pos and p == g:
+                tn += 1
+            else:
+                other += 1  # unparseable / unexpected pred on a negative gold
+        n = len(rows)
+        prec = tp / (tp + fp) if (tp + fp) else 0.0
+        rec = tp / (tp + fn) if (tp + fn) else 0.0
+        f1 = 2 * prec * rec / (prec + rec) if (prec + rec) else 0.0
+        acc = (tp + tn) / n if n else 0.0
+        out.append({
+            "model": model, "testset": testset, "hw": hw, "quant": quant, "run": run,
+            "qid": qid, "n": n,
+            "accuracy_pct": round(acc * 100.0, 2),
+            "precision": round(prec, 4), "recall": round(rec, 4), "f1": round(f1, 4),
+            "tp": tp, "fp": fp, "fn": fn, "tn": tn, "other": other,
+        })
+    # Stable order: model, test set, then QID.
+    out.sort(key=lambda x: (x["model"], x["testset"], x["qid"]))
+    return out
+
+
 def export_excel(
     perf_results: list[dict[str, Any]],
     qual_results: list[dict[str, Any]],
@@ -610,7 +676,34 @@ def export_excel(
             str(q.get("started_at", q.get("timestamp", "-")))[:19].replace("T", " "),
         ])
 
-    # ── Sheet 3: Quality Samples (per-row model output) ─────────────────────
+    # ── Sheet 3: Per-QID Metrics (segment-wise) ─────────────────────────────
+    # One record per (run, QID) with the full binary metric set, derived from the
+    # samples. Present only when a run was dumped with --dump-samples.
+    ws_qid = None
+    per_qid = build_per_qid_metrics(sample_results)
+    if per_qid:
+        ws_qid = wb.create_sheet(title="Per-QID Metrics")
+        headers_qid = [
+            "Model", "Test Set", "Instance Type / HW", "Quantization",
+            "Question ID", "Rows",
+            "Accuracy (%)", "Precision", "Recall", "F1",
+            "TP", "FP", "FN", "TN", "Other",
+        ]
+        ws_qid.append(headers_qid)
+        for col_num in range(1, len(headers_qid) + 1):
+            cell = ws_qid.cell(row=1, column=col_num)
+            cell.font = header_font
+            cell.fill = header_fill_qual
+            cell.alignment = Alignment(horizontal="center", vertical="center")
+        for m in per_qid:
+            ws_qid.append([
+                m["model"], m["testset"], m["hw"], m["quant"],
+                m["qid"], m["n"],
+                m["accuracy_pct"], m["precision"], m["recall"], m["f1"],
+                m["tp"], m["fp"], m["fn"], m["tn"], m["other"],
+            ])
+
+    # ── Sheet 4: Quality Samples (per-row model output) ─────────────────────
     # Present only when a run was submitted with --dump-samples. Every column is
     # a field written by quality-eval.py; the report does not re-judge anything.
     ws_samples = None
@@ -726,7 +819,7 @@ def export_excel(
 
     # Auto-adjust column widths. Capped so a long model-output cell cannot stretch
     # a column past the width of the screen.
-    for ws in [s for s in (ws_perf, ws_qual, ws_samples, ws_detail) if s is not None]:
+    for ws in [s for s in (ws_perf, ws_qual, ws_qid, ws_samples, ws_detail) if s is not None]:
         for col in ws.columns:
             max_len = max(len(str(cell.value or "")) for cell in col)
             col_letter = openpyxl.utils.get_column_letter(col[0].column)
