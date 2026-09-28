@@ -40,6 +40,7 @@ import os
 import re
 import subprocess  # noqa: S404 - invoking the trusted `vllm` CLI, args are controlled
 import tempfile
+import threading
 import time
 import urllib.request
 import uuid
@@ -153,6 +154,12 @@ class BenchmarkResult:
     status: str             # passed | failed_slo | error
     slo_violations: list[str] = field(default_factory=list)
 
+    # Telemetry quality — sampled DURING the run (see _TelemetrySampler).
+    # kv_cache_utilization_pct above is the PEAK; this is the mean under load.
+    kv_cache_utilization_mean_pct: float | None = None
+    telemetry_samples: int = 0        # vLLM /metrics samples taken during the level
+    gpu_telemetry_samples: int = 0    # DCGM samples that matched the vLLM pod (0 => GPU fields are None)
+
 
 # ---------------------------------------------------------------------------
 # YAML loading
@@ -220,10 +227,12 @@ def _scrape_vllm_metrics(endpoint: str) -> dict[str, float | None]:
         return {"kv_cache_utilization_pct": None, "num_requests_waiting": None,
                 "prefix_cache_hit_rate": None, "generation_tokens_total": None}
 
-    kv = _sum_metric(text, "vllm:gpu_cache_usage_perc", "vllm_gpu_cache_usage_perc",
-                     "vllm:gpu_cache_usage_percent", "vllm_gpu_cache_usage_percent",
-                     "vllm:gpu_memory_utilization", "vllm_gpu_memory_utilization",
-                     "vllm:kv_cache_usage_perc", "vllm_kv_cache_usage_perc")
+    # vLLM V1 (0.10+) exposes vllm:kv_cache_usage_perc; older builds used
+    # vllm:gpu_cache_usage_perc. (vllm:gpu_memory_utilization is NOT KV usage —
+    # it is the static --gpu-memory-utilization setting, so it is not an alias.)
+    kv = _sum_metric(text, "vllm:kv_cache_usage_perc", "vllm_kv_cache_usage_perc",
+                     "vllm:gpu_cache_usage_perc", "vllm_gpu_cache_usage_perc",
+                     "vllm:gpu_cache_usage_percent", "vllm_gpu_cache_usage_percent")
     waiting = _sum_metric(text, "vllm:num_requests_waiting", "vllm_num_requests_waiting")
     gen_tokens = _sum_metric(text, "vllm:generation_tokens_total", "vllm_generation_tokens_total")
     hits = _sum_metric(text, "vllm:prefix_cache_hits_total", "vllm_prefix_cache_hits_total")
@@ -239,11 +248,68 @@ def _scrape_vllm_metrics(endpoint: str) -> dict[str, float | None]:
     }
 
 
-def _scrape_gpu_metrics(dcgm_url: str | None) -> dict[str, float | None]:
+_LABEL_RE = re.compile(r'([a-zA-Z_][a-zA-Z0-9_]*)="((?:[^"\\]|\\.)*)"')
+
+
+def _metric_samples(text: str, metric_name: str) -> list[tuple[dict[str, str], float]]:
+    """Return every (labels, value) sample of one Prometheus metric family."""
+    pattern = re.compile(rf"^\s*{re.escape(metric_name)}(?:\{{([^}}]*)\}})?\s+([0-9eE.+-]+|NaN)(?:\s+[0-9]+)?\s*$")
+    samples: list[tuple[dict[str, str], float]] = []
+    for line in text.splitlines():
+        if line.startswith("#"):
+            continue
+        m = pattern.match(line)
+        if not m:
+            continue
+        try:
+            value = float(m.group(2))
+        except ValueError:
+            continue
+        samples.append((dict(_LABEL_RE.findall(m.group(1) or "")), value))
+    return samples
+
+
+def _pod_matcher(deployment: str | None, namespace: str | None):
     """
-    Best-effort GPU telemetry from a DCGM-exporter (or Prometheus federate) URL.
-    Set DCGM_METRICS_URL to a scrape endpoint that exposes DCGM_FI_DEV_* for the
-    GPU node under test.
+    Build a predicate selecting only the DCGM samples of the vLLM pod under test.
+
+    dcgm-exporter (k8s mode) labels each GPU with the pod/namespace/container it is
+    allocated to (`pod`/`namespace`/`container`, or the older `pod_name`/
+    `pod_namespace`/`container_name`). Deployment pods are named
+    <deployment>-<rs-hash>-<5 chars>, so we match that shape exactly — a plain
+    prefix match would also catch a tagged parallel deploy (<deployment>-g7e-...).
+    """
+    pod_re = re.compile(rf"{re.escape(deployment)}-[a-z0-9]{{5,10}}-[a-z0-9]{{5}}") if deployment else None
+
+    def _match(labels: dict[str, str]) -> bool:
+        pod = labels.get("pod") or labels.get("pod_name") or ""
+        ns = labels.get("namespace") or labels.get("pod_namespace") or ""
+        container = labels.get("container") or labels.get("container_name") or ""
+        if pod_re is not None:
+            return bool(pod_re.fullmatch(pod))
+        if namespace:
+            return ns == namespace and container == "vllm"
+        return True
+
+    return _match
+
+
+def _scrape_gpu_metrics(
+    dcgm_url: str | None,
+    deployment: str | None = None,
+    namespace: str | None = None,
+) -> dict[str, float | None]:
+    """
+    Best-effort GPU telemetry from a DCGM-exporter (or Prometheus federate) URL,
+    scoped to the GPUs of the vLLM pod under test.
+
+    The in-cluster dcgm-exporter Service load-balances across ONE exporter pod per
+    GPU node, so a single scrape returns a random node's GPUs. Summing that blindly
+    produced impossible rows (400 % util, 164 GB on a 24 GB L4). We therefore keep
+    only samples whose pod labels match the vLLM deployment; a scrape that lands on
+    another node yields None and is simply skipped by the sampler.
+
+    Aggregation across the pod's GPUs (TP>1): util = mean, mem = sum, power = sum.
     """
     urls_to_try = []
     if dcgm_url:
@@ -263,11 +329,96 @@ def _scrape_gpu_metrics(dcgm_url: str | None) -> dict[str, float | None]:
     if not text:
         return {"gpu_utilization_pct": None, "gpu_mem_used_mib": None,
                 "gpu_power_watts": None}
+    match = _pod_matcher(deployment, namespace)
+
+    def _vals(name: str) -> list[float]:
+        return [v for labels, v in _metric_samples(text, name) if match(labels)]
+
+    util = _vals("DCGM_FI_DEV_GPU_UTIL")
+    mem = _vals("DCGM_FI_DEV_FB_USED")
+    power = _vals("DCGM_FI_DEV_POWER_USAGE")
     return {
-        "gpu_utilization_pct": _sum_metric(text, "DCGM_FI_DEV_GPU_UTIL"),
-        "gpu_mem_used_mib": _sum_metric(text, "DCGM_FI_DEV_FB_USED"),
-        "gpu_power_watts": _sum_metric(text, "DCGM_FI_DEV_POWER_USAGE"),
+        "gpu_utilization_pct": (sum(util) / len(util)) if util else None,
+        "gpu_mem_used_mib": sum(mem) if mem else None,
+        "gpu_power_watts": sum(power) if power else None,
     }
+
+
+# ---------------------------------------------------------------------------
+# In-run telemetry sampler
+# ---------------------------------------------------------------------------
+class _TelemetrySampler:
+    """
+    Polls vLLM /metrics and DCGM in a background thread WHILE `vllm bench serve`
+    runs, then reports peak / mean values for the level.
+
+    Why: the harness used to scrape once AFTER the run, when the queue had drained
+    and the KV cache was empty — so every row showed KV 0 % and GPU util was an
+    idle-instant reading. Gauges must be sampled under load.
+    """
+
+    def __init__(
+        self,
+        endpoint: str,
+        dcgm_url: str | None,
+        deployment: str | None,
+        namespace: str | None,
+        interval_s: float = 2.0,
+    ) -> None:
+        self._endpoint = endpoint
+        self._dcgm_url = dcgm_url
+        self._deployment = deployment
+        self._namespace = namespace
+        self._interval_s = interval_s
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._loop, name="telemetry-sampler", daemon=True)
+        self._kv: list[float] = []
+        self._waiting: list[float] = []
+        self._util: list[float] = []
+        self._mem: list[float] = []
+        self._power: list[float] = []
+
+    def __enter__(self) -> _TelemetrySampler:
+        self._thread.start()
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self._stop.set()
+        self._thread.join(timeout=self._interval_s + 10)
+
+    def _loop(self) -> None:
+        while not self._stop.is_set():
+            try:
+                v = _scrape_vllm_metrics(self._endpoint)
+                if v.get("kv_cache_utilization_pct") is not None:
+                    self._kv.append(v["kv_cache_utilization_pct"])
+                if v.get("num_requests_waiting") is not None:
+                    self._waiting.append(v["num_requests_waiting"])
+                g = _scrape_gpu_metrics(self._dcgm_url, self._deployment, self._namespace)
+                if g.get("gpu_utilization_pct") is not None:
+                    self._util.append(g["gpu_utilization_pct"])
+                if g.get("gpu_mem_used_mib") is not None:
+                    self._mem.append(g["gpu_mem_used_mib"])
+                if g.get("gpu_power_watts") is not None:
+                    self._power.append(g["gpu_power_watts"])
+            except Exception as exc:  # noqa: BLE001 - telemetry must never kill a run
+                logger.debug("Telemetry sample failed: %s", exc)
+            self._stop.wait(self._interval_s)
+
+    def summary(self) -> dict[str, float | int | None]:
+        def _mean(xs: list[float]) -> float | None:
+            return round(sum(xs) / len(xs), 2) if xs else None
+
+        return {
+            "kv_cache_utilization_pct": round(max(self._kv), 2) if self._kv else None,
+            "kv_cache_utilization_mean_pct": _mean(self._kv),
+            "num_requests_waiting": max(self._waiting) if self._waiting else None,
+            "gpu_utilization_pct": _mean(self._util),
+            "gpu_mem_used_mib": max(self._mem) if self._mem else None,
+            "gpu_power_watts": _mean(self._power),
+            "telemetry_samples": len(self._kv),
+            "gpu_telemetry_samples": len(self._util),
+        }
 
 
 # ---------------------------------------------------------------------------
@@ -482,7 +633,7 @@ def _build_result(
     bench: dict[str, Any],
     vmetrics_before: dict[str, float | None],
     vmetrics_after: dict[str, float | None],
-    gpu: dict[str, float | None],
+    telemetry: dict[str, float | int | None],
     concurrency: int,
     profile_id: str,
     manifest: dict[str, Any],
@@ -501,13 +652,14 @@ def _build_result(
     instance_usd = _resolve_instance_hourly_usd(manifest)
 
     cost = _derive_cost(instance_usd, runtime_s, total_tokens, total_out, completed,
-                        gpu.get("gpu_power_watts"))
+                        telemetry.get("gpu_power_watts"))
 
     git_sha = os.popen("git rev-parse --short HEAD 2>/dev/null").read().strip() or "unknown"  # noqa: S605
 
-    # KV / queue: take the peak observed (after-run snapshot is representative of load)
-    kv = vmetrics_after.get("kv_cache_utilization_pct")
-    waiting = vmetrics_after.get("num_requests_waiting")
+    # KV / queue: PEAK observed while the level was running (in-run sampler).
+    # The after-run snapshot is NOT used — by then the queue has drained and KV is ~0.
+    kv = telemetry.get("kv_cache_utilization_pct")
+    waiting = telemetry.get("num_requests_waiting")
 
     return BenchmarkResult(
         run_id=manifest["run_id"],
@@ -543,9 +695,9 @@ def _build_result(
         kv_cache_utilization_pct=round(kv, 2) if kv is not None else None,
         num_requests_waiting=waiting,
         prefix_cache_hit_rate=vmetrics_after.get("prefix_cache_hit_rate"),
-        gpu_utilization_pct=gpu.get("gpu_utilization_pct"),
-        gpu_mem_used_mib=gpu.get("gpu_mem_used_mib"),
-        gpu_power_watts=gpu.get("gpu_power_watts"),
+        gpu_utilization_pct=telemetry.get("gpu_utilization_pct"),
+        gpu_mem_used_mib=telemetry.get("gpu_mem_used_mib"),
+        gpu_power_watts=telemetry.get("gpu_power_watts"),
         instance_hourly_usd=instance_usd,
         runtime_s=round(runtime_s, 2),
         cost_per_1m_tokens=cost["cost_per_1m_tokens"],
@@ -562,6 +714,9 @@ def _build_result(
         started_at=started_at,
         ended_at=ended_at,
         status="passed",
+        kv_cache_utilization_mean_pct=telemetry.get("kv_cache_utilization_mean_pct"),
+        telemetry_samples=int(telemetry.get("telemetry_samples") or 0),
+        gpu_telemetry_samples=int(telemetry.get("gpu_telemetry_samples") or 0),
     )
 
 
@@ -814,6 +969,13 @@ def _run(args: argparse.Namespace) -> None:
         or os.getenv("DCGM_EXPORTER_URL")
         or "http://dcgm-exporter.monitoring.svc.cluster.local:9400/metrics"
     )
+    # Scope GPU telemetry to the vLLM pod under test (set by run-benchmark.sh).
+    # Unset -> fall back to namespace + container=vllm; neither -> unscoped (legacy).
+    vllm_deployment = os.getenv("OAI_VLLM_DEPLOYMENT", "").strip() or None
+    vllm_namespace = os.getenv("OAI_VLLM_NAMESPACE", "").strip() or None
+    if not vllm_deployment and not vllm_namespace:
+        logger.warning("OAI_VLLM_DEPLOYMENT/OAI_VLLM_NAMESPACE unset - GPU telemetry is NOT pod-scoped "
+                       "and may mix GPUs from other nodes.")
 
     _wait_for_vllm(endpoint, timeout_s=args.wait_timeout)
 
@@ -830,29 +992,32 @@ def _run(args: argparse.Namespace) -> None:
 
         vmetrics_before = _scrape_vllm_metrics(endpoint)
         try:
-            bench = _run_vllm_bench(
-                base_url=endpoint,
-                served_model=served_model,
-                tokenizer=tokenizer,
-                concurrency=conc,
-                num_prompts=num_prompts,
-                dataset_name=dataset_name,
-                random_input_len=random_input_len,
-                random_output_len=max_new,
-                seed=seed,
-                ignore_eos=ignore_eos,
-                extra_args=extra_args,
-            )
+            with _TelemetrySampler(endpoint, dcgm_url, vllm_deployment, vllm_namespace) as sampler:
+                bench = _run_vllm_bench(
+                    base_url=endpoint,
+                    served_model=served_model,
+                    tokenizer=tokenizer,
+                    concurrency=conc,
+                    num_prompts=num_prompts,
+                    dataset_name=dataset_name,
+                    random_input_len=random_input_len,
+                    random_output_len=max_new,
+                    seed=seed,
+                    ignore_eos=ignore_eos,
+                    extra_args=extra_args,
+                )
         except Exception as exc:  # noqa: BLE001
             logger.error("Benchmark at concurrency=%d failed: %s", conc, exc)
             continue
         vmetrics_after = _scrape_vllm_metrics(endpoint)
-        gpu = _scrape_gpu_metrics(dcgm_url)
+        telemetry = sampler.summary()
+        if telemetry["gpu_telemetry_samples"] == 0:
+            logger.warning("Concurrency=%d: no DCGM samples matched the vLLM pod - GPU fields left null.", conc)
         ended_at = datetime.now(tz=timezone.utc).isoformat()
 
         result = _build_result(
             bench=bench, vmetrics_before=vmetrics_before, vmetrics_after=vmetrics_after,
-            gpu=gpu, concurrency=conc, profile_id=profile_id, manifest=manifest, opt=opt,
+            telemetry=telemetry, concurrency=conc, profile_id=profile_id, manifest=manifest, opt=opt,
             reasoning_effort=reasoning_effort, correlation_id=correlation_id,
             started_at=started_at, ended_at=ended_at,
         )

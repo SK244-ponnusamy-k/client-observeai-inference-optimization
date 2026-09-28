@@ -78,6 +78,10 @@ data:
   # Optional: DCGM-exporter / Prometheus-federate URL exposing DCGM_FI_DEV_* for
   # the GPU node under test. Leave empty to source GPU util from Grafana/AMP post-hoc.
   DCGM_METRICS_URL: ""
+  # Scopes GPU telemetry to the vLLM pod under test. Leave OAI_VLLM_DEPLOYMENT empty
+  # to derive it from MODEL_NAME (oai-infopt-vllm-<MODEL_NAME>).
+  OAI_VLLM_DEPLOYMENT: ""
+  OAI_VLLM_NAMESPACE: "oai-infopt"
   PROMETHEUS_PUSHGATEWAY: "http://prometheus-pushgateway.monitoring:9091"
   # ─────────────────────────────────────────────────────────────────────────────
 
@@ -158,6 +162,7 @@ spec:
 
               if [ -z "${VLLM_ENDPOINT:-}" ]; then
                 export VLLM_ENDPOINT="http://oai-infopt-vllm-${MODEL_NAME}:8000"
+                export OAI_VLLM_DEPLOYMENT="${OAI_VLLM_DEPLOYMENT:-oai-infopt-vllm-${MODEL_NAME}}"
               fi
               echo "Target endpoint: ${VLLM_ENDPOINT}"
 
@@ -326,6 +331,7 @@ spec:
 
               if [ -z "${VLLM_ENDPOINT:-}" ]; then
                 export VLLM_ENDPOINT="http://oai-infopt-vllm-${MODEL_NAME}:8000"
+                export OAI_VLLM_DEPLOYMENT="${OAI_VLLM_DEPLOYMENT:-oai-infopt-vllm-${MODEL_NAME}}"
               fi
               echo "Target endpoint: ${VLLM_ENDPOINT}"
 
