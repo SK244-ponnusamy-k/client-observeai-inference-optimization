@@ -104,7 +104,7 @@ spec:
             - "--tensor-parallel-size=${TP_SIZE}"
             - "--gpu-memory-utilization=0.85"
             - "--max-model-len=8192"
-            - "--max-num-seqs=128"
+            - "--max-num-seqs=1024"
             - "--max-num-batched-tokens=4096"
             - "--trust-remote-code"
             - "--enable-chunked-prefill"

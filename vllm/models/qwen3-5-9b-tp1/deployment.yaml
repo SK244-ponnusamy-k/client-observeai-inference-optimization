@@ -104,7 +104,7 @@ spec:
             - "--tensor-parallel-size=${TP_SIZE}"
             - "--gpu-memory-utilization=0.9"
             - "--max-model-len=16384"
-            - "--max-num-seqs=256"
+            - "--max-num-seqs=1024"
             - "--max-num-batched-tokens=8192"
             - "--reasoning-parser=qwen3"
           ports:

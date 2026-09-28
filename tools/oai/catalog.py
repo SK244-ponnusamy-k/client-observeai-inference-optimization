@@ -53,7 +53,7 @@ class Serving:
     quantization: str = "none"
     max_model_len: int = 8192
     gpu_memory_utilization: float = 0.90
-    max_num_seqs: int = 256
+    max_num_seqs: int = 1024
     max_num_batched_tokens: int = 8192
     extra_args: list[str] = field(default_factory=list)
 
@@ -189,7 +189,7 @@ def from_dict(data: dict[str, Any]) -> ModelSpec:
         quantization=srv_raw.get("quantization", "none"),
         max_model_len=int(srv_raw.get("max_model_len", 8192)),
         gpu_memory_utilization=float(srv_raw.get("gpu_memory_utilization", 0.90)),
-        max_num_seqs=int(srv_raw.get("max_num_seqs", 256)),
+        max_num_seqs=int(srv_raw.get("max_num_seqs", 1024)),
         max_num_batched_tokens=int(srv_raw.get("max_num_batched_tokens", 8192)),
         extra_args=list(srv_raw.get("extra_args", []) or []),
     )
