@@ -20,6 +20,12 @@ serving:
     # side. NOTE: unlike qwen3-5-9b and phi-4-mini-instruct (which run WITHOUT
     # reasoning), this Gemma entry is a reasoning run.
     - '--default-chat-template-kwargs={\"enable_thinking\": true}'
+    # Load Gemma 4's reasoning parser so vLLM actually EXTRACTS the chain-of-thought
+    # into the response `reasoning` field. Without this, enable_thinking alone is not
+    # enough: the model may think, but vLLM never surfaces it, so the run's inference
+    # probe records reasoning_observed=OFF. The parser name for the Gemma 4 series on
+    # vLLM 0.26.0 is `gemma4` (see vLLM Reasoning Outputs docs).
+    - "--reasoning-parser=gemma4"
 instances:
   candidates:
   - g6e.2xlarge

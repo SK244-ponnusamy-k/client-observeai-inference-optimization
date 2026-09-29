@@ -107,6 +107,7 @@ spec:
             - "--max-num-seqs=256"
             - "--max-num-batched-tokens=8192"
             - "--default-chat-template-kwargs={\"enable_thinking\": true}"
+            - "--reasoning-parser=gemma4"
           ports:
             - name: http
               containerPort: 8000
