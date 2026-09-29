@@ -480,7 +480,7 @@ ${INIT_CONTAINER}
                 --profile  /configs/profiles/profile.yaml \\
                 --endpoint "${ENDPOINT}" \\
                 --output   /results/${P} \\
-                --wait-timeout 600 ${DATASET_JOB_ARG} || TEST_EXIT=\$?
+                --wait-timeout 1200 ${DATASET_JOB_ARG} || TEST_EXIT=\$?
               echo "=== Uploading ${P} results to S3 ==="
               python3 -c "
               import boto3, os, glob

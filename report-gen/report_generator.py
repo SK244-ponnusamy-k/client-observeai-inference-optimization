@@ -269,6 +269,120 @@ def _row_dates(row: dict[str, Any]) -> set[str]:
     return dates
 
 
+def _folder_datetime_from_path(path: str) -> datetime | None:
+    """Extract the run-folder timestamp as a UTC datetime.
+
+    Results live under results/<YYYYMMDD-HHMMSS>/... (and quality/<YYYYMMDD-HHMMSS>).
+    Unlike _folder_date_from_path, this keeps the HHMMSS so we can filter at
+    minute/second granularity (e.g. "after 15:30"). Returns None if not found.
+    """
+    import re
+
+    for seg in str(path).replace("\\", "/").split("/"):
+        m = re.match(r"^(\d{8})-(\d{6})", seg)
+        if m:
+            try:
+                return datetime.strptime(m.group(1) + m.group(2), "%Y%m%d%H%M%S").replace(
+                    tzinfo=timezone.utc
+                )
+            except ValueError:
+                return None
+    return None
+
+
+def _row_datetimes(row: dict[str, Any]) -> set[datetime]:
+    """UTC datetimes associated with a row: the run-folder timestamp (preferred,
+    present on every row type) and the payload started_at/timestamp when parseable.
+    Used only by the optional time-of-day filter; naive values are treated as UTC.
+    """
+    out: set[datetime] = set()
+    folder_dt = _folder_datetime_from_path(row.get("_source_path", ""))
+    if folder_dt:
+        out.add(folder_dt)
+    ts = str(row.get("started_at") or row.get("timestamp") or "")
+    if ts:
+        try:
+            parsed = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            out.add(parsed.astimezone(timezone.utc))
+        except ValueError:
+            pass
+    return out
+
+
+def resolve_time_bounds(
+    from_date: str | None,
+    to_date: str | None,
+    after_arg: str | None,
+    before_arg: str | None,
+    tz_mode: str,
+) -> tuple[datetime | None, datetime | None]:
+    """Combine the resolved date range with optional --after/--before HH:MM times
+    into precise UTC datetime bounds.
+
+    --after refines the lower bound to <from_date>T<after> (needs --from-date/--date).
+    --before refines the upper bound to <to_date>T<before>   (needs --to-date/--date).
+    tz_mode 'utc' (default) treats the times as UTC; 'local' converts from the
+    machine's local timezone to UTC before comparing (data is stored in UTC).
+    """
+    def _parse_hhmm(value: str, option: str) -> tuple[int, int]:
+        try:
+            hh, mm = value.split(":", 1)
+            h, m = int(hh), int(mm)
+            if not (0 <= h <= 23 and 0 <= m <= 59):
+                raise ValueError
+            return h, m
+        except ValueError:
+            raise SystemExit(f"Invalid {option} value: '{value}'. Use HH:MM (24h), e.g. 15:30.")
+
+    def _combine(date_str: str, h: int, m: int) -> datetime:
+        base = datetime.strptime(date_str, "%Y-%m-%d").replace(hour=h, minute=m)
+        if tz_mode == "local":
+            # Interpret the wall-clock time in the machine's local zone, then
+            # convert to UTC (the stored folder/started_at timestamps are UTC).
+            local_tz = datetime.now().astimezone().tzinfo
+            return base.replace(tzinfo=local_tz).astimezone(timezone.utc)
+        return base.replace(tzinfo=timezone.utc)
+
+    lower = upper = None
+    if after_arg:
+        if not from_date:
+            raise SystemExit("--after requires --date or --from-date to anchor the day.")
+        h, m = _parse_hhmm(after_arg, "--after")
+        lower = _combine(from_date, h, m)
+    if before_arg:
+        if not to_date:
+            raise SystemExit("--before requires --date or --to-date to anchor the day.")
+        h, m = _parse_hhmm(before_arg, "--before")
+        upper = _combine(to_date, h, m)
+    return lower, upper
+
+
+def filter_by_time_bounds(
+    results: list[dict[str, Any]],
+    lower: datetime | None,
+    upper: datetime | None,
+) -> list[dict[str, Any]]:
+    """Keep rows with any associated UTC datetime inside [lower, upper].
+
+    A row with no recoverable timestamp is DROPPED when a bound is active, so an
+    '--after' filter never silently includes undatable rows.
+    """
+    if not lower and not upper:
+        return results
+
+    def in_bounds(dt: datetime) -> bool:
+        return (not lower or dt >= lower) and (not upper or dt <= upper)
+
+    kept: list[dict[str, Any]] = []
+    for row in results:
+        dts = _row_datetimes(row)
+        if dts and any(in_bounds(dt) for dt in dts):
+            kept.append(row)
+    return kept
+
+
 def filter_by_date_range(
     results: list[dict[str, Any]],
     from_date: str | None,
@@ -1174,6 +1288,33 @@ def main() -> None:
         help="Inclusive range end: 'today' or YYYY-MM-DD.",
     )
     parser.add_argument(
+        "--after",
+        default=None,
+        help=(
+            "Time-of-day lower bound HH:MM (24h) that refines the day set by "
+            "--date/--from-date. Only runs at/after this time are kept "
+            "(e.g. --date today --after 15:30). See --time-tz for the timezone."
+        ),
+    )
+    parser.add_argument(
+        "--before",
+        default=None,
+        help=(
+            "Time-of-day upper bound HH:MM (24h) that refines the day set by "
+            "--date/--to-date. Only runs at/before this time are kept."
+        ),
+    )
+    parser.add_argument(
+        "--time-tz",
+        choices=["utc", "local"],
+        default="utc",
+        help=(
+            "Timezone for --after/--before. Results are stored in UTC, so 'utc' "
+            "(default) matches the stored run-folder timestamps exactly; 'local' "
+            "interprets the times in this machine's timezone."
+        ),
+    )
+    parser.add_argument(
         "--max-sample-rows",
         type=int,
         default=2000,
@@ -1223,6 +1364,25 @@ def main() -> None:
             f"perf runs {before_perf} -> {len(perf_results)}, "
             f"quality runs {before_qual} -> {len(qual_results)}, "
             f"quality samples {before_samples} -> {len(sample_results)}"
+        )
+
+    # Optional time-of-day refinement (e.g. only runs after 15:30). Compares the
+    # run-folder YYYYMMDD-HHMMSS timestamp (present on every row) in UTC.
+    lower_dt, upper_dt = resolve_time_bounds(
+        from_date, to_date, args.after, args.before, args.time_tz
+    )
+    if lower_dt or upper_dt:
+        b_perf, b_qual, b_samp = len(perf_results), len(qual_results), len(sample_results)
+        perf_results = filter_by_time_bounds(perf_results, lower_dt, upper_dt)
+        qual_results = filter_by_time_bounds(qual_results, lower_dt, upper_dt)
+        sample_results = filter_by_time_bounds(sample_results, lower_dt, upper_dt)
+        lo = lower_dt.strftime("%Y-%m-%d %H:%M UTC") if lower_dt else "earliest"
+        hi = upper_dt.strftime("%Y-%m-%d %H:%M UTC") if upper_dt else "latest"
+        print(
+            f"[FILTER] Time = {lo} through {hi} (tz-input={args.time_tz}): "
+            f"perf runs {b_perf} -> {len(perf_results)}, "
+            f"quality runs {b_qual} -> {len(qual_results)}, "
+            f"quality samples {b_samp} -> {len(sample_results)}"
         )
 
     print_comparison_table(perf_results, qual_results, sample_results)

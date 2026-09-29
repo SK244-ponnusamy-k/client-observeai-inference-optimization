@@ -12,14 +12,18 @@ serving:
   quantization: none
   max_model_len: 16384
   extra_args:
-    # Run WITHOUT reasoning. This is the plain -instruct variant (NOT
-    # microsoft/Phi-4-mini-reasoning). The thinking-off default is set on the
-    # server because the benchmark harness (`vllm bench serve` ->
-    # /v1/chat/completions) sends no per-request chat_template_kwargs. If this
-    # template does not read enable_thinking, vLLM ignores the unknown kwarg
-    # (harmless no-op); if it does, thinking is forced off. Either way the run
-    # stays non-reasoning.
-    - '--default-chat-template-kwargs={\"enable_thinking\": false}'
+    # Attempt to run WITH reasoning (flipped from the previous OFF run).
+    # IMPORTANT CAVEAT: this is the plain -instruct variant (NOT
+    # microsoft/Phi-4-mini-reasoning), which has no native thinking mode. Setting
+    # enable_thinking: true is very likely a NO-OP here — if the chat template
+    # does not read the kwarg, vLLM ignores it and the model produces no
+    # chain-of-thought, so the inference probe will still record
+    # reasoning_observed=OFF. No reasoning parser is loaded because -instruct
+    # emits no <think> blocks to parse. To genuinely get phi reasoning ON, switch
+    # source.hf_id to microsoft/Phi-4-mini-reasoning and add its reasoning parser.
+    # This flip is kept for parity with the qwen/gemma opposite-run config; expect
+    # the observed status to remain OFF until the model itself is changed.
+    - '--default-chat-template-kwargs={\"enable_thinking\": true}'
 instances:
   candidates:
   - g6e.2xlarge
