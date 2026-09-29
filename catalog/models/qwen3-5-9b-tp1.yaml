@@ -25,7 +25,7 @@ serving:
     # NOTE on quoting: the generator wraps each extra arg in double quotes in the
     # rendered deployment.yaml (- "<arg>"). The JSON value needs double quotes on
     # its key, so they are pre-escaped as \" here to stay valid YAML after render.
-    - '--chat-template-kwargs={\"enable_thinking\": false}'
+    - '--default-chat-template-kwargs={\"enable_thinking\": false}'
 instances:
   candidates:
   - g6e.2xlarge

@@ -19,7 +19,7 @@ serving:
     # template does not read enable_thinking, vLLM ignores the unknown kwarg
     # (harmless no-op); if it does, thinking is forced off. Either way the run
     # stays non-reasoning.
-    - '--chat-template-kwargs={\"enable_thinking\": false}'
+    - '--default-chat-template-kwargs={\"enable_thinking\": false}'
 instances:
   candidates:
   - g6e.2xlarge

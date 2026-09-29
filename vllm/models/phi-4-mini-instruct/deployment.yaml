@@ -106,7 +106,7 @@ spec:
             - "--max-model-len=16384"
             - "--max-num-seqs=256"
             - "--max-num-batched-tokens=8192"
-            - "--chat-template-kwargs={\"enable_thinking\": false}"
+            - "--default-chat-template-kwargs={\"enable_thinking\": false}"
           ports:
             - name: http
               containerPort: 8000

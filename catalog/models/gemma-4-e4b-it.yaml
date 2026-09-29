@@ -19,7 +19,7 @@ serving:
     # per-request chat_template_kwargs, so this default must live on the server
     # side. NOTE: unlike qwen3-5-9b and phi-4-mini-instruct (which run WITHOUT
     # reasoning), this Gemma entry is a reasoning run.
-    - '--chat-template-kwargs={\"enable_thinking\": true}'
+    - '--default-chat-template-kwargs={\"enable_thinking\": true}'
 instances:
   candidates:
   - g6e.2xlarge
