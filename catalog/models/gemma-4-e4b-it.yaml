@@ -19,5 +19,5 @@ instances:
   - g7e.2xlarge
   tensor_parallel_size: 1
 benchmark:
-  auto: true
+  auto: false
   instance_hourly_usd: 0.0
