@@ -87,8 +87,16 @@ JOB_NAME=$(k8s_name "oai-infopt-autostop-${MODEL_ID_DASHED}${TAG_SEG}-${RUN_TIME
 JOB_LABEL="oai-infopt-autostop-runner"
 
 # Label selector to find the quality Job(s) for this model+tag.
-RUN_TAG_LABEL="${TAG:-untagged}"
-QUALITY_SELECTOR="app.kubernetes.io/component=quality-runner,model=${MODEL},run-tag=${RUN_TAG_LABEL}"
+#
+# IMPORTANT: run-quality.sh labels each quality Job with run-tag=<base>-<sheet>
+# (e.g. "astest3-org", "astest3-xl") because ORG and XL are separate Jobs that
+# must land under separate S3 prefixes. The auto-stop only knows the BASE tag
+# (e.g. "astest3"), so an exact run-tag= match NEVER hits -> the counter stayed
+# 0/0 forever and the model was never stopped. We therefore select on
+# component+model only, then filter returned Jobs by a run-tag PREFIX equal to
+# the base tag (label selectors cannot do prefix matching themselves).
+RUN_TAG_BASE="${TAG:-untagged}"
+QUALITY_SELECTOR="app.kubernetes.io/component=quality-runner,model=${MODEL}"
 
 # How many quality Jobs to expect (one per sheet). Default: both sheets.
 EXPECTED_QUALITY_JOBS="${#QUALITY_SHEETS[@]}"
@@ -127,24 +135,43 @@ if [[ "${WAIT_MODE}" == "marker" ]]; then
     : "${WAIT_FOR_MARKER:?ERROR: --wait-for-marker is required for --wait-mode marker.}"
     WAIT_STEP=$(cat <<WAITEOF
               echo "Waiting for benchmark completion marker s3://${RESULTS_BUCKET}/${WAIT_FOR_MARKER}"
+              # This python block MUST exit 0 only when the marker is genuinely
+              # found (or the deadline is hit). ANY other failure - notably
+              # NoCredentialsError when the pod has no AWS identity - must exit
+              # non-zero so the bash guard below SKIPS the stop. Previously an
+              # uncaught boto3 error crashed python but bash (no set -e) fell
+              # through and deleted the model before the benchmark even ran.
               python3 -c "
-              import time
-              import boto3
-              from botocore.exceptions import ClientError
-              s3 = boto3.client('s3', region_name='${AWS_REGION}')
+              import sys, time
+              try:
+                  import boto3
+                  from botocore.exceptions import ClientError, NoCredentialsError, BotoCoreError
+              except Exception as exc:
+                  print('ERROR: boto3 import failed:', exc); sys.exit(3)
+              try:
+                  s3 = boto3.client('s3', region_name='${AWS_REGION}')
+              except Exception as exc:
+                  print('ERROR: could not create S3 client:', exc); sys.exit(3)
               deadline = time.time() + ${JOB_DEADLINE}
               while time.time() < deadline:
                   try:
                       s3.get_object(Bucket='${RESULTS_BUCKET}', Key='${WAIT_FOR_MARKER}')
-                      print('Benchmark marker found - pipeline complete.'); break
+                      print('Benchmark marker found - pipeline complete.'); sys.exit(0)
+                  except NoCredentialsError:
+                      print('ERROR: no AWS credentials in auto-stop pod; cannot poll S3 marker.')
+                      print('Refusing to stop the model blindly. Stop manually: oai stop ${MODEL} ${TAG:+--tag ${TAG}}')
+                      sys.exit(4)
                   except ClientError as exc:
                       code = str(exc.response.get('Error', {}).get('Code', ''))
-                      if code not in ('404', 'NoSuchKey', 'NotFound'):
-                          raise
-                      print('...pipeline not done; sleeping 30s'); time.sleep(30)
-              else:
-                  print('Auto-stop deadline reached before marker; stopping anyway.')
-              "
+                      if code in ('404', 'NoSuchKey', 'NotFound'):
+                          print('...pipeline not done; sleeping 30s'); time.sleep(30); continue
+                      if code in ('403', 'AccessDenied'):
+                          print('ERROR: access denied reading S3 marker; refusing to stop blindly.'); sys.exit(4)
+                      print('ERROR: unexpected S3 error:', code); sys.exit(4)
+                  except BotoCoreError as exc:
+                      print('ERROR: boto core error polling S3:', exc); sys.exit(4)
+              print('Auto-stop deadline reached before marker; stopping anyway.'); sys.exit(0)
+              " || { echo "Marker wait failed (exit \$?); NOT stopping the model. Stop manually if needed."; exit 1; }
 WAITEOF
 )
 else
@@ -159,15 +186,18 @@ else
                   # no matches; a '|| echo 0' would append a SECOND 0, producing a
                   # multi-line "0\n0" that breaks the numeric [[ ]] test below.
                   # Sanitize to a single integer with tr/head instead.
-                  total=\$(kubectl get jobs -n "${BENCHMARK_NAMESPACE}" -l "${QUALITY_SELECTOR}" \\
-                      -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' 2>/dev/null \\
-                      | grep -c . | tr -d '[:space:]' | head -c 8)
+                  # Emit one line per quality Job: "<run-tag> <complete-status> <failed-status>".
+                  # We then keep only rows whose run-tag equals the base tag OR
+                  # starts with "<base>-" (the per-sheet suffix, e.g. astest3-org).
+                  # This is the prefix match that a bare label selector can't do,
+                  # and it is why the old exact run-tag=<base> selector saw 0/0.
+                  rows=\$(kubectl get jobs -n "${BENCHMARK_NAMESPACE}" -l "${QUALITY_SELECTOR}" \\
+                      -o jsonpath='{range .items[*]}{.metadata.labels.run-tag}{" "}{.status.conditions[?(@.type=="Complete")].status}{" "}{.status.conditions[?(@.type=="Failed")].status}{"\n"}{end}' 2>/dev/null)
+                  total=\$(printf '%s\n' "\${rows}" | awk -v b="${RUN_TAG_BASE}" 'NF && (\$1==b || index(\$1, b"-")==1)' | grep -c .)
                   total=\${total:-0}
-                  finished=\$(kubectl get jobs -n "${BENCHMARK_NAMESPACE}" -l "${QUALITY_SELECTOR}" \\
-                      -o jsonpath='{range .items[*]}{.status.conditions[?(@.type=="Complete")].status}{.status.conditions[?(@.type=="Failed")].status}{"\n"}{end}' 2>/dev/null \\
-                      | grep -c "True" | tr -d '[:space:]' | head -c 8)
+                  finished=\$(printf '%s\n' "\${rows}" | awk -v b="${RUN_TAG_BASE}" 'NF && (\$1==b || index(\$1, b"-")==1) && (\$2=="True" || \$3=="True")' | grep -c .)
                   finished=\${finished:-0}
-                  echo "...quality Jobs finished \${finished}/\${total} (expected ${EXPECTED_QUALITY_JOBS}); sleeping 30s"
+                  echo "...quality Jobs finished \${finished}/\${total} (base-tag=${RUN_TAG_BASE}, expected ${EXPECTED_QUALITY_JOBS}); sleeping 30s"
                   if [[ "\${total}" -ge "${EXPECTED_QUALITY_JOBS}" && "\${finished}" -ge "\${total}" && "\${total}" -gt 0 ]]; then
                       echo "All quality Jobs finished - pipeline complete."; break
                   fi
@@ -189,7 +219,7 @@ metadata:
     app.kubernetes.io/component: auto-stop-runner
     project: observeai-inference-optimization
     model: "${MODEL}"
-    run-tag: "${RUN_TAG_LABEL}"
+    run-tag: "${RUN_TAG_BASE}"
 spec:
   backoffLimit: 1
   activeDeadlineSeconds: $((JOB_DEADLINE + 600))
@@ -201,7 +231,7 @@ spec:
         app.kubernetes.io/component: auto-stop-runner
         project: observeai-inference-optimization
         model: "${MODEL}"
-        run-tag: "${RUN_TAG_LABEL}"
+        run-tag: "${RUN_TAG_BASE}"
     spec:
       restartPolicy: Never
       serviceAccountName: oai-infopt-autostop-sa
@@ -237,10 +267,31 @@ spec:
               export PYTHONPATH="/tmp/pip-packages:\${PYTHONPATH:-}"
 
               # kubectl (for job watch + delete) and boto3 (for marker mode).
+              # The container image (vLLM DLC) has neither kubectl nor curl, so
+              # download kubectl using whatever IS present: curl, wget, or python.
+              # Without this the kubectl calls silently fail and the job counter
+              # stays 0/0 forever (auto-stop never fires).
+              KVER="v1.30.0"
+              KURL="https://dl.k8s.io/release/\${KVER}/bin/linux/amd64/kubectl"
               if ! command -v kubectl >/dev/null 2>&1; then
-                echo "Installing kubectl..."
-                curl -sfL "https://dl.k8s.io/release/v1.30.0/bin/linux/amd64/kubectl" -o /tmp/kubectl \
-                  && chmod +x /tmp/kubectl && export PATH="/tmp:\${PATH}"
+                echo "kubectl not found - downloading to /tmp..."
+                if command -v curl >/dev/null 2>&1; then
+                  curl -sfL "\${KURL}" -o /tmp/kubectl
+                elif command -v wget >/dev/null 2>&1; then
+                  wget -q "\${KURL}" -O /tmp/kubectl
+                else
+                  echo "curl/wget missing - fetching kubectl via python urllib..."
+                  python3 -c "import urllib.request; urllib.request.urlretrieve('\${KURL}', '/tmp/kubectl')"
+                fi
+                chmod +x /tmp/kubectl && export PATH="/tmp:\${PATH}"
+              fi
+              # Fail loudly if kubectl still isn't usable, so the job doesn't spin
+              # at 0/0 pretending to wait. It errors out and the model can be
+              # stopped manually instead of billing forever.
+              if ! kubectl version --client >/dev/null 2>&1; then
+                echo "ERROR: kubectl unavailable after install attempts; cannot watch jobs."
+                echo "Stop the model manually: oai stop ${MODEL} ${TAG:+--tag ${TAG}}"
+                exit 1
               fi
               python3 -c "import boto3" 2>/dev/null || \
                 pip install --quiet --no-cache-dir --target=/tmp/pip-packages boto3==1.34.0 || true

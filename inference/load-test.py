@@ -148,6 +148,11 @@ class BenchmarkResult:
     successful_requests: int
     error_rate_pct: float
     reasoning_effort: str
+    # OBSERVED at inference time by probing the live server (see _probe_reasoning):
+    # "ON" if the server actually emitted chain-of-thought on a probe request,
+    # "OFF" if it did not, "-" if the probe was inconclusive. This is the truth of
+    # what the run did, independent of any config/deployment default.
+    reasoning_observed: str
     git_sha: str
     started_at: str
     ended_at: str
@@ -187,6 +192,61 @@ def _wait_for_vllm(endpoint: str, timeout_s: int = 300) -> None:
         except Exception:  # noqa: BLE001
             time.sleep(5)
     raise TimeoutError(f"vLLM not ready at {endpoint} after {timeout_s}s")
+
+
+# ---------------------------------------------------------------------------
+# Inference-time reasoning probe
+# ---------------------------------------------------------------------------
+def _probe_reasoning(endpoint: str, served_model: str, timeout: int = 30) -> str:
+    """Detect whether the SERVER actually reasons at INFERENCE TIME.
+
+    This is deliberately NOT read from any config/deployment default. It asks the
+    live server one throwaway question and inspects the reply for evidence that
+    the model produced chain-of-thought:
+
+      * a non-empty ``reasoning`` / ``reasoning_content`` field (vLLM surfaces
+        chain-of-thought here when a reasoning parser is active), or
+      * a ``<think>...</think>`` block in the content.
+
+    Whatever governed that reply — a server-side ``--default-chat-template-kwargs``
+    default, a model that thinks by default, or nothing — is captured as the
+    OBSERVED behaviour of this run. `vllm bench serve` discards response bodies,
+    so without this probe the perf row has no reasoning signal at all.
+
+    Returns "ON", "OFF", or "-" (probe failed / inconclusive).
+    """
+    body = {
+        "model": served_model,
+        "messages": [{"role": "user", "content": "In one short sentence, is 17 a prime number?"}],
+        "temperature": 0.0,
+        "max_tokens": 512,
+    }
+    try:
+        data = json.dumps(body).encode("utf-8")
+        req = urllib.request.Request(  # noqa: S310
+            f"{endpoint}/v1/chat/completions", data=data,
+            headers={"Content-Type": "application/json"}, method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310
+            out = json.loads(resp.read())
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Reasoning probe failed (%s); recording reasoning_observed as '-'.",
+                       type(exc).__name__)
+        return "-"
+
+    try:
+        msg = (out.get("choices") or [{}])[0].get("message") or {}
+    except (AttributeError, IndexError, TypeError):
+        return "-"
+
+    reasoning_field = str(msg.get("reasoning") or msg.get("reasoning_content") or "").strip()
+    content = str(msg.get("content") or "")
+    has_think_block = bool(re.search(r"<\s*(think|thinking|reasoning)\s*>", content, re.IGNORECASE))
+
+    observed = "ON" if (reasoning_field or has_think_block) else "OFF"
+    logger.info("Reasoning probe: observed=%s (reasoning_field=%s, think_block=%s)",
+                observed, bool(reasoning_field), has_think_block)
+    return observed
 
 
 # ---------------------------------------------------------------------------
@@ -639,6 +699,7 @@ def _build_result(
     manifest: dict[str, Any],
     opt: dict[str, Any],
     reasoning_effort: str,
+    reasoning_observed: str,
     correlation_id: str,
     started_at: str,
     ended_at: str,
@@ -710,6 +771,7 @@ def _build_result(
         successful_requests=completed,
         error_rate_pct=0.0,
         reasoning_effort=reasoning_effort,
+        reasoning_observed=reasoning_observed,
         git_sha=git_sha,
         started_at=started_at,
         ended_at=ended_at,
@@ -979,6 +1041,11 @@ def _run(args: argparse.Namespace) -> None:
 
     _wait_for_vllm(endpoint, timeout_s=args.wait_timeout)
 
+    # Probe ONCE per run: observe whether the server actually reasons at inference
+    # time. Applied to every level's result row so the report reflects what this
+    # run did, not a config default. Cheap (one request) and done before the load.
+    reasoning_observed = _probe_reasoning(endpoint, served_model)
+
     # Start from a clean JSONL so incremental appends don't inherit stale rows
     # from a prior run that reused the same output directory.
     _reset_results_file(args.output, run_id)
@@ -1018,7 +1085,8 @@ def _run(args: argparse.Namespace) -> None:
         result = _build_result(
             bench=bench, vmetrics_before=vmetrics_before, vmetrics_after=vmetrics_after,
             telemetry=telemetry, concurrency=conc, profile_id=profile_id, manifest=manifest, opt=opt,
-            reasoning_effort=reasoning_effort, correlation_id=correlation_id,
+            reasoning_effort=reasoning_effort, reasoning_observed=reasoning_observed,
+            correlation_id=correlation_id,
             started_at=started_at, ended_at=ended_at,
         )
         result = _check_slo(result, slo)

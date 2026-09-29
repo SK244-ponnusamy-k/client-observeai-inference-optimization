@@ -74,6 +74,15 @@ class QualityResult:
     dataset_version: str
     decoding_mode: str
     reasoning_effort: str
+    # The per-request reasoning DEFAULT this run used, from the config's
+    # model.chat_template_kwargs (e.g. {"enable_thinking": false}). Empty dict
+    # means the run sent no chat-template override, so the SERVER default
+    # (--default-chat-template-kwargs) governed thinking.
+    chat_template_kwargs: dict[str, Any]
+    # OBSERVED at inference time by probing the live server (see _probe_reasoning):
+    # "ON"/"OFF"/"-". Since the quality config sends no thinking override, this is
+    # what the SERVER default actually produced on this run.
+    reasoning_observed: str
     n_total: int
 
     n_scored: int
@@ -762,6 +771,48 @@ def _f1_for(preds: list[str], golds: list[str], pos: str) -> float:
 
 
 # ---------------------------------------------------------------------------
+# Inference-time reasoning probe
+# ---------------------------------------------------------------------------
+def _probe_reasoning(endpoint: str, served_model: str, timeout: int = 30) -> str:
+    """Observe whether the SERVER actually reasons at inference time.
+
+    The quality config sends no chat_template_kwargs, so thinking is decided by
+    the vLLM server default (--default-chat-template-kwargs). Rather than infer
+    that from config, this asks the live server one throwaway question and looks
+    at the reply for chain-of-thought: a non-empty ``reasoning`` /
+    ``reasoning_content`` field, or a ``<think>`` block in the content.
+
+    Returns "ON", "OFF", or "-" (probe failed / inconclusive). Recorded on the
+    result row so the report shows what the run actually did.
+    """
+    body = {
+        "model": served_model,
+        "messages": [{"role": "user", "content": "In one short sentence, is 17 a prime number?"}],
+        "temperature": 0.0,
+        "max_tokens": 512,
+    }
+    try:
+        out = _post_chat(endpoint, body)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Reasoning probe failed (%s); recording reasoning_observed as '-'.",
+                       type(exc).__name__)
+        return "-"
+
+    try:
+        msg = (out.get("choices") or [{}])[0].get("message") or {}
+    except (AttributeError, IndexError, TypeError):
+        return "-"
+
+    reasoning_field = str(msg.get("reasoning") or msg.get("reasoning_content") or "").strip()
+    content = str(msg.get("content") or "")
+    has_think_block = bool(_THINK_OPEN_RE.search(content))
+    observed = "ON" if (reasoning_field or has_think_block) else "OFF"
+    logger.info("Reasoning probe: observed=%s (reasoning_field=%s, think_block=%s)",
+                observed, bool(reasoning_field), has_think_block)
+    return observed
+
+
+# ---------------------------------------------------------------------------
 # Health wait
 # ---------------------------------------------------------------------------
 def _wait_for_vllm(endpoint: str, timeout_s: int = 300) -> None:
@@ -808,6 +859,10 @@ def _run(args: argparse.Namespace) -> None:
         "guided_choice supported=%s; constrained retry on truncation=%s",
         guided_ok, bool(dcfg.get("truncation_fallback", True)),
     )
+
+    # Observe reasoning at inference time. The quality config sends no thinking
+    # override, so this captures what the SERVER default actually did on this run.
+    reasoning_observed = _probe_reasoning(endpoint, served_model)
 
     started_at = datetime.now(tz=timezone.utc).isoformat()
 
@@ -909,6 +964,10 @@ def _run(args: argparse.Namespace) -> None:
         ),
         decoding_mode=str(dcfg.get("mode", "guided_choice")),
         reasoning_effort=str(mcfg.get("reasoning_effort", "") or "n/a"),
+        # Configured chat-template default ({} = none set -> server default) and
+        # the inference-time observed reasoning behaviour.
+        chat_template_kwargs=dict(mcfg.get("chat_template_kwargs") or {}),
+        reasoning_observed=reasoning_observed,
         n_total=len(results),
         n_scored=len(results) - n_unparseable,
         n_unparseable=n_unparseable,
@@ -1032,7 +1091,12 @@ def _run(args: argparse.Namespace) -> None:
 def _print_summary(r: QualityResult) -> None:
     sep = "=" * 70
     print(f"\n{sep}\n  QUALITY (AutoQA) — {r.served_model}  [{r.quantization}]  ({r.hardware})\n{sep}")
+    ctk_str = (
+        " ".join(f"{k}={v}" for k, v in sorted(r.chat_template_kwargs.items()))
+        if r.chat_template_kwargs else "server-default"
+    )
     print(f"  dataset={r.dataset_version}  decoding={r.decoding_mode}  reasoning={r.reasoning_effort}")
+    print(f"  chat_template_kwargs={ctk_str}  reasoning_observed={r.reasoning_observed}")
     print(f"  n={r.n_total}  unparseable={r.n_unparseable}  truncated={r.n_truncated}"
           f"  recovered_by_retry={r.n_fallback}")
     if r.verdict_sources:

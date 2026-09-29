@@ -320,6 +320,71 @@ def export_csv(results: list[dict[str, Any]], csv_path: Path) -> None:
     print(f"[SUCCESS] Benchmark comparison CSV exported to: {csv_path.resolve()}")
 
 
+def _reasoning_flag(r: dict[str, Any]) -> str:
+    """Derive whether a run let the model REASON (think) before answering.
+
+    "reasoning true/false" is not a single stored field — it is the combination of
+    how the row was decoded:
+
+      * decoding_mode == "guided_choice"  -> the model is forced to emit only a
+        label, so it CANNOT reason. Reasoning = OFF.
+      * chat_template_kwargs.enable_thinking == false -> thinking explicitly
+        disabled (Qwen3). Reasoning = OFF.
+      * reasoning_effort in ("", "n/a", "none", "off") on a free_parse run ->
+        no reasoning budget requested. Reasoning = OFF.
+      * otherwise (free_parse with a real effort / thinking left on) -> the model
+        was allowed to think first. Reasoning = ON.
+
+    Performance rows have no decoding_mode; there the reasoning_effort alone
+    decides. Returns "ON", "OFF", or "-" when nothing about reasoning is recorded.
+    """
+    # Inference-time observation wins over everything else: load-test.py probes
+    # the live server and records what it ACTUALLY did (reasoning_observed), which
+    # is more trustworthy than any config/deployment default.
+    observed = str(r.get("reasoning_observed") or "").strip().upper()
+    if observed in ("ON", "OFF"):
+        return observed
+
+    mode = str(r.get("decoding_mode") or "").strip().lower()
+    effort = str(r.get("reasoning_effort") or "").strip().lower()
+
+    # Explicit thinking-off via chat template kwargs (may be nested in config echo).
+    ctk = r.get("chat_template_kwargs")
+    if isinstance(ctk, dict) and str(ctk.get("enable_thinking")).strip().lower() == "false":
+        return "OFF"
+
+    if mode == "guided_choice":
+        return "OFF"
+
+    effort_off = effort in ("", "n/a", "na", "none", "off")
+    if mode == "free_parse":
+        return "OFF" if effort_off else "ON"
+
+    # No decoding_mode recorded (performance rows): decide on effort alone.
+    if not mode:
+        if effort_off:
+            return "-" if effort in ("", "n/a", "na") else "OFF"
+        return "ON"
+    return "-"
+
+
+def _format_chat_template_kwargs(ctk: Any) -> str:
+    """Render the quality run's chat-template DEFAULT for the report.
+
+    A populated dict (e.g. {"enable_thinking": false}) is shown as
+    "enable_thinking=False". An empty/absent dict means the quality run sent no
+    per-request override, so the vLLM SERVER default governed thinking — shown as
+    "server-default". Older rows that predate this field show "-".
+    """
+    if ctk is None:
+        return "-"
+    if isinstance(ctk, dict):
+        if not ctk:
+            return "server-default"
+        return " ".join(f"{k}={v}" for k, v in sorted(ctk.items()))
+    return str(ctk)
+
+
 def _v(r: dict[str, Any], *keys: str, default: float = 0.0) -> float:
     """Safely extract float metric from dict, handling None values and key fallbacks."""
     for key in keys:
@@ -545,6 +610,8 @@ def export_excel(
     headers_perf = [
         "Model (HF ID)",
         "Profile",
+        "Reasoning",
+        "Reasoning Effort",
         "Concurrency",
         "TTFT p50 (ms)",
         "TTFT p95 (ms)",
@@ -569,15 +636,21 @@ def export_excel(
     seen_perf = set()
     unique_perf = []
     for r in perf_results:
-        key = (r.get("hf_id", ""), r.get("profile", ""), r.get("concurrency", 0), r.get("started_at", ""))
+        # Reasoning is part of the run identity: a with-reasoning and a
+        # without-reasoning run of the same model/profile/concurrency are two
+        # distinct results and must both survive dedup so they can be compared.
+        key = (r.get("hf_id", ""), r.get("profile", ""), _reasoning_flag(r),
+               r.get("concurrency", 0), r.get("started_at", ""))
         if key not in seen_perf:
             seen_perf.add(key)
             unique_perf.append(r)
 
-    for r in sorted(unique_perf, key=lambda x: (x.get("hf_id", ""), x.get("profile", ""), x.get("concurrency", 0))):
+    for r in sorted(unique_perf, key=lambda x: (x.get("hf_id", ""), x.get("profile", ""), _reasoning_flag(x), x.get("concurrency", 0))):
         ws_perf.append([
             r.get("hf_id", "unknown").split("/")[-1],
             r.get("profile", "unknown"),
+            _reasoning_flag(r),
+            r.get("reasoning_effort", "-") or "-",
             r.get("concurrency", 1),
             round(_v(r, "ttft_p50_ms", "median_ttft_ms"), 1),
             round(_v(r, "ttft_p95_ms", "p95_ttft_ms"), 1),
@@ -619,7 +692,11 @@ def export_excel(
         "Truncated",
         "Recovered by Retry",
         "Verdict Sources",
+        "Reasoning",
+        "Reasoning (observed)",
+        "Reasoning Effort",
         "Decoding Mode",
+        "Chat Template Kwargs (default)",
         "Timestamp",
     ]
 
@@ -633,12 +710,16 @@ def export_excel(
     seen_qual = set()
     unique_qual = []
     for q in qual_results:
-        key = (q.get("_clean_model", ""), q.get("_clean_testset", ""), q.get("_clean_quant", ""), q.get("_clean_hw", ""), q.get("started_at", ""))
+        # Reasoning ON/OFF is part of the identity so a with-reasoning and a
+        # without-reasoning run of the same model on the same test set (e.g.
+        # Test-XL) both appear as their own rows instead of collapsing to one.
+        key = (q.get("_clean_model", ""), q.get("_clean_testset", ""), q.get("_clean_quant", ""),
+               q.get("_clean_hw", ""), _reasoning_flag(q), q.get("started_at", ""))
         if key not in seen_qual:
             seen_qual.add(key)
             unique_qual.append(q)
 
-    for q in sorted(unique_qual, key=lambda x: (x.get("_clean_model", ""), x.get("_clean_testset", ""), x.get("_clean_quant", ""))):
+    for q in sorted(unique_qual, key=lambda x: (x.get("_clean_model", ""), x.get("_clean_testset", ""), x.get("_clean_quant", ""), _reasoning_flag(x))):
         conf = q.get("confusion") or {}
         if not isinstance(conf, dict):
             conf = {}
@@ -672,7 +753,11 @@ def export_excel(
                 if isinstance(q.get("verdict_sources"), dict) and q.get("verdict_sources")
                 else "-"
             ),
+            _reasoning_flag(q),
+            (str(q.get("reasoning_observed")).upper() if str(q.get("reasoning_observed") or "").strip() else "-"),
+            q.get("reasoning_effort", "-") or "-",
             q.get("decoding_mode", "-"),
+            _format_chat_template_kwargs(q.get("chat_template_kwargs")),
             str(q.get("started_at", q.get("timestamp", "-")))[:19].replace("T", " "),
         ])
 
@@ -849,24 +934,26 @@ def print_comparison_table(
     if perf_results:
         print("\n  [ PERFORMANCE & EFFICIENCY BENCHMARKS ]")
         print(
-            f"  {'Model':<22} {'HW':<8} {'Profile':<9} {'Concur':>6} "
+            f"  {'Model':<22} {'HW':<8} {'Profile':<9} {'Reason':<7} {'Concur':>6} "
             f"{'TTFT p95':>10} {'ITL p95':>9} {'Tok/s':>9} "
             f"{'Cost/1M':>9} {'GPU Util':>9} {'Status':<9}"
         )
-        print(f"  {'-'*101}")
+        print(f"  {'-'*108}")
 
         seen = set()
         unique_perf = []
         for r in perf_results:
-            key = (r.get("hf_id", ""), r.get("profile", ""), r.get("concurrency", 0), r.get("started_at", ""))
+            key = (r.get("hf_id", ""), r.get("profile", ""), _reasoning_flag(r),
+                   r.get("concurrency", 0), r.get("started_at", ""))
             if key not in seen:
                 seen.add(key)
                 unique_perf.append(r)
 
-        for r in sorted(unique_perf, key=lambda x: (x.get("hf_id", ""), x.get("profile", ""), x.get("concurrency", 0))):
+        for r in sorted(unique_perf, key=lambda x: (x.get("hf_id", ""), x.get("profile", ""), _reasoning_flag(x), x.get("concurrency", 0))):
             model = r.get("hf_id", "unknown").split("/")[-1]
             hw = r.get("instance_type", r.get("hardware", "-"))
             profile = r.get("profile", "unknown")
+            reasoning = _reasoning_flag(r)
             concurrency = r.get("concurrency", 1)
             ttft_p95 = f"{_v(r, 'ttft_p95_ms', 'p95_ttft_ms'):.1f}ms"
             itl_p95 = f"{_v(r, 'itl_p95_ms', 'p95_itl_ms'):.1f}ms"
@@ -876,7 +963,7 @@ def print_comparison_table(
             status = "PASSED" if r.get("status") == "passed" else "SLO FAIL"
 
             print(
-                f"  {model:<22} {hw:<8} {profile:<9} {concurrency:>6} "
+                f"  {model:<22} {hw:<8} {profile:<9} {reasoning:<7} {concurrency:>6} "
                 f"{ttft_p95:>10} {itl_p95:>9} {throughput:>9} "
                 f"{cost:>9} {gpu_util:>9} {status:<9}"
             )
@@ -885,24 +972,26 @@ def print_comparison_table(
     if qual_results:
         print("\n  [ QUALITY & ACCURACY BENCHMARKS (AutoQA F1 Score) ]")
         print(
-            f"  {'Model':<22} {'HW':<8} {'Quant':<8} {'Rows':>6} "
+            f"  {'Model':<22} {'HW':<8} {'Quant':<8} {'Reason':<7} {'Rows':>6} "
             f"{'Accuracy':>10} {'Precision':>10} {'Recall':>9} {'F1 Score':>10} "
             f"{'Unparse':>8} {'Trunc':>6}"
         )
-        print(f"  {'-'*106}")
+        print(f"  {'-'*113}")
 
         seen_q = set()
         unique_qual = []
         for q in qual_results:
-            key = (q.get("_clean_model", ""), q.get("_clean_quant", ""), q.get("_clean_hw", ""), q.get("started_at", ""))
+            key = (q.get("_clean_model", ""), q.get("_clean_quant", ""), q.get("_clean_hw", ""),
+                   _reasoning_flag(q), q.get("started_at", ""))
             if key not in seen_q:
                 seen_q.add(key)
                 unique_qual.append(q)
 
-        for q in sorted(unique_qual, key=lambda x: (x.get("_clean_model", ""), x.get("_clean_quant", ""))):
+        for q in sorted(unique_qual, key=lambda x: (x.get("_clean_model", ""), x.get("_clean_quant", ""), _reasoning_flag(x))):
             model = str(q.get("_clean_model", "gpt-oss-20b"))
             hw = str(q.get("_clean_hw", "-"))
             quant = str(q.get("_clean_quant", "-"))
+            reasoning = _reasoning_flag(q)
             rows = q.get("_clean_rows", 1200)
             acc = f"{q.get('_clean_acc', 0.0):.2f}%"
             prec = f"{_v(q, 'precision'):.4f}"
@@ -912,7 +1001,7 @@ def print_comparison_table(
             trunc = str(q.get("n_truncated", "-"))
 
             print(
-                f"  {model:<22} {hw:<8} {quant:<8} {rows:>6} "
+                f"  {model:<22} {hw:<8} {quant:<8} {reasoning:<7} {rows:>6} "
                 f"{acc:>10} {prec:>10} {rec:>9} {f1:>10} "
                 f"{unparse:>8} {trunc:>6}"
             )
