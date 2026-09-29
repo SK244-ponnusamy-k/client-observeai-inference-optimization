@@ -11,6 +11,15 @@ source:
 serving:
   quantization: none
   max_model_len: 16384
+  extra_args:
+    # Run WITH reasoning. Gemma 4 HAS a thinking mode: the bundled chat template
+    # reads `enable_thinking | default(false)`, so thinking is OFF by default.
+    # We set it to true here to turn reasoning ON for this model (the model emits
+    # <think> chain-of-thought before its answer). The benchmark harness sends no
+    # per-request chat_template_kwargs, so this default must live on the server
+    # side. NOTE: unlike qwen3-5-9b and phi-4-mini-instruct (which run WITHOUT
+    # reasoning), this Gemma entry is a reasoning run.
+    - '--chat-template-kwargs={\"enable_thinking\": true}'
 instances:
   candidates:
   - g6e.2xlarge

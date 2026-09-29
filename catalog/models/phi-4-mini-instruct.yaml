@@ -11,6 +11,15 @@ source:
 serving:
   quantization: none
   max_model_len: 16384
+  extra_args:
+    # Run WITHOUT reasoning. This is the plain -instruct variant (NOT
+    # microsoft/Phi-4-mini-reasoning). The thinking-off default is set on the
+    # server because the benchmark harness (`vllm bench serve` ->
+    # /v1/chat/completions) sends no per-request chat_template_kwargs. If this
+    # template does not read enable_thinking, vLLM ignores the unknown kwarg
+    # (harmless no-op); if it does, thinking is forced off. Either way the run
+    # stays non-reasoning.
+    - '--chat-template-kwargs={\"enable_thinking\": false}'
 instances:
   candidates:
   - g6e.2xlarge

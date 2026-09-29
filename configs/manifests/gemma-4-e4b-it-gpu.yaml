@@ -9,7 +9,7 @@
 # For Trainium/Neuron, use the separate <id>-neuron-*.yaml manifest (--manifest).
 # Edit catalog/models/gemma-4-e4b-it.yaml and re-generate. Every field is read by inference/load-test.py.
 # ==============================================================================
-run_id: gemma-4-e4b-it-2026-09-28-001
+run_id: gemma-4-e4b-it-2026-09-29-001
 description: "google/gemma-4-E4B-it none, any NVIDIA G instance (TP=1)"
 
 model:
@@ -50,4 +50,4 @@ tags:
   ManagedBy: oai-cli
   Owner: TBD
   CostCenter: TBD
-  RunId: gemma-4-e4b-it-2026-09-28-001
+  RunId: gemma-4-e4b-it-2026-09-29-001

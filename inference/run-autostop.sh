@@ -155,11 +155,18 @@ else
               deadline=\$(( \$(date +%s) + ${JOB_DEADLINE} ))
               while [[ \$(date +%s) -lt \${deadline} ]]; do
                   # A quality Job is "finished" when it has a Complete or Failed condition.
+                  # NOTE: 'grep -c' already prints 0 (and exits 1) when there are
+                  # no matches; a '|| echo 0' would append a SECOND 0, producing a
+                  # multi-line "0\n0" that breaks the numeric [[ ]] test below.
+                  # Sanitize to a single integer with tr/head instead.
                   total=\$(kubectl get jobs -n "${BENCHMARK_NAMESPACE}" -l "${QUALITY_SELECTOR}" \\
-                      -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' 2>/dev/null | grep -c . || echo 0)
+                      -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' 2>/dev/null \\
+                      | grep -c . | tr -d '[:space:]' | head -c 8)
+                  total=\${total:-0}
                   finished=\$(kubectl get jobs -n "${BENCHMARK_NAMESPACE}" -l "${QUALITY_SELECTOR}" \\
                       -o jsonpath='{range .items[*]}{.status.conditions[?(@.type=="Complete")].status}{.status.conditions[?(@.type=="Failed")].status}{"\n"}{end}' 2>/dev/null \\
-                      | grep -c "True" || echo 0)
+                      | grep -c "True" | tr -d '[:space:]' | head -c 8)
+                  finished=\${finished:-0}
                   echo "...quality Jobs finished \${finished}/\${total} (expected ${EXPECTED_QUALITY_JOBS}); sleeping 30s"
                   if [[ "\${total}" -ge "${EXPECTED_QUALITY_JOBS}" && "\${finished}" -ge "\${total}" && "\${total}" -gt 0 ]]; then
                       echo "All quality Jobs finished - pipeline complete."; break

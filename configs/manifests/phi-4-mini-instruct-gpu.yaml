@@ -9,7 +9,7 @@
 # For Trainium/Neuron, use the separate <id>-neuron-*.yaml manifest (--manifest).
 # Edit catalog/models/phi-4-mini-instruct.yaml and re-generate. Every field is read by inference/load-test.py.
 # ==============================================================================
-run_id: phi-4-mini-instruct-2026-09-28-001
+run_id: phi-4-mini-instruct-2026-09-29-001
 description: "microsoft/Phi-4-mini-instruct none, any NVIDIA G instance (TP=1)"
 
 model:
@@ -50,4 +50,4 @@ tags:
   ManagedBy: oai-cli
   Owner: TBD
   CostCenter: TBD
-  RunId: phi-4-mini-instruct-2026-09-28-001
+  RunId: phi-4-mini-instruct-2026-09-29-001

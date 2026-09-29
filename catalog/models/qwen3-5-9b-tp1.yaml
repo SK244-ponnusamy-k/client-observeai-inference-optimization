@@ -12,7 +12,20 @@ serving:
   quantization: none
   max_model_len: 16384
   extra_args:
-    - "--reasoning-parser=qwen3"   # enable reasoning: split <think> tokens into reasoning_content
+    # Run WITHOUT reasoning. Qwen3.5 has thinking ON by default in its chat
+    # template, so disabling reasoning needs BOTH of:
+    #   1. NOT loading the qwen3 reasoning parser (no <think> splitting), and
+    #   2. a server-side default that turns thinking OFF for every request.
+    # The benchmark harness uses `vllm bench serve` -> /v1/chat/completions and
+    # sends NO per-request chat_template_kwargs, so the OFF switch must live on
+    # the server. --chat-template-kwargs sets that default (request values still
+    # win if ever provided). Without it, the model keeps emitting <think> blocks
+    # and burns output tokens even though nothing parses them.
+    #
+    # NOTE on quoting: the generator wraps each extra arg in double quotes in the
+    # rendered deployment.yaml (- "<arg>"). The JSON value needs double quotes on
+    # its key, so they are pre-escaped as \" here to stay valid YAML after render.
+    - '--chat-template-kwargs={\"enable_thinking\": false}'
 instances:
   candidates:
   - g6e.2xlarge
