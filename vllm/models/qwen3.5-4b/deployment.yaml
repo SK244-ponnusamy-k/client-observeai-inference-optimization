@@ -127,7 +127,7 @@ spec:
             - "--gpu-memory-utilization=0.90"
             - "--max-model-len=16384"
             # ── Scheduler / batching ─────────────────────────────────────────
-            - "--max-num-seqs=1024"
+            - "--max-num-seqs=256"
             - "--max-num-batched-tokens=8192"
             - "--async-scheduling"
             # ── Benchmark consistency ────────────────────────────────────────
