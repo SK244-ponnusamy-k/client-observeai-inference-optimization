@@ -53,6 +53,13 @@ import yaml
 
 logger = logging.getLogger(__name__)
 
+# Distinct exit code for "the model endpoint never became ready" (health check
+# timed out). Kept SEPARATE from a generic error (exit 1) and from an SLO miss
+# (exit 0) so the in-cluster marker — and every downstream gate/report — can
+# tell "the model never came up" (e.g. no GPU capacity) apart from "the model
+# ran but the measurement failed" or "the model ran but missed an SLO".
+EXIT_MODEL_NOT_READY = 3
+
 
 # ---------------------------------------------------------------------------
 # Logging — structured JSON per shellkode-code-standards.md
@@ -1039,7 +1046,20 @@ def _run(args: argparse.Namespace) -> None:
         logger.warning("OAI_VLLM_DEPLOYMENT/OAI_VLLM_NAMESPACE unset - GPU telemetry is NOT pod-scoped "
                        "and may mix GPUs from other nodes.")
 
-    _wait_for_vllm(endpoint, timeout_s=args.wait_timeout)
+    try:
+        _wait_for_vllm(endpoint, timeout_s=args.wait_timeout)
+    except TimeoutError as exc:
+        # The endpoint never became ready within the wait budget. This is NOT a
+        # benchmark result and NOT a generic measurement error — the model never
+        # served (commonly: no GPU capacity, OOM at startup, or a still-pending
+        # pod). Exit with the dedicated code so the marker records the real
+        # reason and downstream stages don't misreport it as a load-test failure.
+        logger.error(
+            "vLLM endpoint never became ready: %s. Skipping benchmark (model-not-ready). "
+            "This is an infrastructure/capacity issue, not a benchmark failure.",
+            exc,
+        )
+        raise SystemExit(EXIT_MODEL_NOT_READY) from exc
 
     # Probe ONCE per run: observe whether the server actually reasons at inference
     # time. Applied to every level's result row so the report reflects what this

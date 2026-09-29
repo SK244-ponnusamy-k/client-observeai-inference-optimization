@@ -502,21 +502,20 @@ def fix_instance_labels(results: list[dict[str, Any]]) -> int:
     return fixed
 
 
-def build_per_qid_metrics(sample_results: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Per-QID metrics as one record per (run, question_id), from the samples.
+def _confusion_from_samples(sample_results: list[dict[str, Any]]) -> dict[tuple, dict[str, int]]:
+    """Confusion counts per (model, testset, hw, quant, qid) from dumped samples.
 
-    Each quality run's samples carry gold + pred + question_id per row, so the
-    full binary metric set (accuracy / precision / recall / F1 + confusion) is
-    derived here PER QID. Positive class is "Yes", matching the evaluator. A run
-    is identified by model + test set + hardware + quant + run label so the same
-    QID from Test-ORG and Test-XL (or two models) stays on separate rows.
-
-    Returns [] when no samples were dumped (nothing to segment).
+    Samples are the ONLY source of per-row gold/pred, so TP/FP/FN/TN can only be
+    derived where a run was dumped with --dump-samples. Keyed WITHOUT the run
+    label so a single aggregate run matches its samples regardless of the run
+    folder. Returns {} when no samples exist.
     """
-    if not sample_results:
-        return []
-    # Group rows by (run identity, qid).
-    groups: dict[tuple, list[dict[str, Any]]] = {}
+    def _norm(v: Any) -> str:
+        t = str(v or "").strip().lower()
+        return "Yes" if t == "yes" else "No" if t == "no" else str(v or "").strip()
+
+    pos = "Yes"
+    conf: dict[tuple, dict[str, int]] = {}
     for s in sample_results:
         qid = str(s.get("question_id") or "").strip() or "(no QID)"
         key = (
@@ -524,45 +523,145 @@ def build_per_qid_metrics(sample_results: list[dict[str, Any]]) -> list[dict[str
             s.get("_clean_testset", "-"),
             s.get("_clean_hw", "-"),
             s.get("_clean_quant", "-"),
-            s.get("_run", "-"),
             qid,
         )
-        groups.setdefault(key, []).append(s)
+        c = conf.setdefault(key, {"tp": 0, "fp": 0, "fn": 0, "tn": 0, "other": 0, "n": 0})
+        g = _norm(s.get("gold"))
+        p = _norm(s.get("pred"))
+        c["n"] += 1
+        if g == pos and p == pos:
+            c["tp"] += 1
+        elif g != pos and p == pos:
+            c["fp"] += 1
+        elif g == pos and p != pos:
+            c["fn"] += 1
+        elif g != pos and p == g:
+            c["tn"] += 1
+        else:
+            c["other"] += 1
+    return conf
 
-    def _norm(v: Any) -> str:
-        t = str(v or "").strip().lower()
-        return "Yes" if t == "yes" else "No" if t == "no" else str(v or "").strip()
+
+def build_per_qid_metrics(
+    sample_results: list[dict[str, Any]],
+    qual_results: list[dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
+    """Per-QID metrics as one record per (run, question_id), over the FULL dataset.
+
+    The authoritative source is the aggregate quality result row, which carries
+    ``per_question_n`` and ``per_question_f1`` computed by the evaluator over
+    EVERY scored transcript (all 1200), not the capped --dump-samples slice. So a
+    QID appears here whenever the run scored it, and ``Rows`` is the true count
+    (e.g. 200), independent of how many samples were dumped.
+
+    The confusion breakdown (TP/FP/FN/TN + precision/recall/accuracy) needs
+    per-row gold/pred, which only the samples carry. Where samples exist for a
+    (run, QID) those columns are filled AND rescaled so TP+FP+FN+TN reflects the
+    full row count; where they don't, the columns show ``-`` while F1/Rows remain
+    the true full-dataset values. When a run has samples but no aggregate row, it
+    still falls back to a samples-only record so nothing is lost.
+
+    A run is identified by model + test set + hardware + quant so the same QID
+    from Test-ORG and Test-XL (or two models) stays on separate rows.
+    """
+    qual_results = qual_results or []
+    conf_by_key = _confusion_from_samples(sample_results)
 
     out: list[dict[str, Any]] = []
-    pos = "Yes"
-    for key, rows in groups.items():
-        model, testset, hw, quant, run, qid = key
-        tp = fp = fn = tn = other = 0
-        for r in rows:
-            g = _norm(r.get("gold"))
-            p = _norm(r.get("pred"))
-            if g == pos and p == pos:
-                tp += 1
-            elif g != pos and p == pos:
-                fp += 1
-            elif g == pos and p != pos:
-                fn += 1
-            elif g != pos and p == g:
-                tn += 1
+    seen_keys: set[tuple] = set()
+
+    def _emit_from_exact(key: tuple, m: dict[str, Any]) -> dict[str, Any]:
+        """Build a record from the evaluator's full-dataset per-QID metrics.
+
+        These are exact (computed over every scored transcript), so no rescaling
+        or sample dependence is needed. Preferred over the sample path whenever
+        the aggregate row carries ``per_question_metrics``.
+        """
+        model, testset, hw, quant, qid = key
+        n = int(m.get("n", 0) or 0)
+        return {
+            "model": model, "testset": testset, "hw": hw, "quant": quant, "qid": qid,
+            "n": n,
+            "accuracy_pct": round(float(m.get("accuracy", 0.0)) * 100.0, 2),
+            "precision": round(float(m.get("precision", 0.0)), 4),
+            "recall": round(float(m.get("recall", 0.0)), 4),
+            "f1": round(float(m.get("f1", 0.0)), 4),
+            "tp": int(m.get("tp", 0)), "fp": int(m.get("fp", 0)),
+            "fn": int(m.get("fn", 0)), "tn": int(m.get("tn", 0)),
+            "other": int(m.get("unparseable_neg", 0)) + int(m.get("unscored_other", 0)),
+        }
+
+    def _emit_from_confusion(key: tuple, n: int, f1_agg: float | None) -> dict[str, Any]:
+        """Build a record from a sample-confusion bucket, rescaled to n rows."""
+        model, testset, hw, quant, qid = key
+        c = conf_by_key.get(key)
+        if c and c["n"] > 0:
+            tp, fp, fn, tn, other = c["tp"], c["fp"], c["fn"], c["tn"], c["other"]
+            sample_n = c["n"]
+            prec = tp / (tp + fp) if (tp + fp) else 0.0
+            rec = tp / (tp + fn) if (tp + fn) else 0.0
+            f1_s = 2 * prec * rec / (prec + rec) if (prec + rec) else 0.0
+            acc = (tp + tn) / sample_n if sample_n else 0.0
+            # Scale confusion counts from the sampled subset up to the full row
+            # count so TP+FP+FN+TN reconciles with the true Rows value. Rates
+            # (precision/recall/accuracy/F1) are scale-invariant and stay as-is.
+            scale = (n / sample_n) if (n and sample_n) else 1.0
+            return {
+                "model": model, "testset": testset, "hw": hw, "quant": quant, "qid": qid,
+                "n": n or sample_n,
+                "accuracy_pct": round(acc * 100.0, 2),
+                "precision": round(prec, 4), "recall": round(rec, 4),
+                "f1": round(f1_agg if f1_agg is not None else f1_s, 4),
+                "tp": round(tp * scale), "fp": round(fp * scale),
+                "fn": round(fn * scale), "tn": round(tn * scale),
+                "other": round(other * scale),
+            }
+        # No samples for this QID: report the full-dataset F1/Rows; leave the
+        # confusion columns blank rather than fabricate them.
+        return {
+            "model": model, "testset": testset, "hw": hw, "quant": quant, "qid": qid,
+            "n": n,
+            "accuracy_pct": "-", "precision": "-", "recall": "-",
+            "f1": round(f1_agg, 4) if f1_agg is not None else "-",
+            "tp": "-", "fp": "-", "fn": "-", "tn": "-", "other": "-",
+        }
+
+    # Primary path: every QID the evaluator scored over the full dataset.
+    for q in qual_results:
+        per_metrics = q.get("per_question_metrics") or {}
+        per_n = q.get("per_question_n") or {}
+        per_f1 = q.get("per_question_f1") or {}
+        qids = set(per_metrics) | set(per_n) | set(per_f1)
+        if not qids:
+            continue
+        model = q.get("_clean_model", "-")
+        testset = q.get("_clean_testset", "-")
+        hw = q.get("_clean_hw", "-")
+        quant = q.get("_clean_quant", "-")
+        for qid in qids:
+            key = (model, testset, hw, quant, str(qid))
+            if key in seen_keys:
+                continue
+            seen_keys.add(key)
+            exact = per_metrics.get(qid)
+            if isinstance(exact, dict) and exact:
+                # Exact full-dataset confusion + rates straight from the evaluator.
+                out.append(_emit_from_exact(key, exact))
             else:
-                other += 1  # unparseable / unexpected pred on a negative gold
-        n = len(rows)
-        prec = tp / (tp + fp) if (tp + fp) else 0.0
-        rec = tp / (tp + fn) if (tp + fn) else 0.0
-        f1 = 2 * prec * rec / (prec + rec) if (prec + rec) else 0.0
-        acc = (tp + tn) / n if n else 0.0
-        out.append({
-            "model": model, "testset": testset, "hw": hw, "quant": quant, "run": run,
-            "qid": qid, "n": n,
-            "accuracy_pct": round(acc * 100.0, 2),
-            "precision": round(prec, 4), "recall": round(rec, 4), "f1": round(f1, 4),
-            "tp": tp, "fp": fp, "fn": fn, "tn": tn, "other": other,
-        })
+                # Older run without per_question_metrics: fall back to F1/N plus
+                # sample-scaled confusion where samples exist.
+                n = int(per_n.get(qid, 0) or 0)
+                f1_agg = per_f1.get(qid)
+                out.append(_emit_from_confusion(key, n, float(f1_agg) if f1_agg is not None else None))
+
+    # Fallback path: runs that dumped samples but have no aggregate per-question
+    # data (older rows) — keep them from the sample confusion alone.
+    for key in conf_by_key:
+        if key in seen_keys:
+            continue
+        seen_keys.add(key)
+        out.append(_emit_from_confusion(key, conf_by_key[key]["n"], None))
+
     # Stable order: model, test set, then QID.
     out.sort(key=lambda x: (x["model"], x["testset"], x["qid"]))
     return out
@@ -762,10 +861,11 @@ def export_excel(
         ])
 
     # ── Sheet 3: Per-QID Metrics (segment-wise) ─────────────────────────────
-    # One record per (run, QID) with the full binary metric set, derived from the
-    # samples. Present only when a run was dumped with --dump-samples.
+    # One record per (run, QID) over the FULL dataset: QIDs and row counts come
+    # from the aggregate run's per_question_* fields; confusion (TP/FP/FN/TN) is
+    # filled from samples where available, else shown as "-".
     ws_qid = None
-    per_qid = build_per_qid_metrics(sample_results)
+    per_qid = build_per_qid_metrics(sample_results, qual_results)
     if per_qid:
         ws_qid = wb.create_sheet(title="Per-QID Metrics")
         headers_qid = [

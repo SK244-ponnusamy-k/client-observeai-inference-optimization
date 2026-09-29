@@ -226,7 +226,9 @@ if [[ -n "${WAIT_FOR_MARKER}" ]]; then
                       obj = s3.get_object(Bucket='${RESULTS_BUCKET}', Key='${WAIT_FOR_MARKER}')
                       exit_code = obj['Body'].read().decode().strip()
                       if exit_code != '0':
-                          print('Performance stage failed (exit=' + exit_code + '); quality will NOT start.')
+                          reason = ('model never became ready (infra/capacity)'
+                                    if exit_code == '3' else 'stage failed')
+                          print('Performance ' + reason + ' (exit=' + exit_code + '); quality will NOT start.')
                           sys.exit(1)
                       print('Performance marker found (success) — starting quality.'); sys.exit(0)
                   except ClientError as exc:

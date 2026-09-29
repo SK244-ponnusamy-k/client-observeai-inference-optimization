@@ -330,12 +330,16 @@ submit_profile_job() {
                       obj = s3.get_object(Bucket='${RESULTS_BUCKET}', Key='${REALTIME_MARKER_KEY}')
                       exit_code = obj['Body'].read().decode().strip()
                       if exit_code != '0':
-                          print('Realtime stage failed (exit=' + exit_code + '); batch will NOT start.')
+                          reason = ('model never became ready (infra/capacity)'
+                                    if exit_code == '3' else 'stage failed')
+                          print('Realtime ' + reason + ' (exit=' + exit_code + '); batch will NOT start.')
+                          # Propagate the SAME code so the downstream quality gate
+                          # can also tell model-not-ready (3) from a real failure.
                           s3.put_object(
                               Bucket='${RESULTS_BUCKET}', Key='${BATCH_MARKER_KEY}',
                               Body=exit_code.encode(),
                           )
-                          print('Published failed batch marker for downstream quality gate.')
+                          print('Published batch marker (exit=' + exit_code + ') for downstream quality gate.')
                           sys.exit(1)
                       print('Realtime marker found (success) — starting batch.'); sys.exit(0)
                   except ClientError as exc:

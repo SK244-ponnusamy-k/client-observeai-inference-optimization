@@ -54,6 +54,11 @@ import yaml
 logger = logging.getLogger(__name__)
 csv.field_size_limit(10_000_000)  # transcripts are large
 
+# Distinct exit code for "the model endpoint never became ready" (health check
+# timed out). Mirrors load-test.py so a quality-alone run reports model-not-ready
+# the same way a benchmark run does, instead of a generic error (exit 1).
+EXIT_MODEL_NOT_READY = 3
+
 
 def _configure_logging(level: str = "INFO") -> None:
     logging.basicConfig(
@@ -98,6 +103,12 @@ class QualityResult:
     started_at: str
     ended_at: str
     per_question_n: dict[str, int] = field(default_factory=dict)
+    # Full per-QID confusion + rates over the ENTIRE dataset, keyed by QID:
+    #   {QID: {tp, fp, fn, tn, precision, recall, f1, accuracy, n, ...}}
+    # Computed with the same _binary_metrics used for the overall matrix, so the
+    # report can show accuracy/precision/recall/TP.. per QID without depending on
+    # the (capped) sample dump.
+    per_question_metrics: dict[str, dict[str, float]] = field(default_factory=dict)
     # Replies that hit the token budget (finish_reason == "length"). A high count
     # means the reasoning budget is too small for the model to reach a verdict —
     # an INTEGRATION signal, not a quality signal. Raise
@@ -845,7 +856,18 @@ def _run(args: argparse.Namespace) -> None:
     logger.info("Loaded %d rows; labels=%s positive=%s mode=%s sheet=%s",
                 len(rows), labels, pos, dcfg.get("mode"), getattr(args, "sheet", "") or "(default)")
 
-    _wait_for_vllm(endpoint, timeout_s=args.wait_timeout)
+    try:
+        _wait_for_vllm(endpoint, timeout_s=args.wait_timeout)
+    except TimeoutError as exc:
+        # Endpoint never came up in the wait budget. Not a quality result — the
+        # model never served. Exit with the dedicated code so the reason is
+        # legible (infra/capacity), not a generic error.
+        logger.error(
+            "vLLM endpoint never became ready: %s. Skipping quality eval (model-not-ready). "
+            "This is an infrastructure/capacity issue, not a quality failure.",
+            exc,
+        )
+        raise SystemExit(EXIT_MODEL_NOT_READY) from exc
 
     # Capability probe, run once regardless of mode: guided decoding is both the
     # primary mechanism for guided_choice mode AND the strongest constrained-retry
@@ -941,14 +963,29 @@ def _run(args: argparse.Namespace) -> None:
     other = next((x for x in labels if x != pos), pos)
     macro_f1 = (_f1_for(preds, golds, pos) + _f1_for(preds, golds, other)) / 2.0
 
-    # per-question F1
+    # per-question metrics over the FULL dataset (F1 + N kept for back-compat,
+    # plus the complete confusion/rate set so the report needs no sample dump).
     per_q_f1: dict[str, float] = {}
     per_q_n: dict[str, int] = {}
+    per_q_metrics: dict[str, dict[str, float]] = {}
     for q in sorted({r["question"] for r in results}):
         qp = [r["pred"] for r in results if r["question"] == q]
         qg = [r["gold"] for r in results if r["question"] == q]
-        per_q_f1[q] = round(_f1_for(qp, qg, pos), 4)
+        qm = _binary_metrics(qp, qg, pos)
+        per_q_f1[q] = round(qm["f1"], 4)
         per_q_n[q] = len(qp)
+        per_q_metrics[q] = {
+            "n": len(qp),
+            "tp": int(qm["tp"]), "fp": int(qm["fp"]),
+            "fn": int(qm["fn"]), "tn": int(qm["tn"]),
+            "unparseable_pos": int(qm["unparseable_pos"]),
+            "unparseable_neg": int(qm["unparseable_neg"]),
+            "unscored_other": int(qm["unscored_other"]),
+            "precision": round(qm["precision"], 4),
+            "recall": round(qm["recall"], 4),
+            "f1": round(qm["f1"], 4),
+            "accuracy": round(qm["accuracy"], 4),
+        }
 
     result = QualityResult(
         eval_id=cfg.get("eval_id", "autoqa"),
@@ -987,6 +1024,7 @@ def _run(args: argparse.Namespace) -> None:
         },
         per_question_f1=per_q_f1,
         per_question_n=per_q_n,
+        per_question_metrics=per_q_metrics,
         started_at=started_at,
         ended_at=ended_at,
         n_truncated=n_truncated,
