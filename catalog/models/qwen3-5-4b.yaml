@@ -26,13 +26,14 @@ serving:
   max_num_seqs: 256
   max_num_batched_tokens: 8192
   extra_args:
-    # Reasoning ON. Qwen3.5 defaults thinking ON in its chat template; we set it
-    # true explicitly AND load the qwen3 reasoning parser so vLLM extracts the
-    # chain-of-thought into the response `reasoning` field (without the parser the
-    # run's probe records OFF even though the model thinks). The benchmark harness
-    # sends no per-request chat_template_kwargs, so this must live on the server.
-    - '--default-chat-template-kwargs={\"enable_thinking\": true}'
-    - "--reasoning-parser=qwen3"
+    # Reasoning OFF. Qwen3.5 defaults thinking ON in its chat template, so turning
+    # reasoning OFF needs BOTH: an explicit enable_thinking=false server default AND
+    # NOT loading the qwen3 reasoning parser (no <think> splitting). The parser line
+    # is commented out (not deleted) so it can be re-enabled quickly. The benchmark
+    # harness sends no per-request chat_template_kwargs, so this must live on the
+    # server. Result: the inference probe records reasoning_observed=OFF.
+    - '--default-chat-template-kwargs={\"enable_thinking\": false}'
+    # - "--reasoning-parser=qwen3"   # uncomment to turn reasoning ON (with enable_thinking=true)
 
 resources:
   cpu_request: "4"

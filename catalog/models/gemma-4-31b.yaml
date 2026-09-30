@@ -36,13 +36,13 @@ serving:
     - "--trust-remote-code"       # required by the gemma4 model code
     - "--enable-chunked-prefill"
     - "--enable-prefix-caching"
-    # Reasoning ON. Gemma 4's chat template reads `enable_thinking | default(false)`,
-    # so thinking is OFF unless set true here. The benchmark harness sends no
-    # per-request chat_template_kwargs, so the ON default must live on the server.
-    - '--default-chat-template-kwargs={\"enable_thinking\": true}'
-    # Load Gemma 4's reasoning parser so vLLM extracts the chain-of-thought into
-    # the response `reasoning` field; without it the run's probe records OFF.
-    - "--reasoning-parser=gemma4"
+    # Reasoning OFF. Gemma 4's chat template reads `enable_thinking | default(false)`,
+    # so thinking is OFF by default; set explicitly to false to keep it unambiguous
+    # for every request. The reasoning parser is commented out (not deleted) so it
+    # can be re-enabled quickly; with thinking off there is nothing to extract, so
+    # the inference probe records reasoning_observed=OFF.
+    - '--default-chat-template-kwargs={\"enable_thinking\": false}'
+    # - "--reasoning-parser=gemma4"   # uncomment to turn reasoning ON (with enable_thinking=true)
 
 resources:
   cpu_request: "8"
