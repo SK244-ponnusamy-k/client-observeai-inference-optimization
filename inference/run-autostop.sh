@@ -102,10 +102,12 @@ QUALITY_SELECTOR="app.kubernetes.io/component=quality-runner,model=${MODEL}"
 EXPECTED_QUALITY_JOBS="${#QUALITY_SHEETS[@]}"
 [[ "${EXPECTED_QUALITY_JOBS}" -eq 0 ]] && EXPECTED_QUALITY_JOBS=2
 
-# Overall safety cap so the cleanup Job can never hang forever (9h pipeline
-# envelope + 1h headroom). If the pipeline never finishes, the Job stops the
-# model anyway at this deadline to avoid a stuck billing node.
-JOB_DEADLINE=36000   # 10h
+# Overall safety cap so the cleanup Job can never hang forever (13h pipeline
+# envelope + 1h headroom). Raised in step with the larger realtime (3h) + batch
+# (6h) benchmark caps for reasoning-ON on large/slow models. If the pipeline
+# never finishes, the Job stops the model anyway at this deadline to avoid a
+# stuck billing node.
+JOB_DEADLINE=50400   # 14h
 
 echo ""
 echo "======================================================"

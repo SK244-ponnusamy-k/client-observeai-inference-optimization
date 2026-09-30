@@ -199,9 +199,11 @@ INIT_CONTAINER=""
 JOB_DEADLINE=10800
 if [[ -n "${WAIT_FOR_MARKER}" ]]; then
     # Quality is submitted at the same time as realtime. Its Job deadline and
-    # marker wait must cover the complete realtime (1.5h) + batch (4h) budgets,
+    # marker wait must cover the complete realtime (3h) + batch (6h) budgets,
     # plus quality itself; init-container time counts toward activeDeadlineSeconds.
-    JOB_DEADLINE=32400  # 9h total pipeline envelope
+    # Raised in step with run-benchmark.sh's larger realtime/batch caps for
+    # reasoning-ON on large/slow models.
+    JOB_DEADLINE=46800  # 13h total pipeline envelope (realtime 3h + batch 6h + quality ~3h + headroom)
     INIT_CONTAINER=$(cat <<INITEOF
       initContainers:
         - name: wait-for-performance
@@ -220,24 +222,40 @@ if [[ -n "${WAIT_FOR_MARKER}" ]]; then
               import boto3
               from botocore.exceptions import ClientError
               s3 = boto3.client('s3', region_name='${AWS_REGION}')
-              deadline = time.time() + 21600  # 6h: realtime + batch + coordination headroom
+              deadline = time.time() + 36000  # 10h: realtime (3h) + batch (6h) + coordination headroom
               while time.time() < deadline:
                   try:
                       obj = s3.get_object(Bucket='${RESULTS_BUCKET}', Key='${WAIT_FOR_MARKER}')
                       exit_code = obj['Body'].read().decode().strip()
-                      if exit_code != '0':
+                      # Quality depends only on the LIVE model endpoint, not on the
+                      # performance RESULTS. So we gate on 'performance FINISHED'
+                      # (marker present), NOT on 'performance succeeded'. Whatever
+                      # the performance outcome (0 success / 1 error / 3 not-ready /
+                      # 124 timeout), we start quality anyway; quality-eval.py then
+                      # waits on /health and will run if the model is up, or exit
+                      # cleanly (model-not-ready) if the endpoint is truly gone.
+                      if exit_code == '0':
+                          print('Performance succeeded (exit=0) — starting quality.')
+                      else:
                           reason = ('model never became ready (infra/capacity)'
-                                    if exit_code == '3' else 'stage failed')
-                          print('Performance ' + reason + ' (exit=' + exit_code + '); quality will NOT start.')
-                          sys.exit(1)
-                      print('Performance marker found (success) — starting quality.'); sys.exit(0)
+                                    if exit_code == '3'
+                                    else 'timed out' if exit_code == '124'
+                                    else 'failed')
+                          print('Performance ' + reason + ' (exit=' + exit_code + '), but quality '
+                                'only needs the live endpoint — starting quality anyway.')
+                      sys.exit(0)
                   except ClientError as exc:
                       code = str(exc.response.get('Error', {}).get('Code', ''))
                       if code not in ('404', 'NoSuchKey', 'NotFound'):
                           raise
                       print('...performance not done; sleeping 20s'); time.sleep(20)
-              print('Timed out waiting for performance marker; quality will NOT start.')
-              sys.exit(1)
+              # Performance never even wrote a marker within the wait budget. Rather
+              # than abandon quality, proceed anyway: quality-eval.py's /health wait
+              # decides if the model is reachable (run) or not (clean exit). This
+              # avoids killing quality just because the perf stage was slow/stuck.
+              print('Performance marker never appeared before the wait deadline; '
+                    'starting quality anyway (it will verify the endpoint via /health).')
+              sys.exit(0)
               "
           env:
             - name: AWS_DEFAULT_REGION

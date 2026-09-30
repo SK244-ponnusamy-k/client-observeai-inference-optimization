@@ -187,8 +187,14 @@ BATCH_MARKER_KEY="${S3_MARKER_PREFIX}/batch.done"
 
 # Per-profile hard caps. Batch (high-concurrency sweep, up to 10k prompts) is the
 # long pole, so it gets a bigger deadline than the latency-bound realtime run.
-REALTIME_DEADLINE=5400    # 1.5 h
-BATCH_DEADLINE=14400      # 4 h
+REALTIME_DEADLINE=10800   # 3 h  (raised from 1.5h: reasoning-ON on large/slow
+                          #       models — e.g. gemma-4-31b TP=4 on L4 — emits long
+                          #       <think> chains and exceeded the old cap, so the
+                          #       realtime job was killed and never wrote its marker,
+                          #       timing out the batch gate. The batch gate waits
+                          #       REALTIME_DEADLINE+600, so this also extends the wait.)
+BATCH_DEADLINE=21600      # 6 h  (raised from 4h to keep proportion for the long
+                          #       high-concurrency sweep under reasoning-ON.)
 
 echo ""
 echo "======================================================"
