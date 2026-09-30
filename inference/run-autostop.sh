@@ -182,23 +182,34 @@ else
     WAIT_STEP=$(cat <<WAITEOF
               echo "Waiting for ${EXPECTED_QUALITY_JOBS} quality Job(s) [${QUALITY_SELECTOR}] to finish..."
               deadline=\$(( \$(date +%s) + ${JOB_DEADLINE} ))
+              # Resilience: this loop polls kubectl every 30s for potentially MANY
+              # hours. A SINGLE transient kubectl/API error (throttling, a brief
+              # api-server disconnect) must NOT kill the pod — otherwise autostop
+              # dies while the pipeline is still running (models never cleaned up).
+              # So each poll is wrapped: pipefail is disabled around the pipelines
+              # (grep -c exits 1 on a zero count), kubectl failure is tolerated, and
+              # the loop simply retries on the next tick.
               while [[ \$(date +%s) -lt \${deadline} ]]; do
+                  set +o pipefail  # grep -c exits 1 on zero matches; that is normal here
                   # A quality Job is "finished" when it has a Complete or Failed condition.
-                  # NOTE: 'grep -c' already prints 0 (and exits 1) when there are
-                  # no matches; a '|| echo 0' would append a SECOND 0, producing a
-                  # multi-line "0\n0" that breaks the numeric [[ ]] test below.
-                  # Sanitize to a single integer with tr/head instead.
                   # Emit one line per quality Job: "<run-tag> <complete-status> <failed-status>".
-                  # We then keep only rows whose run-tag equals the base tag OR
-                  # starts with "<base>-" (the per-sheet suffix, e.g. astest3-org).
-                  # This is the prefix match that a bare label selector can't do,
-                  # and it is why the old exact run-tag=<base> selector saw 0/0.
+                  # Keep only rows whose run-tag equals the base tag OR starts with
+                  # "<base>-" (per-sheet suffix, e.g. astest3-org) — the prefix match
+                  # a bare label selector cannot do.
                   rows=\$(kubectl get jobs -n "${BENCHMARK_NAMESPACE}" -l "${QUALITY_SELECTOR}" \\
-                      -o jsonpath='{range .items[*]}{.metadata.labels.run-tag}{" "}{.status.conditions[?(@.type=="Complete")].status}{" "}{.status.conditions[?(@.type=="Failed")].status}{"\n"}{end}' 2>/dev/null)
-                  total=\$(printf '%s\n' "\${rows}" | awk -v b="${RUN_TAG_BASE}" 'NF && (\$1==b || index(\$1, b"-")==1)' | grep -c .)
-                  total=\${total:-0}
-                  finished=\$(printf '%s\n' "\${rows}" | awk -v b="${RUN_TAG_BASE}" 'NF && (\$1==b || index(\$1, b"-")==1) && (\$2=="True" || \$3=="True")' | grep -c .)
-                  finished=\${finished:-0}
+                      -o jsonpath='{range .items[*]}{.metadata.labels.run-tag}{" "}{.status.conditions[?(@.type=="Complete")].status}{" "}{.status.conditions[?(@.type=="Failed")].status}{"\n"}{end}' 2>/dev/null) || {
+                      # Transient kubectl error — do NOT die. Log, wait, retry.
+                      echo "...transient kubectl error while polling jobs; retrying in 30s"
+                      set -o pipefail
+                      sleep 30
+                      continue
+                  }
+                  total=\$(printf '%s\n' "\${rows}" | awk -v b="${RUN_TAG_BASE}" 'NF && (\$1==b || index(\$1, b"-")==1)' | grep -c . || true)
+                  finished=\$(printf '%s\n' "\${rows}" | awk -v b="${RUN_TAG_BASE}" 'NF && (\$1==b || index(\$1, b"-")==1) && (\$2=="True" || \$3=="True")' | grep -c . || true)
+                  set -o pipefail
+                  # Force clean single integers (guard against empty/whitespace).
+                  total=\$(printf '%s' "\${total}" | tr -dc '0-9' | head -c 6); total=\${total:-0}
+                  finished=\$(printf '%s' "\${finished}" | tr -dc '0-9' | head -c 6); finished=\${finished:-0}
                   echo "...quality Jobs finished \${finished}/\${total} (base-tag=${RUN_TAG_BASE}, expected ${EXPECTED_QUALITY_JOBS}); sleeping 30s"
                   if [[ "\${total}" -ge "${EXPECTED_QUALITY_JOBS}" && "\${finished}" -ge "\${total}" && "\${total}" -gt 0 ]]; then
                       echo "All quality Jobs finished - pipeline complete."; break
