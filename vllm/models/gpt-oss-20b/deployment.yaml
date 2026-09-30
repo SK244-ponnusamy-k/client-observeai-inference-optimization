@@ -104,10 +104,12 @@ spec:
             - "--tensor-parallel-size=${TP_SIZE}"
             - "--gpu-memory-utilization=0.9"
             - "--max-model-len=16384"
-            - "--max-num-seqs=1024"
+            - "--max-num-seqs=256"
             - "--max-num-batched-tokens=8192"
             - "--async-scheduling"
             - "--no-enable-prefix-caching"
+            - "--reasoning-parser=openai_gptoss"
+            - "--default-chat-template-kwargs={\"enable_thinking\": true}"
           ports:
             - name: http
               containerPort: 8000

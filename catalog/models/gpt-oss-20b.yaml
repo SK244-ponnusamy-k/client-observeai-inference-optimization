@@ -34,6 +34,19 @@ serving:
   extra_args:
     - "--async-scheduling"        # recipe optimisation (overlap CPU/GPU)
     - "--no-enable-prefix-caching" # required for consistent benchmark numbers
+    # Reasoning ON. gpt-oss is a reasoning model (OpenAI harmony format) and thinks
+    # by default via reasoning_effort (set in the workload profile, default
+    # "medium"). The gpt-oss reasoning parser makes vLLM extract the chain-of-thought
+    # into the response `reasoning` field so the inference probe records
+    # reasoning_observed=ON (without it the model still reasons, but the parser
+    # never surfaces it -> probe sees OFF).
+    - "--reasoning-parser=openai_gptoss"
+    # Set for uniformity with the other reasoning-ON models. NOTE: gpt-oss controls
+    # reasoning via reasoning_effort (harmony), not enable_thinking, so this kwarg
+    # is expected to be a NO-OP for this model. If vLLM rejects the unknown kwarg
+    # at startup, remove this line — reasoning ON is already provided by the parser
+    # + reasoning_effort above.
+    - '--default-chat-template-kwargs={\"enable_thinking\": true}'
 
 resources:
   cpu_request: "4"
