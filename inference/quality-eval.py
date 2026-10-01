@@ -363,13 +363,20 @@ def _load_qid_map(path: Path, sheet: str, id_col: str, text_col: str) -> dict[st
 # ---------------------------------------------------------------------------
 # One model call (vLLM OpenAI chat completions, stdlib HTTP)
 # ---------------------------------------------------------------------------
+# Per-request HTTP timeout (seconds) for a single model call. Set once from the
+# --request-timeout CLI arg in _run(). Large/slow models with reasoning ON (e.g.
+# gemma-4-31b on L4 TP=4) can take well over 2 minutes per request, so the old
+# hardcoded 120s cut genuinely-working requests off as false TimeoutErrors.
+_REQUEST_TIMEOUT_S = 300
+
+
 def _post_chat(endpoint: str, body: dict[str, Any]) -> dict[str, Any]:
     data = json.dumps(body).encode("utf-8")
     req = urllib.request.Request(
         f"{endpoint}/v1/chat/completions", data=data,
         headers={"Content-Type": "application/json"}, method="POST",
     )
-    with urllib.request.urlopen(req, timeout=120) as resp:  # noqa: S310
+    with urllib.request.urlopen(req, timeout=_REQUEST_TIMEOUT_S) as resp:  # noqa: S310
         return json.loads(resp.read())
 
 
@@ -841,6 +848,11 @@ def _wait_for_vllm(endpoint: str, timeout_s: int = 300) -> None:
 # Main
 # ---------------------------------------------------------------------------
 def _run(args: argparse.Namespace) -> None:
+    # Apply the per-request timeout for every model call this run (set once).
+    global _REQUEST_TIMEOUT_S
+    _REQUEST_TIMEOUT_S = int(getattr(args, "request_timeout", _REQUEST_TIMEOUT_S))
+    logger.info("Per-request model-call timeout: %ds", _REQUEST_TIMEOUT_S)
+
     with open(args.config) as f:
         cfg = yaml.safe_load(f)
 
@@ -919,6 +931,15 @@ def _run(args: argparse.Namespace) -> None:
             pred = "UNKNOWN"
             finish_reason = "error"
             source = "error"
+            # Capture the REAL error reason so the report's response column shows
+            # WHY this row has no verdict (e.g. the vLLM endpoint dropped/timed
+            # out mid-run) instead of a blank '-'. This is an integration signal,
+            # not model output. Message is truncated to keep sample rows compact.
+            _msg = str(exc).strip().replace("\n", " ")
+            if len(_msg) > 300:
+                _msg = _msg[:300] + "..."
+            answer_text = f"ERROR: request to model endpoint failed ({type(exc).__name__}): {_msg}"
+            reasoning_text = answer_text
         # finish_reason is always kept (a short string): it is what distinguishes
         # "the model answered wrongly" from "the model never got to answer".
         out = {"data_id": row["data_id"], "gold": row["gold"],
@@ -1176,7 +1197,12 @@ def main() -> None:
     ap.add_argument("--model", default="", help="Served model name override")
     ap.add_argument("--quantization", default="unknown", help="Quant label for the result row")
     ap.add_argument("--hardware", default="unknown", help="Hardware/instance type label (e.g. g5, g6, g6e)")
-    ap.add_argument("--wait-timeout", type=int, default=300)
+    ap.add_argument("--wait-timeout", type=int, default=300,
+                    help="Seconds to wait for the vLLM /health endpoint before giving up (model-not-ready).")
+    ap.add_argument("--request-timeout", type=int, default=300,
+                    help="Per-request HTTP timeout (seconds) for a single model call. Raise for large/slow "
+                         "models with reasoning ON (e.g. gemma-4-31b on L4 TP=4) that can take >2 min/request; "
+                         "the old fixed 120s cut working requests off as false TimeoutErrors.")
     # Opt-in per-row sample capture. OFF by default (customer-data policy).
     # Captures MODEL OUTPUT only (never the input transcript), capped by
     # --max-dump-samples to keep the file small.
