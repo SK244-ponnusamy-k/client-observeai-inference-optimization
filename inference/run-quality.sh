@@ -403,7 +403,7 @@ ${INIT_CONTAINER}
                 --quantization "${QUANT}" \
                 --hardware "${HW}" \
                 --output /results \
-                --wait-timeout 1800 ${QUALITY_EXTRA_ARGS} || TEST_EXIT=\$?
+                --wait-timeout 2400 ${QUALITY_EXTRA_ARGS} || TEST_EXIT=\$?
 
               echo "=== Uploading quality results to S3 ==="
               python3 -c "

@@ -347,9 +347,13 @@ def _submit_auto_stop(
         from . import benchmark as bench_mod
 
         last_profile = bench_mod.completion_profile(spec, profile, spec.benchmark.skip_batch)
-        tag_segment = f"{tag}/" if tag else ""
-        marker = f"results/{run_timestamp}/{tag_segment}_markers/{spec.id}/{last_profile}.done"
-        args += ["--wait-mode", "marker", "--wait-for-marker", marker]
+        # Benchmark-only: wait on the final benchmark Job via KUBECTL (not the S3
+        # marker). The auto-stop ServiceAccount has Kubernetes API access but no
+        # AWS/S3 credentials, so the old marker (boto3) path failed with
+        # NoCredentialsError. bench-jobs mode watches the Job's terminal state and
+        # needs no AWS. last_profile is 'batch' normally, or 'realtime' when batch
+        # is skipped, matching the benchmark Job that writes the final result.
+        args += ["--wait-mode", "bench-jobs", "--wait-for-profile", last_profile]
 
     ui.banner(f"Auto-stop: {spec.id}{f'  (tag={tag})' if tag else ''}")
     rc = shell.run_bash(script, args)

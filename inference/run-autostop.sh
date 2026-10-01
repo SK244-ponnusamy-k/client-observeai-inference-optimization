@@ -42,6 +42,7 @@ TAG=""
 RUN_TIMESTAMP=""
 WAIT_MODE="quality-jobs"
 WAIT_FOR_MARKER=""
+WAIT_FOR_PROFILE="batch"   # for --wait-mode bench-jobs: which benchmark profile Job to await
 QUALITY_SHEETS=()
 
 while [[ $# -gt 0 ]]; do
@@ -51,6 +52,7 @@ while [[ $# -gt 0 ]]; do
         --run-timestamp)   RUN_TIMESTAMP="$2"; shift 2 ;;
         --wait-mode)       WAIT_MODE="$2"; shift 2 ;;
         --wait-for-marker) WAIT_FOR_MARKER="$2"; shift 2 ;;
+        --wait-for-profile) WAIT_FOR_PROFILE="$2"; shift 2 ;;
         --quality-sheet)   QUALITY_SHEETS+=("$2"); shift 2 ;;
         *) log_warn "Unknown arg: $1"; shift ;;
     esac
@@ -185,6 +187,46 @@ if [[ "${WAIT_MODE}" == "marker" ]]; then
                       print('ERROR: boto core error polling S3:', exc); sys.exit(4)
               print('Auto-stop deadline reached before marker; stopping anyway.'); sys.exit(0)
               " || { echo "Marker wait failed (exit \$?); NOT stopping the model. Stop manually if needed."; exit 1; }
+WAITEOF
+)
+elif [[ "${WAIT_MODE}" == "bench-jobs" ]]; then
+    # bench-jobs mode: benchmark-only pipeline (no quality). Wait until the final
+    # benchmark profile's Job reaches a terminal state (Complete or Failed), using
+    # KUBECTL — NOT the S3 marker. The auto-stop ServiceAccount has Kubernetes API
+    # access (jobs: get/list/watch) but NO AWS/S3 credentials, so the old marker
+    # (boto3/S3) path failed with NoCredentialsError. Watching the Job needs no AWS.
+    #
+    # The benchmark Job name mirrors run-benchmark.sh:
+    #   oai-infopt-bench-<model-dashed><-tag>-<run-timestamp>-<profile>
+    # (wrapped in k8s_name for the 63-byte cap). We know all parts here, so match
+    # the exact Job by name.
+    BENCH_JOB_NAME=$(k8s_name "oai-infopt-bench-${MODEL_ID_DASHED}${TAG_SEG}-${RUN_TIMESTAMP}-${WAIT_FOR_PROFILE}")
+    WAIT_STEP=$(cat <<WAITEOF
+              echo "Waiting for benchmark Job \"${BENCH_JOB_NAME}\" (${WAIT_FOR_PROFILE}) to finish (kubectl, no S3)..."
+              deadline=\$(( \$(date +%s) + ${JOB_DEADLINE} ))
+              # Resilient poll: a single transient kubectl error must not kill the
+              # pod (pipefail off around the pipeline; retry on error).
+              while [[ \$(date +%s) -lt \${deadline} ]]; do
+                  set +o pipefail
+                  status=\$(kubectl get job "${BENCH_JOB_NAME}" -n "${BENCHMARK_NAMESPACE}" \\
+                      -o jsonpath='{.status.conditions[?(@.type=="Complete")].status} {.status.conditions[?(@.type=="Failed")].status}' 2>/dev/null)
+                  rc=\$?
+                  set -o pipefail
+                  if [[ \${rc} -ne 0 ]]; then
+                      echo "...transient kubectl error (or Job not created yet); retrying in 30s"
+                      sleep 30; continue
+                  fi
+                  complete=\$(printf '%s' "\${status}" | awk '{print \$1}')
+                  failed=\$(printf '%s' "\${status}" | awk '{print \$2}')
+                  if [[ "\${complete}" == "True" ]]; then
+                      echo "Benchmark Job completed - pipeline done."; break
+                  fi
+                  if [[ "\${failed}" == "True" ]]; then
+                      echo "Benchmark Job failed (terminal) - pipeline done; stopping model."; break
+                  fi
+                  echo "...benchmark not done yet; sleeping 30s"
+                  sleep 30
+              done
 WAITEOF
 )
 else
