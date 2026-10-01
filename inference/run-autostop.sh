@@ -58,6 +58,17 @@ done
 
 : "${MODEL:?ERROR: --model is required.}"
 
+# RUN_TIMESTAMP only makes the Job name unique. When invoked by `oai deploy
+# --auto-stop` it is always passed; when run by hand it may be omitted, which
+# previously produced a Job name ending in a trailing '-' (e.g.
+# "oai-infopt-autostop-gemma-4-31b-g5-") that Kubernetes rejects. Default it to
+# a fresh UTC timestamp so a manual/relaunched auto-stop always gets a valid,
+# unique name.
+if [[ -z "${RUN_TIMESTAMP}" ]]; then
+    RUN_TIMESTAMP="$(date -u +%Y%m%d-%H%M%S)"
+    log_info "No --run-timestamp given; using generated ${RUN_TIMESTAMP}."
+fi
+
 # Kubernetes copies a Job's metadata.name into the auto-injected pod label
 # batch.kubernetes.io/job-name (value limit 63 bytes). Keep every name <=63 with
 # a stable checksum suffix. Mirrors run-benchmark.sh / run-quality.sh.
