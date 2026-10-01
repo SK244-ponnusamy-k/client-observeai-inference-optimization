@@ -109,7 +109,8 @@ spec:
             - "--trust-remote-code"
             - "--enable-chunked-prefill"
             - "--enable-prefix-caching"
-            - "--default-chat-template-kwargs={\"enable_thinking\": false}"
+            - "--default-chat-template-kwargs={\"enable_thinking\": true}"
+            - "--reasoning-parser=gemma4"
           ports:
             - name: http
               containerPort: 8000

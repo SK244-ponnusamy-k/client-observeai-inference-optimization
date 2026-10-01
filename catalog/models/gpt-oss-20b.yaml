@@ -39,8 +39,8 @@ serving:
     # consistency with the other models; NOTE gpt-oss controls reasoning via
     # reasoning_effort (harmony), so this kwarg is a NO-OP and gpt-oss may still
     # reason — set reasoning_effort in the workload profile to truly minimise it.
-    #- "--reasoning-parser=openai_gptoss"
-    - '--default-chat-template-kwargs={\"enable_thinking\": false}'
+    - "--reasoning-parser=openai_gptoss"
+    - '--default-chat-template-kwargs={\"enable_thinking\": true}'
 
 resources:
   cpu_request: "4"

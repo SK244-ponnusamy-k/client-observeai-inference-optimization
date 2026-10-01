@@ -41,8 +41,8 @@ serving:
     # for every request. The reasoning parser is commented out (not deleted) so it
     # can be re-enabled quickly; with thinking off there is nothing to extract, so
     # the inference probe records reasoning_observed=OFF.
-    - '--default-chat-template-kwargs={\"enable_thinking\": false}'
-    # - "--reasoning-parser=gemma4"   # uncomment to turn reasoning ON (with enable_thinking=true)
+    - '--default-chat-template-kwargs={\"enable_thinking\": true}'
+    - "--reasoning-parser=gemma4"   # uncomment to turn reasoning ON (with enable_thinking=true)
 
 resources:
   cpu_request: "8"

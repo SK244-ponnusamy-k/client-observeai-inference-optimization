@@ -108,7 +108,8 @@ spec:
             - "--max-num-batched-tokens=8192"
             - "--async-scheduling"
             - "--no-enable-prefix-caching"
-            - "--default-chat-template-kwargs={\"enable_thinking\": false}"
+            - "--reasoning-parser=openai_gptoss"
+            - "--default-chat-template-kwargs={\"enable_thinking\": true}"
           ports:
             - name: http
               containerPort: 8000
