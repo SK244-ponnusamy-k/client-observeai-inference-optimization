@@ -103,6 +103,16 @@ def run(
 ) -> int:
     spec = catalog.load(model_id)
 
+    # Refuse a duplicate standalone run for this model+tag (would hit the same
+    # endpoint and contaminate results). Skipped when run_timestamp is set, i.e.
+    # when called from the deploy pipeline — deploy already ran this guard, and
+    # the jobs it just submitted share this run_timestamp, so re-checking would
+    # false-positive on our own jobs. include_deployment=False: benchmarking runs
+    # AGAINST a live deployment, so an existing deployment is expected, not a clash.
+    from . import preflight
+    if run_timestamp is None:
+        preflight.fail_if_active(spec.id, tag, include_deployment=False)
+
     # Resolve the benchmark manifest, in priority order:
     #   1. Explicit --manifest (e.g. a Neuron/Trainium manifest you select by hand).
     #   2. Single dynamic GPU manifest <id>-gpu.yaml (the standard path — one file

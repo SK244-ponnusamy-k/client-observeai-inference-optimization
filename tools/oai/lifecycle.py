@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
-from . import catalog, config, generate, instances, paths, shell, ui
+from . import catalog, config, generate, instances, paths, preflight, shell, ui
 from .catalog import ModelSpec
 
 
@@ -121,6 +121,9 @@ def deploy(
 
     _ensure_generated(spec)
     _preflight_cluster()
+    # Refuse a duplicate of the same model+tag (collides + contaminates results).
+    # include_deployment=True: a leftover Deployment for this tag also blocks.
+    preflight.fail_if_active(spec.id, tag, include_deployment=True)
 
     cfg = config.load()
     region = cfg.get("AWS_REGION", "us-east-2")

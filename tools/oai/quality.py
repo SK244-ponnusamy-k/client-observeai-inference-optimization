@@ -104,6 +104,15 @@ def run(
             "This is part of the base framework - check your checkout.",
         )
 
+    # Refuse a duplicate standalone run for this model+tag (would hit the same
+    # endpoint and contaminate results). Skipped when run_timestamp is set (called
+    # from the deploy pipeline, already guarded; its just-submitted jobs share the
+    # run_timestamp so re-checking would flag our own jobs). include_deployment=
+    # False: quality runs AGAINST a live deployment, so one existing is expected.
+    from . import preflight
+    if run_timestamp is None:
+        preflight.fail_if_active(model_id, tag, include_deployment=False)
+
     if max_dump_samples < 1:
         ui.fail("--max-dump-samples must be at least 1.")
 
