@@ -166,6 +166,7 @@ def _cmd_quality(args: argparse.Namespace) -> int:
         dump_samples=args.dump_samples,
         max_dump_samples=args.max_dump_samples,
         dump_inputs=args.dump_inputs,
+        concurrency=args.concurrency,
         detach=args.detach,
     )
 
@@ -356,6 +357,9 @@ def _build_parser() -> argparse.ArgumentParser:
     ql.add_argument("--max-dump-samples", type=int, default=200, help="rows to save with --dump-samples (default 200)")
     ql.add_argument("--dump-inputs", action="store_true",
                     help="include the input transcript in each sample row so verdicts can be audited (needs --dump-samples)")
+    ql.add_argument("--concurrency", type=int, default=None,
+                    help="override request concurrency (lower it for large/slow models to avoid KV-cache "
+                         "over-subscription and timeouts; gemma-4-31b defaults to 8 automatically)")
     ql.add_argument("--detach", action="store_true", help="submit the quality Job and return without following logs")
     ql.set_defaults(func=_cmd_quality)
 

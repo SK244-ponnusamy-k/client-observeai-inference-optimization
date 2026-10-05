@@ -76,6 +76,7 @@ while [[ $# -gt 0 ]]; do
         --dataset-file)     DATASET_FILE="$2"; shift 2 ;;
         --force-stage)      FORCE_STAGE="true"; shift ;;
         --sheet)            SHEET="$2"; shift 2 ;;
+        --concurrency)      CONCURRENCY="$2"; shift 2 ;;
         *) log_error "Unknown: $1"; exit 1 ;;
     esac
 done
@@ -182,6 +183,12 @@ elif [[ "${DUMP_INPUTS}" == "true" ]]; then
     log_error "--dump-inputs requires --dump-samples."; exit 1
 fi
 # Pass the worksheet selector through to the evaluator (xlsx only; ignored for
+# Optional concurrency override (lower it for large/slow models like gemma-4-31b
+# so the vLLM KV cache is not over-subscribed and requests don't time out).
+if [[ -n "${CONCURRENCY:-}" ]]; then
+    QUALITY_EXTRA_ARGS="${QUALITY_EXTRA_ARGS} --concurrency ${CONCURRENCY}"
+fi
+
 # csv/jsonl). Quoted so a sheet name with spaces survives.
 if [[ -n "${SHEET}" ]]; then
     QUALITY_EXTRA_ARGS="${QUALITY_EXTRA_ARGS} --sheet '${SHEET}'"

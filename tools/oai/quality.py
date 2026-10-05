@@ -85,6 +85,7 @@ def run(
     dump_inputs: bool = False,
     run_timestamp: str | None = None,
     wait_for_marker: str | None = None,
+    concurrency: int | None = None,
     detach: bool = False,
 ) -> int:
     """Submit AutoQA quality Job(s) against an already-deployed model.
@@ -124,6 +125,18 @@ def run(
 
     sheet_keys = _resolve_sheet_keys(sheets)
 
+    # Large/slow models over-subscribe the vLLM KV cache at the default config
+    # concurrency (32/16), which queues requests and causes TimeoutErrors. If the
+    # caller didn't pass an explicit --concurrency, default such models to a safe
+    # lower value so quality runs clean out of the box.
+    _LOW_CONCURRENCY_MODELS = {"gemma-4-31b": 8}
+    if concurrency is None and model_id in _LOW_CONCURRENCY_MODELS:
+        concurrency = _LOW_CONCURRENCY_MODELS[model_id]
+        ui.info(
+            f"Defaulting --concurrency to {concurrency} for '{model_id}' (large/slow model; "
+            "avoids KV-cache over-subscription and request timeouts). Override with --concurrency."
+        )
+
     # An explicit --config or --dataset-key only makes sense for a single sheet;
     # per-sheet defaults would otherwise be silently overridden for both.
     if len(sheet_keys) > 1 and (config or dataset_key):
@@ -154,6 +167,7 @@ def run(
             dump_inputs=dump_inputs,
             run_timestamp=run_timestamp,
             wait_for_marker=wait_for_marker,
+            concurrency=concurrency,
             # When several sheets run in one invocation they must all be submitted
             # up front and continue in-cluster, so force detach for a multi-sheet
             # run regardless of the caller's preference.
@@ -183,6 +197,7 @@ def _run_one_sheet(
     dump_inputs: bool,
     run_timestamp: str | None,
     wait_for_marker: str | None,
+    concurrency: int | None,
     detach: bool,
 ) -> int:
     spec = catalog.load(model_id)
@@ -227,6 +242,8 @@ def _run_one_sheet(
         args += ["--run-timestamp", run_timestamp]
     if wait_for_marker:
         args += ["--wait-for-marker", wait_for_marker]
+    if concurrency:
+        args += ["--concurrency", str(concurrency)]
     if dump_samples:
         args += ["--dump-samples", "--max-dump-samples", str(max_dump_samples)]
         if dump_inputs:

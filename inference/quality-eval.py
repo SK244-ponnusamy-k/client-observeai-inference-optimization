@@ -862,6 +862,12 @@ def _run(args: argparse.Namespace) -> None:
     mcfg = cfg.get("model", {})
     served_model = args.model or mcfg.get("served_name") or "model"
     concurrency = int(cfg.get("run", {}).get("concurrency", 8))
+    # CLI override wins over the config value. Lets a slow/large model (e.g.
+    # gemma-4-31b) run with fewer concurrent requests so the vLLM KV cache is not
+    # over-subscribed (which otherwise queues ~38 reqs and causes TimeoutErrors).
+    if getattr(args, "concurrency", 0):
+        concurrency = int(args.concurrency)
+    logger.info("Request concurrency: %d", concurrency)
     endpoint = args.endpoint.rstrip("/")
 
     rows = load_dataset(args.dataset, cfg, sheet=getattr(args, "sheet", "") or "")
@@ -1203,6 +1209,10 @@ def main() -> None:
                     help="Per-request HTTP timeout (seconds) for a single model call. Raise for large/slow "
                          "models with reasoning ON (e.g. gemma-4-31b on L4 TP=4) that can take >2 min/request; "
                          "the old fixed 120s cut working requests off as false TimeoutErrors.")
+    ap.add_argument("--concurrency", type=int, default=0,
+                    help="Override run.concurrency from the config. Lower it for large/slow models so the "
+                         "vLLM KV cache is not over-subscribed (over-subscription queues requests and causes "
+                         "TimeoutErrors). 0 = use the config value.")
     # Opt-in per-row sample capture. OFF by default (customer-data policy).
     # Captures MODEL OUTPUT only (never the input transcript), capped by
     # --max-dump-samples to keep the file small.
