@@ -99,18 +99,30 @@ def run(
     hw: str | None = None,
     manifest: str | None = None,
     run_timestamp: str | None = None,
+    auto_stop: bool = False,
     detach: bool = False,
 ) -> int:
     spec = catalog.load(model_id)
 
-    # Refuse a duplicate standalone run for this model+tag (would hit the same
-    # endpoint and contaminate results). Skipped when run_timestamp is set, i.e.
-    # when called from the deploy pipeline — deploy already ran this guard, and
-    # the jobs it just submitted share this run_timestamp, so re-checking would
-    # false-positive on our own jobs. include_deployment=False: benchmarking runs
-    # AGAINST a live deployment, so an existing deployment is expected, not a clash.
+    # A deploy-pipeline call always supplies run_timestamp (and never auto_stop,
+    # since deploy submits its own autostop). Anything else is a STANDALONE run.
+    from_deploy_pipeline = run_timestamp is not None
+
+    # Standalone --auto-stop: we must know the run_timestamp up front so the
+    # auto-stop Job can match the benchmark Job it should wait on. Generate one
+    # here and run detached (auto-stop must survive the terminal closing).
+    if auto_stop and run_timestamp is None:
+        from datetime import datetime, timezone
+        run_timestamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+        detach = True
+
+    # Refuse a duplicate STANDALONE run for this model+tag (would hit the same
+    # endpoint and contaminate results). Skipped for the deploy pipeline — deploy
+    # already ran this guard, and the jobs it just submitted share this
+    # run_timestamp, so re-checking would false-positive on our own jobs.
+    # include_deployment=False: benchmarking runs AGAINST a live deployment.
     from . import preflight
-    if run_timestamp is None:
+    if not from_deploy_pipeline:
         preflight.fail_if_active(spec.id, tag, include_deployment=False)
 
     # Resolve the benchmark manifest, in priority order:
@@ -199,4 +211,14 @@ def run(
         ui.info("Performance Jobs submitted in-cluster. They continue independently of this terminal.")
     else:
         ui.info("Benchmark complete. Results are in the results bucket (path shown above).")
+
+    # Standalone --auto-stop: submit an in-cluster autostop that waits for the
+    # final benchmark Job (bench-jobs mode, kubectl-based) then stops the model.
+    if auto_stop and not from_deploy_pipeline:
+        last_profile = completion_profile(spec, profile, skip_batch)
+        preflight.submit_autostop(
+            spec.id, tag, run_timestamp,  # type: ignore[arg-type]
+            wait_mode="bench-jobs",
+            wait_for_profile=last_profile,
+        )
     return 0

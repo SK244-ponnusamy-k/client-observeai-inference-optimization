@@ -86,6 +86,7 @@ def run(
     run_timestamp: str | None = None,
     wait_for_marker: str | None = None,
     concurrency: int | None = None,
+    auto_stop: bool = False,
     detach: bool = False,
 ) -> int:
     """Submit AutoQA quality Job(s) against an already-deployed model.
@@ -122,6 +123,17 @@ def run(
             "--dump-inputs needs --dump-samples.",
             "Inputs are written into the samples file, so both are required.",
         )
+
+    # A deploy-pipeline call always supplies run_timestamp (and never auto_stop,
+    # since deploy submits its own autostop). Anything else is STANDALONE.
+    from_deploy_pipeline = run_timestamp is not None
+
+    # Standalone --auto-stop: fix the run_timestamp up front so the autostop Job
+    # can match the quality Jobs it must wait on, and run detached.
+    if auto_stop and run_timestamp is None:
+        from datetime import datetime, timezone
+        run_timestamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+        detach = True
 
     sheet_keys = _resolve_sheet_keys(sheets)
 
@@ -174,6 +186,17 @@ def run(
             detach=detach or len(sheet_keys) > 1,
         )
         rc_final = rc_final or rc
+
+    # Standalone --auto-stop: submit an in-cluster autostop that waits for the
+    # quality Job(s) (quality-jobs mode, kubectl) then stops the model. The
+    # sheets that ran determine how many quality Jobs the autostop expects.
+    if auto_stop and not from_deploy_pipeline:
+        from . import preflight
+        preflight.submit_autostop(
+            model_id, tag, run_timestamp,  # type: ignore[arg-type]
+            wait_mode="quality-jobs",
+            quality_sheets=[SHEETS[k]["tag"] for k in sheet_keys],
+        )
     return rc_final
 
 

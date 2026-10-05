@@ -146,7 +146,7 @@ def _cmd_status(_args: argparse.Namespace) -> int:
 def _cmd_benchmark(args: argparse.Namespace) -> int:
     return bench_mod.run(
         args.id, profile=args.profile, dataset=args.dataset, skip_batch=args.skip_batch,
-        tag=args.tag, hw=args.hw, manifest=args.manifest,
+        tag=args.tag, hw=args.hw, manifest=args.manifest, auto_stop=args.auto_stop,
     )
 
 
@@ -167,6 +167,7 @@ def _cmd_quality(args: argparse.Namespace) -> int:
         max_dump_samples=args.max_dump_samples,
         dump_inputs=args.dump_inputs,
         concurrency=args.concurrency,
+        auto_stop=args.auto_stop,
         detach=args.detach,
     )
 
@@ -328,6 +329,9 @@ def _build_parser() -> argparse.ArgumentParser:
     bm.add_argument("--tag", help="benchmark a specific tagged copy (matches the deploy --tag)")
     bm.add_argument("--hw", help="instance the model runs on; drives dynamic instance_type + cost (e.g. g7e.2xlarge)")
     bm.add_argument("--manifest", help="explicit manifest to use (e.g. a Neuron manifest: gpt-oss-20b-neuron-trn2-bf16.yaml)")
+    bm.add_argument("--auto-stop", action="store_true",
+                    help="after the benchmark finishes, automatically stop this model (frees its GPU node). "
+                         "Runs as an in-cluster cleanup Job, so it works even after the terminal is closed.")
     bm.set_defaults(func=_cmd_benchmark)
 
     # quality
@@ -360,6 +364,9 @@ def _build_parser() -> argparse.ArgumentParser:
     ql.add_argument("--concurrency", type=int, default=None,
                     help="override request concurrency (lower it for large/slow models to avoid KV-cache "
                          "over-subscription and timeouts; gemma-4-31b defaults to 8 automatically)")
+    ql.add_argument("--auto-stop", action="store_true",
+                    help="after quality finishes, automatically stop this model (frees its GPU node). "
+                         "Runs as an in-cluster cleanup Job, so it works even after the terminal is closed.")
     ql.add_argument("--detach", action="store_true", help="submit the quality Job and return without following logs")
     ql.set_defaults(func=_cmd_quality)
 

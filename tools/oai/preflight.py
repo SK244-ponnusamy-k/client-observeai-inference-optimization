@@ -71,6 +71,58 @@ def active_runs_for(
     return found
 
 
+def submit_autostop(
+    model_id: str,
+    tag: str | None,
+    run_timestamp: str,
+    *,
+    wait_mode: str,
+    wait_for_profile: str | None = None,
+    quality_sheets: list[str] | None = None,
+) -> int:
+    """Submit an in-cluster auto-stop Job for a STANDALONE benchmark/quality run.
+
+    Used by `oai benchmark --auto-stop` and `oai quality --auto-stop` so a run
+    against an already-deployed model can clean itself up. The run_timestamp MUST
+    be the same one passed to the benchmark/quality run so the autostop matches
+    the right Jobs.
+
+    wait_mode:
+      - "bench-jobs"   -> waits for the benchmark Job (needs wait_for_profile).
+      - "quality-jobs" -> waits for the quality Job(s) (needs quality_sheets).
+    """
+    from . import paths  # local import to avoid import cycles
+
+    script = paths.ROOT / "inference" / "run-autostop.sh"
+    if not script.exists():
+        ui.warn(
+            "inference/run-autostop.sh is missing; skipping auto-stop. "
+            f"Stop manually later: oai stop {model_id}{f' --tag {tag}' if tag else ''}."
+        )
+        return 0
+
+    args = ["--model", model_id, "--run-timestamp", run_timestamp, "--wait-mode", wait_mode]
+    if tag:
+        args += ["--tag", tag]
+    if wait_mode == "bench-jobs":
+        args += ["--wait-for-profile", wait_for_profile or "batch"]
+    elif wait_mode == "quality-jobs":
+        for sheet in (quality_sheets or ["org", "xl"]):
+            args += ["--quality-sheet", sheet]
+
+    ui.banner(f"Auto-stop: {model_id}{f'  (tag={tag})' if tag else ''}")
+    rc = shell.run_bash(script, args)
+    if rc != 0:
+        ui.warn(
+            f"Auto-stop Job submission returned non-zero (exit {rc}). "
+            f"If the model is not stopped when the run ends, run "
+            f"'oai stop {model_id}{f' --tag {tag}' if tag else ''}' manually."
+        )
+    else:
+        ui.info("Auto-stop Job submitted; it stops this model once the run finishes.")
+    return rc
+
+
 def fail_if_active(
     model_id: str,
     tag: str | None,
