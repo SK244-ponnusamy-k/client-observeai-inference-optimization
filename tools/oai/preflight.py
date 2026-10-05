@@ -12,6 +12,7 @@ never blocked spuriously.
 from __future__ import annotations
 
 import json
+import re
 
 from . import shell, ui
 
@@ -32,8 +33,10 @@ def active_runs_for(
         is terminal only when it has a Complete or Failed condition set True).
 
     Job names are oai-infopt-(bench|quality)-<id-dashed>[-<tag>]-<timestamp>-...,
-    so we match on the name prefix (benchmark Jobs carry no run-tag label; the tag
-    is reliably embedded only in the name).
+    so we match the name up to and including the <timestamp> (YYYYMMDD-HHMMSS)
+    token. Anchoring on the timestamp means a short tag is NOT mistaken for a
+    prefix of a longer one (e.g. tag "g6" must not match "g6-v1" jobs). Benchmark
+    Jobs carry no run-tag label; the tag is reliably embedded only in the name.
 
     Returns an empty list when nothing is active OR kubectl can't reach the
     cluster (fail-safe: never block spuriously).
@@ -54,11 +57,27 @@ def active_runs_for(
             items = json.loads(jobs_out).get("items", [])
         except (ValueError, TypeError):
             items = []
-        bench_prefix = f"oai-infopt-bench-{id_dashed}{tag_seg}-"
-        qual_prefix = f"oai-infopt-quality-{id_dashed}{tag_seg}-"
+        # Job names look like:
+        #   oai-infopt-bench-<id>[-<tag>]-<timestamp>-<profile>
+        #   oai-infopt-quality-<id>[-<tag>]-<sheet>-<timestamp>-<suffix>
+        # where <timestamp> is YYYYMMDD-HHMMSS. The run-timestamp is what reliably
+        # terminates the tag (optionally followed, for quality, by one sheet token).
+        # Anchoring on the timestamp means a short tag is NOT treated as a prefix of
+        # a longer one (e.g. tag "g6" must not match the "g6-v1" jobs): for "g6" the
+        # token right after "-g6-" would be "v1-org-<ts>", and "v1" is neither a
+        # timestamp nor a lone sheet token, so it correctly does not match.
+        ts = r"\d{8}-\d{6}"
+        # bench: tag is immediately followed by the timestamp.
+        bench_re = re.compile(
+            rf"^oai-infopt-bench-{re.escape(id_dashed)}{re.escape(tag_seg)}-{ts}(-|$)"
+        )
+        # quality: tag is followed by exactly one sheet token, then the timestamp.
+        qual_re = re.compile(
+            rf"^oai-infopt-quality-{re.escape(id_dashed)}{re.escape(tag_seg)}-[^-]+-{ts}(-|$)"
+        )
         for j in items:
             name = (j.get("metadata") or {}).get("name", "")
-            if not (name.startswith(bench_prefix) or name.startswith(qual_prefix)):
+            if not (bench_re.match(name) or qual_re.match(name)):
                 continue
             conds = (j.get("status") or {}).get("conditions") or []
             terminal = any(
