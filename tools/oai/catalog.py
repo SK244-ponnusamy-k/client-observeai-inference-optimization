@@ -55,6 +55,13 @@ class Serving:
     gpu_memory_utilization: float = 0.90
     max_num_seqs: int = 256
     max_num_batched_tokens: int = 8192
+    # CUDA graph capture sizes. One of the two highest-impact tuning knobs
+    # (alongside max_num_batched_tokens) per the llm-tuna study. 0 / unset leaves
+    # vLLM's default behaviour; `oai tune` writes the winning value here.
+    cuda_graph_sizes: int = 0
+    # Prefill requests shorter than this bypass the large prefill path. Optional;
+    # only worth tuning for workloads with high prompt-length variance. 0 = unset.
+    long_prefill_token_threshold: int = 0
     extra_args: list[str] = field(default_factory=list)
 
 
@@ -94,6 +101,51 @@ class Benchmark:
     skip_batch: bool = False
 
 
+# Bounds for the two high-impact parameters the auto-tuner searches. Each entry
+# is [low, high]; the tuner samples within these. Defaults are broad but safe —
+# narrow them per model (e.g. gemma's vision floor) via the catalog `tune:` block.
+_DEFAULT_MNBT_BOUNDS = [2048, 131072]
+_DEFAULT_CUDA_GRAPH_BOUNDS = [1, 512]
+
+
+@dataclass
+class Tune:
+    """Auto-tuning (`oai tune`) configuration. Fully optional, safe defaults.
+
+    The tuner runs a short Bayesian search (Optuna/TPE) over the HIGH-IMPACT
+    performance parameters only, against ONE target concurrency, and writes the
+    winner back into serving.* . Quality is NEVER part of this loop — the tuned
+    params do not change model outputs, so accuracy is evaluated once separately.
+    """
+
+    auto: bool = False                       # if true, `oai deploy` tunes first
+    profile: str = "configs/workload_profiles/tune_v1.yaml"
+    target_concurrency: int = 50             # the ONE level to tune against
+    objective: str = "output_tokens_s"       # output_tokens_s | p95_latency
+    trials: int = 50                         # total trials (10 random warmup + TPE)
+    random_warmup: int = 10                  # initial random exploration trials
+    parallelism: int = 1                     # concurrent trials across nodes
+    # Which params to search. Order is free; unknown names are rejected at run.
+    params: list[str] = field(
+        default_factory=lambda: ["max_num_batched_tokens", "cuda_graph_sizes"]
+    )
+    # Per-parameter [low, high] bounds. Missing entries fall back to the module
+    # defaults above. Set a model-specific floor here to respect known hard
+    # limits (e.g. gemma-4-31b needs max_num_batched_tokens >= 2496).
+    bounds: dict[str, list[int]] = field(default_factory=dict)
+
+    def bounds_for(self, param: str) -> list[int]:
+        if param in self.bounds:
+            return self.bounds[param]
+        if param == "max_num_batched_tokens":
+            return list(_DEFAULT_MNBT_BOUNDS)
+        if param == "cuda_graph_sizes":
+            return list(_DEFAULT_CUDA_GRAPH_BOUNDS)
+        # long_prefill_token_threshold and anything else: derive from model len
+        # at call time; a conservative default here keeps the dataclass pure.
+        return [256, 8192]
+
+
 @dataclass
 class ModelSpec:
     id: str
@@ -105,6 +157,7 @@ class ModelSpec:
     instances: Instances
     neuron: Neuron | None
     benchmark: Benchmark
+    tune: Tune
     tags: dict[str, str] = field(default_factory=dict)
 
     # ---- derived names (single source of truth for resource naming) ----------
@@ -191,6 +244,8 @@ def from_dict(data: dict[str, Any]) -> ModelSpec:
         gpu_memory_utilization=float(srv_raw.get("gpu_memory_utilization", 0.90)),
         max_num_seqs=int(srv_raw.get("max_num_seqs", 256)),
         max_num_batched_tokens=int(srv_raw.get("max_num_batched_tokens", 8192)),
+        cuda_graph_sizes=int(srv_raw.get("cuda_graph_sizes", 0) or 0),
+        long_prefill_token_threshold=int(srv_raw.get("long_prefill_token_threshold", 0) or 0),
         extra_args=list(srv_raw.get("extra_args", []) or []),
     )
 
@@ -239,6 +294,26 @@ def from_dict(data: dict[str, Any]) -> ModelSpec:
         skip_batch=bool(bench_raw.get("skip_batch", False)),
     )
 
+    tune_raw = data.get("tune", {}) or {}
+    raw_bounds = tune_raw.get("bounds", {}) or {}
+    # Normalise bounds to {param: [int, int]}, ignoring malformed entries so a
+    # typo in the catalog can't crash the loader (validate() flags them instead).
+    bounds: dict[str, list[int]] = {}
+    for k, v in raw_bounds.items():
+        if isinstance(v, (list, tuple)) and len(v) == 2:
+            bounds[str(k)] = [int(v[0]), int(v[1])]
+    tune = Tune(
+        auto=bool(tune_raw.get("auto", False)),
+        profile=tune_raw.get("profile") or "configs/workload_profiles/tune_v1.yaml",
+        target_concurrency=int(tune_raw.get("target_concurrency", 50)),
+        objective=tune_raw.get("objective", "output_tokens_s"),
+        trials=int(tune_raw.get("trials", 50)),
+        random_warmup=int(tune_raw.get("random_warmup", 10)),
+        parallelism=int(tune_raw.get("parallelism", 1)),
+        params=list(tune_raw.get("params", []) or ["max_num_batched_tokens", "cuda_graph_sizes"]),
+        bounds=bounds,
+    )
+
     return ModelSpec(
         id=model_id,
         display_name=data.get("display_name") or model_id,
@@ -249,6 +324,7 @@ def from_dict(data: dict[str, Any]) -> ModelSpec:
         instances=instances,
         neuron=neuron,
         benchmark=benchmark,
+        tune=tune,
         tags=dict(data.get("tags", {}) or {}),
     )
 
@@ -335,5 +411,30 @@ def validate(spec: ModelSpec) -> list[str]:
             "benchmark.instance_hourly_usd is 0 - cost figures will be null. "
             "Set the $/hr for your chosen instance and region (this is a warning, not fatal)."
         )
+
+    # ---- tune block (only meaningful if the user populated it) ---------------
+    _TUNABLE = ("max_num_batched_tokens", "cuda_graph_sizes", "long_prefill_token_threshold")
+    _VALID_OBJ = ("output_tokens_s", "p95_latency")
+    if spec.tune.objective not in _VALID_OBJ:
+        problems.append(
+            f"tune.objective '{spec.tune.objective}' is invalid - expected one of {', '.join(_VALID_OBJ)}."
+        )
+    for p in spec.tune.params:
+        if p not in _TUNABLE:
+            problems.append(
+                f"tune.params contains '{p}' which is not tunable - expected a subset of {', '.join(_TUNABLE)}."
+            )
+    if spec.tune.target_concurrency <= 0:
+        problems.append("tune.target_concurrency must be > 0 (the single concurrency to tune against).")
+    if spec.tune.random_warmup > spec.tune.trials:
+        problems.append(
+            f"tune.random_warmup ({spec.tune.random_warmup}) exceeds tune.trials ({spec.tune.trials}) - "
+            "there would be no Bayesian trials after warmup."
+        )
+    for param, b in spec.tune.bounds.items():
+        if param not in _TUNABLE:
+            problems.append(f"tune.bounds has '{param}' which is not a tunable parameter.")
+        elif b[0] >= b[1]:
+            problems.append(f"tune.bounds['{param}'] low ({b[0]}) must be < high ({b[1]}).")
 
     return problems

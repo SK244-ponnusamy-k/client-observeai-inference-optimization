@@ -14,6 +14,7 @@ Commands:
   oai stop <id>                 Stop and free the accelerator node
   oai status                    Show what is running + rough cost
   oai benchmark <id> [flags]    Run the performance benchmark against a deployed model
+  oai tune <id> [flags]         Auto-tune high-impact vLLM params and adopt the best config
   oai quality <id> [flags]      Run the AutoQA quality evaluation against a deployed model
 """
 
@@ -24,6 +25,7 @@ import sys
 
 from . import benchmark as bench_mod
 from . import quality as quality_mod
+from . import tune as tune_mod
 from . import catalog, config, generate, instances, lifecycle, paths, shell, ui
 from .ui import OaiError
 
@@ -147,6 +149,23 @@ def _cmd_benchmark(args: argparse.Namespace) -> int:
     return bench_mod.run(
         args.id, profile=args.profile, dataset=args.dataset, skip_batch=args.skip_batch,
         tag=args.tag, hw=args.hw, manifest=args.manifest, auto_stop=args.auto_stop,
+    )
+
+
+def _cmd_tune(args: argparse.Namespace) -> int:
+    params = None
+    if args.params:
+        params = [p.strip() for p in args.params.split(",") if p.strip()]
+    return tune_mod.run(
+        args.id,
+        concurrency=args.concurrency,
+        trials=args.trials,
+        objective=args.objective,
+        params=params,
+        hw=args.hw,
+        wait_timeout=args.wait_timeout,
+        write_back=not args.no_write_back,
+        dry_run=args.dry_run,
     )
 
 
@@ -333,6 +352,30 @@ def _build_parser() -> argparse.ArgumentParser:
                     help="after the benchmark finishes, automatically stop this model (frees its GPU node). "
                          "Runs as an in-cluster cleanup Job, so it works even after the terminal is closed.")
     bm.set_defaults(func=_cmd_benchmark)
+
+    # tune
+    tn = sub.add_parser(
+        "tune",
+        help="auto-tune high-impact vLLM params (Bayesian search) and adopt the best config",
+    )
+    tn.add_argument("id")
+    tn.add_argument("--concurrency", type=int, default=None,
+                    help="single target concurrency to tune against (overrides catalog tune.target_concurrency)")
+    tn.add_argument("--trials", type=int, default=None,
+                    help="total trials, random warmup + Bayesian (overrides catalog tune.trials)")
+    tn.add_argument("--objective", choices=["output_tokens_s", "p95_latency"], default=None,
+                    help="metric to optimize: maximize output_tokens_s or minimize p95_latency")
+    tn.add_argument("--params", default=None,
+                    help="comma-separated params to search "
+                         "(subset of max_num_batched_tokens,cuda_graph_sizes,long_prefill_token_threshold)")
+    tn.add_argument("--hw", help="instance type to run trial deployments on (e.g. g6e.2xlarge)")
+    tn.add_argument("--wait-timeout", type=int, default=1800,
+                    help="seconds to wait for each trial's vLLM endpoint to become ready (default 1800)")
+    tn.add_argument("--no-write-back", action="store_true",
+                    help="do NOT edit the catalog; just print the winning config")
+    tn.add_argument("--dry-run", action="store_true",
+                    help="validate the full search loop with a synthetic objective (no cluster, no deploy)")
+    tn.set_defaults(func=_cmd_tune)
 
     # quality
     ql = sub.add_parser("quality", help="run AutoQA quality evaluation against a deployed model")

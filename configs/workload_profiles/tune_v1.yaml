@@ -1,0 +1,74 @@
+# ==============================================================================
+# configs/workload_profiles/tune_v1.yaml
+#
+# SHORT PROXY workload profile — TUNE
+# Profile version: v1  |  Status: TUNING-ONLY (NOT a publishable benchmark)
+#
+# Purpose: A cheap, fast proxy load used ONLY by `oai tune` to RANK candidate
+#          vLLM configurations against each other during Bayesian search. It is
+#          deliberately NOT comparable to batch_v1 / realtime_v1 and must NEVER
+#          be used to certify a model — those remain the frozen v1 profiles.
+#
+# WHY THIS EXISTS (the 5-hour problem):
+#   batch_v1 sweeps 6 concurrency levels x (concurrency*20) prompts x 300s, which
+#   is correct for a final, SLO-grade report but far too slow to pay on EVERY
+#   trial of a parameter search. Per the llm-tuna method, a tuning trial only has
+#   to run long enough for STABLE metrics — "a bit longer than 5x median request
+#   latency" — against ONE representative concurrency. That turns a ~5h question
+#   ("did this param help?") into a ~1-3 min one, so 50 trials finish in hours
+#   instead of days. The single proven-best config is then validated ONCE with
+#   the full batch_v1 + realtime_v1 + quality run.
+#
+# Keys read by the harness (inference/load-test.py) are marked [ACTIVE] and use
+# the SAME schema as batch_v1 so no harness change is needed.
+# ==============================================================================
+
+profile_id: tune_v1              # [ACTIVE]
+profile_type: batch
+description: >
+  Short single-concurrency proxy for auto-tuning. Ranks candidate vLLM configs by
+  output_throughput_tokens_s. NOT a publishable benchmark — use batch_v1 /
+  realtime_v1 to certify the winning config.
+
+# -- Input distribution -------------------------------------------------------
+# Same synthetic, PII-free random dataset as batch_v1 so the proxy exercises the
+# same code paths; only the sample sizing / duration shrink.
+input:
+  dataset_name: random           # [ACTIVE] built-in synthetic dataset (no PII)
+  random_input_len: 1024         # [ACTIVE] match batch_v1's transcript p95
+  ignore_eos: true               # [ACTIVE] fixed output length for stable throughput
+
+# -- Output target ------------------------------------------------------------
+output:
+  max_new_tokens: 512            # [ACTIVE]
+  seed: 42                       # [ACTIVE] deterministic — trials differ only by params
+  reasoning_effort: medium       # [ACTIVE]
+  temperature: 0.0               # (documentation)
+
+# -- Concurrency + sample sizing (THE SPEED LEVERS) ---------------------------
+# ONE representative concurrency, NOT a sweep. `oai tune --concurrency N`
+# overrides this at run time so you tune against your real production load level.
+# The llm-tuna paper is explicit that tuned configs do NOT generalize across
+# concurrency, so pick the level you actually serve at.
+concurrency_levels: [50]         # [ACTIVE] single level (override via --concurrency)
+# Few prompts: enough to reach steady state and rank configs, not to certify an
+# SLO. num_prompts per level = max(concurrency * factor, min_prompts).
+num_prompts_factor: 3            # [ACTIVE] 50*3 = 150 prompts (vs batch_v1's 1000+)
+min_prompts: 60                  # [ACTIVE] floor so very low concurrencies still sample
+warmup_requests: 10              # (documentation)
+duration_s: 60                   # (documentation) ~5x median latency target
+
+# -- Objective (documentation) ------------------------------------------------
+# No pass/fail SLO during tuning — Optuna MAXIMIZES/minimizes the objective it is
+# given (default output_throughput_tokens_s). An empty slo block means a trial is
+# never marked failed_slo, so load-test.py always exits 0 on a valid measurement.
+slo: {}
+
+# -- Extra passthrough flags to `vllm bench serve` ----------------------------
+bench_extra_args:                # [ACTIVE]
+  - "--random-range-ratio"
+  - "0.5"
+
+# -- Runner (documentation) ---------------------------------------------------
+runner: vllm_bench_serve
+endpoint_path: /v1/chat/completions

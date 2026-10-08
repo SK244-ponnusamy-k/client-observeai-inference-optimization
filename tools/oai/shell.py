@@ -150,13 +150,40 @@ def run_bash(script: Path, args: list[str] | None = None, env: dict[str, str] | 
     return proc.returncode
 
 
-def kubectl_json(args: list[str]) -> str | None:
-    """Run a kubectl command returning stdout, or None if kubectl/call fails."""
+def run(cmd: list[str], env: dict[str, str] | None = None, cwd: Path | None = None) -> int:
+    """Run an argv command from the framework root, streaming output live.
+
+    A sibling to run_bash for non-bash tooling (e.g. invoking a Python script
+    with the current interpreter). Returns the process exit code.
+    """
+    merged = os.environ.copy()
+    if env:
+        merged.update(env)
+    ui.step(f"Running: {' '.join(Path(c).name if os.path.sep in c else c for c in cmd)}")
+    proc = subprocess.run(  # noqa: S603
+        cmd, cwd=str(cwd or paths.ROOT), env=merged, check=False
+    )
+    return proc.returncode
+
+
+def run_kubectl(args: list[str], env: dict[str, str] | None = None) -> int:
+    """Run a kubectl command, streaming output live. Returns exit code."""
+    return run(["kubectl", *args], env=env)
+
+
+def kubectl_json(args: list[str], timeout: int = 60) -> str | None:
+    """Run a kubectl command returning stdout, or None if kubectl/call fails.
+
+    Decodes as UTF-8 with error replacement. The default Windows console encoding
+    (cp1252) crashes on bytes vLLM/kubectl emit (e.g. box-drawing chars in logs),
+    so we force UTF-8 and never let a decode error kill the caller.
+    """
     if not have("kubectl"):
         return None
     try:
         proc = subprocess.run(  # noqa: S603
-            ["kubectl", *args], capture_output=True, text=True, timeout=30, check=False
+            ["kubectl", *args], capture_output=True, timeout=timeout, check=False,
+            encoding="utf-8", errors="replace",
         )
     except (subprocess.TimeoutExpired, OSError):
         return None

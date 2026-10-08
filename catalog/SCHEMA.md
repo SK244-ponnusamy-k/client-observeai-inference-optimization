@@ -151,6 +151,62 @@ oai deploy my-model --benchmark --profile realtime_v1
 oai benchmark my-model --dataset s3://my-bucket/my-prompts.jsonl
 ```
 
+## `tune`
+
+Controls auto-tuning (`oai tune <id>`). Fully optional — every field has a
+default, and the whole block can be omitted. The tuner runs a short Bayesian
+search (Optuna/TPE) over a handful of HIGH-IMPACT performance parameters, against
+**one** target concurrency, then writes the winning values back into `serving.*`.
+
+Why only a few params and one concurrency: a full `batch_v1` sweep is ~5 h, far
+too slow to pay on every parameter combination. A tuning trial instead runs a
+short proxy load (`tune_v1.yaml`, ~1–3 min) just long enough for stable metrics,
+so 50 trials finish in hours instead of days. The single proven-best config is
+then validated **once** with the full `batch_v1` + `realtime_v1` + quality run.
+
+```yaml
+tune:
+  auto: false                     # if true, `oai deploy` tunes before serving
+  profile: configs/workload_profiles/tune_v1.yaml   # short proxy load
+  target_concurrency: 50          # the ONE concurrency to tune against
+  objective: output_tokens_s      # output_tokens_s (maximize) | p95_latency (minimize)
+  trials: 50                      # total trials (random warmup + Bayesian)
+  random_warmup: 10               # initial random exploration before TPE kicks in
+  parallelism: 1                  # concurrent trials across nodes
+  params:                         # which high-impact params to search
+    - max_num_batched_tokens
+    - cuda_graph_sizes
+  bounds:                         # optional per-param [low, high] overrides
+    max_num_batched_tokens: [4096, 131072]
+    cuda_graph_sizes: [1, 512]
+```
+
+Tunable parameters (the only values `params` / `bounds` may name):
+
+| param                          | effect                                                        |
+|--------------------------------|---------------------------------------------------------------|
+| `max_num_batched_tokens`       | upper bound on batched tokens; the single highest-impact knob |
+| `cuda_graph_sizes`             | pre-traced CUDA graph sizes; cuts host overhead / inter-token latency |
+| `long_prefill_token_threshold` | routes short prefills past large prefill ops (variable prompt lengths) |
+
+Important caveats (from the llm-tuna study):
+
+- **Tuned configs do not generalize across concurrency.** A config tuned at
+  concurrency 28 gained ~9% there but *lost* ~8% at concurrency 56. Set
+  `target_concurrency` to the load you actually serve, and re-tune if it shifts.
+- **Set a model-specific floor when the model has a hard minimum.** E.g.
+  `gemma-4-31b` fails to start unless `max_num_batched_tokens >= 2496` (vision
+  token budget), so give it `bounds: {max_num_batched_tokens: [2496, 65536]}`.
+- **Quality is never tuned.** These are performance-only params; they do not
+  change model outputs, so accuracy is evaluated once, separately.
+
+Override any of this at the command line:
+
+```
+oai tune my-model --concurrency 35 --trials 30 --objective p95_latency
+oai tune my-model --params max_num_batched_tokens,cuda_graph_sizes --dry-run
+```
+
 ## `tags`
 
 Optional key/value pairs merged into the standard resource tags.

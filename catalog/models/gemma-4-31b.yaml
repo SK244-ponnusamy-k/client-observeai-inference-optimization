@@ -38,11 +38,11 @@ serving:
     - "--enable-prefix-caching"
     # Reasoning OFF. Gemma 4's chat template reads `enable_thinking | default(false)`,
     # so thinking is OFF by default; set explicitly to false to keep it unambiguous
-    # for every request. The reasoning parser is commented out (not deleted) so it
-    # can be re-enabled quickly; with thinking off there is nothing to extract, so
-    # the inference probe records reasoning_observed=OFF.
-    - '--default-chat-template-kwargs={\"enable_thinking\": true}'
-    - "--reasoning-parser=gemma4"   # uncomment to turn reasoning ON (with enable_thinking=true)
+    # for every request. The reasoning parser is left commented out so nothing tries
+    # to extract <think> content; with thinking off there is none, so the inference
+    # probe records reasoning_observed=OFF.
+    - '--default-chat-template-kwargs={\"enable_thinking\": false}'
+    # - "--reasoning-parser=gemma4"   # uncomment to turn reasoning ON (also set enable_thinking=true above)
 
 resources:
   cpu_request: "8"
@@ -56,17 +56,17 @@ resources:
   vram_gb_required: 70          # ~63 GB weights + KV cache
 
 instances:
-  # Dense 31B bf16 (~63 GB weights) needs 4x L4 24 GB = 96 GB total on g6.12xlarge.
-  # tensor-parallel-size=4 splits the model across all 4 GPUs on the node.
-  # NOTE: L4 (g6) is a low-power inference card, so expect modest throughput for a
-  # dense 31B — this is a cost/feasibility data point, not a speed champion.
+  # Dense 31B bf16 (~63 GB weights) needs TP=4 to split across 4 GPUs on one node.
+  #   g6e.12xlarge: 4x L40S 48 GB = 192 GB — more VRAM + higher throughput (preferred)
+  #   g6.12xlarge : 4x L4   24 GB =  96 GB — cheaper, low-power inference card
   tensor_parallel_size: 4
   candidates:
-    - g6.12xlarge               # 4x L4 24 GB = 96 GB, TP=4
+    - g6e.12xlarge              # 4x L40S 48 GB = 192 GB, TP=4 (preferred)
+    - g6.12xlarge               # 4x L4   24 GB =  96 GB, TP=4
 
 benchmark:
   auto: false
   profiles:
     - configs/workload_profiles/realtime_v1.yaml
     - configs/workload_profiles/batch_v1.yaml
-  instance_hourly_usd: 5.00     # g6.12xlarge on-demand us-east-2 — VERIFY before run
+  instance_hourly_usd: 7.47     # g6e.12xlarge on-demand us-east-2 — VERIFY before run

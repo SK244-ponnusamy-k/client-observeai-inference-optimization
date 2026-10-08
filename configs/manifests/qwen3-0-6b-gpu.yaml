@@ -1,0 +1,45 @@
+# ==============================================================================
+# configs/manifests/qwen3-0-6b-gpu.yaml  - single DYNAMIC GPU manifest
+#
+# ONE manifest for Qwen/Qwen3-0.6B (bf16) across ALL NVIDIA G instances (TP=1).
+# The actual instance is chosen at deploy time via `--hw`; instance_type, cost,
+# and node placement are resolved DYNAMICALLY (OAI_INSTANCE_TYPE).
+#
+# PURPOSE: tune pipeline smoke test model. Tiny (~1.2 GB), starts fast, cheap.
+# ==============================================================================
+run_id: qwen3-0-6b-gpu-2026-10-06-001
+description: "Qwen/Qwen3-0.6B bf16, any NVIDIA G instance (TP=1) — tune smoke test"
+
+model:
+  hf_id: Qwen/Qwen3-0.6B
+  served_name: Qwen3-0.6B
+  tokenizer: Qwen/Qwen3-0.6B
+  s3_prefix: Qwen3-0.6B/
+  source: eks_gpu
+
+serving:
+  image: public.ecr.aws/deep-learning-containers/vllm:0.26.0-gpu-py312-cu130-ubuntu22.04-ec2-v1.0-soci@sha256:e70d649d964dd0b568669453df523e764d23933987ea378d0f423cbe4ae56b81
+  instance_type: g6.2xlarge
+
+optimization_variants:
+  - label: bf16-gpu
+    quantization: none
+    tensor_parallel_size: 1
+    max_num_seqs: 256
+    max_num_batched_tokens: 8192
+    max_model_len: 8192
+    kv_cache_dtype: auto
+
+benchmark:
+  workload_profiles:
+    - configs/workload_profiles/realtime_v1.yaml
+    - configs/workload_profiles/batch_v1.yaml
+
+tags:
+  Project: observeai-inference-optimization
+  Engagement: shellkode-sow
+  Environment: sandbox
+  ManagedBy: oai-cli
+  Owner: TBD
+  CostCenter: TBD
+  RunId: qwen3-0-6b-gpu-2026-10-06-001

@@ -32,6 +32,11 @@ where = ["tools"]
 include = ["oai*"]
 
 [project.optional-dependencies]
+# Auto-tuning (`oai tune`). Optional so the core CLI installs without it; the
+# tune command raises an actionable error if optuna is missing.
+tune = [
+    "optuna==4.6.0",
+]
 dev = [
     "pytest==8.2.2",
     "pytest-asyncio==0.23.7",

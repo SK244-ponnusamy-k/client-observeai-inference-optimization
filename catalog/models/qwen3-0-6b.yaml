@@ -1,0 +1,87 @@
+# ==============================================================================
+# catalog/models/qwen3-0-6b.yaml
+#
+# Qwen/Qwen3-0.6B — dense 0.6B, bf16. ~1.2 GB, fits a single GPU on any family
+# (TP=1) with room to spare.
+#
+# PURPOSE: the TEST / SMOKE model for the auto-tuning pipeline. It is small and
+# fast enough that a full `oai tune` study (deploy -> short proxy load -> teardown
+# per trial) completes quickly and cheaply, so you can validate the end-to-end
+# tune flow before pointing it at an expensive production model. The absolute
+# throughput numbers are not meaningful on a model this small — what you are
+# validating here is that the SEARCH LOOP works (sampling, pruning, write-back).
+#
+# The id is K8s-safe (dashes, no dots: qwen3-0-6b) while the HF id / served name
+# keep the real "0.6B" naming.
+# ==============================================================================
+
+id: qwen3-0-6b
+display_name: Qwen3 0.6B (tune smoke)
+hardware: gpu
+
+source:
+  hf_id: Qwen/Qwen3-0.6B
+  gated: false
+  size_gb: 2                     # ~1.2 GB bf16 weights; round up for storage/sizing
+
+serving:
+  served_name: Qwen3-0.6B
+  tokenizer: Qwen/Qwen3-0.6B
+  quantization: bf16
+  max_model_len: 8192
+  gpu_memory_utilization: 0.90
+  max_num_seqs: 256
+  max_num_batched_tokens: 8192
+  extra_args:
+    # Reasoning OFF. Qwen3 defaults thinking ON in its chat template, so turning
+    # reasoning OFF needs BOTH an explicit enable_thinking=false server default AND
+    # NOT loading the qwen3 reasoning parser. The parser line is commented out (not
+    # deleted) so it can be re-enabled quickly. Matches the qwen3-5-4b entry.
+    - '--default-chat-template-kwargs={\"enable_thinking\": true}'
+    - "--reasoning-parser=qwen3"   # uncomment to turn reasoning ON (with enable_thinking=true)
+
+resources:
+  cpu_request: "2"
+  cpu_limit: "4"
+  memory_request: "8Gi"
+  memory_limit: "12Gi"
+  vram_gb_required: 4            # ~1.2 GB weights + KV cache; fits the smallest GPU
+
+instances:
+  tensor_parallel_size: 1
+  candidates:
+    - g6.2xlarge                  # L4 24 GB — the test hardware
+    - g6e.2xlarge
+    - g5.2xlarge
+
+benchmark:
+  auto: false
+  profiles:
+    - configs/workload_profiles/realtime_v1.yaml
+    - configs/workload_profiles/batch_v1.yaml
+  instance_hourly_usd: 1.52      # g6.2xlarge on-demand us-east-2 — VERIFY for your region
+
+# ------------------------------------------------------------------------------
+# Auto-tuning (oai tune). Configured for CHEAP PIPELINE VALIDATION, not for a
+# serious optimization campaign:
+#   * target_concurrency 50     — one representative level (the proxy profile uses it)
+#   * trials 15 (5 random)      — small so the whole study finishes fast on a tiny model
+#   * params                    — the two highest-impact knobs
+#   * bounds                    — capped at max_model_len*max_num_seqs so a candidate
+#                                 can never exceed the context budget on this small box
+# Scale trials up (e.g. 50) and widen bounds once you move to a real model.
+# ------------------------------------------------------------------------------
+tune:
+  auto: false
+  profile: configs/workload_profiles/tune_v1.yaml
+  target_concurrency: 50
+  objective: output_tokens_s
+  trials: 15
+  random_warmup: 5
+  parallelism: 1
+  params:
+    - max_num_batched_tokens
+    - cuda_graph_sizes
+  bounds:
+    max_num_batched_tokens: [2048, 32768]
+    cuda_graph_sizes: [1, 256]
