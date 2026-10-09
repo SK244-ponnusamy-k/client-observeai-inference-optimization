@@ -132,6 +132,9 @@ def _cmd_deploy(args: argparse.Namespace) -> int:
         dump_inputs=args.dump_inputs,
         detach=args.detach,
         auto_stop=args.auto_stop,
+        qid_cost=args.qid_cost,
+        qid_config=args.qid_config,
+        qid_sheet=args.qid_sheet,
     )
 
 
@@ -147,6 +150,7 @@ def _cmd_benchmark(args: argparse.Namespace) -> int:
     return bench_mod.run(
         args.id, profile=args.profile, dataset=args.dataset, skip_batch=args.skip_batch,
         tag=args.tag, hw=args.hw, manifest=args.manifest, auto_stop=args.auto_stop,
+        qid_cost=args.qid_cost, qid_config=args.qid_config, qid_sheet=args.qid_sheet,
     )
 
 
@@ -278,6 +282,15 @@ def _build_parser() -> argparse.ArgumentParser:
     dp.add_argument(
         "--tag", help="run this model as an independent, concurrent copy (suffixes all resource names)"
     )
+    # QID-cost benchmark (same flags as `oai benchmark --qid-cost`)
+    dp.add_argument("--qid-cost", action="store_true", default=False,
+                    help="after deploy, run the benchmark in QID-cost mode: segment the QID dataset "
+                         "and benchmark each QID across all concurrency levels for fair per-QID cost. "
+                         "Requires --benchmark. Dataset + config default from config.env.")
+    dp.add_argument("--qid-config", default="",
+                    help="quality config YAML for QID-cost mode (default from QID_COST_CONFIG in config.env).")
+    dp.add_argument("--qid-sheet", default="",
+                    help="xlsx sheet for QID-cost mode; omit to load all sheets combined.")
     dp.set_defaults(func=_cmd_deploy)
 
     # stop
@@ -332,6 +345,16 @@ def _build_parser() -> argparse.ArgumentParser:
     bm.add_argument("--auto-stop", action="store_true",
                     help="after the benchmark finishes, automatically stop this model (frees its GPU node). "
                          "Runs as an in-cluster cleanup Job, so it works even after the terminal is closed.")
+    # QID-cost mode
+    bm.add_argument("--qid-cost", action="store_true", default=False,
+                    help="segment the dataset by question_id and run each QID as its own benchmark "
+                         "across all concurrency levels to get fair per-QID and average cost/question. "
+                         "Requires --dataset (S3 key of the QID workbook/csv, already in S3) and --qid-config.")
+    bm.add_argument("--qid-config", default="",
+                    help="quality config YAML (e.g. configs/quality/autoqa_v1.yaml) that drives "
+                         "QID dataset parsing — sheet name, field names, system_prompt.")
+    bm.add_argument("--qid-sheet", default="",
+                    help="xlsx sheet override for QID-cost mode (e.g. synthetic_autoqa_transcripts).")
     bm.set_defaults(func=_cmd_benchmark)
 
     # quality

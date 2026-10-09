@@ -152,6 +152,32 @@ def _model_from_samples_filename(name: str) -> str:
     return parts[1] if len(parts) == 2 and parts[1] else stem or "-"
 
 
+def load_qid_cost_results(results_dir: Path) -> list[dict[str, Any]]:
+    """Read QID-cost summary JSONL files written by load-test.py's QID-cost mode.
+
+    Files are named ``<run_id>-qid-cost-summary.jsonl`` and contain two record
+    types:
+      - ``qid_level``       — one row per (QID, concurrency) with cost_per_question
+      - ``overall_average`` — one row per concurrency with avg_cost_per_question
+    """
+    rows: list[dict[str, Any]] = []
+    if not results_dir.exists():
+        return rows
+    for f in sorted(results_dir.rglob("*-qid-cost-summary.jsonl")):
+        with f.open("r", encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    data = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                data["_source_path"] = str(f)
+                rows.append(data)
+    return rows
+
+
 def load_quality_samples(results_dir: Path) -> list[dict[str, Any]]:
     """Read per-row quality samples written by quality-eval.py --dump-samples.
 
@@ -787,10 +813,12 @@ def export_excel(
     xlsx_path: Path,
     sample_results: list[dict[str, Any]] | None = None,
     max_sample_rows: int = 2000,
+    qid_cost_results: list[dict[str, Any]] | None = None,
 ) -> None:
     """Generates a formatted Excel (.xlsx) report with Performance, Quality,
-    Quality Samples, and Detail sheets."""
+    Quality Samples, Per-QID Metrics, and QID-Cost sheets."""
     sample_results = sample_results or []
+    qid_cost_results = qid_cost_results or []
     if not perf_results and not qual_results and not sample_results:
         print("No benchmark or quality results to export.")
         return
@@ -1124,6 +1152,70 @@ def export_excel(
             col_letter = openpyxl.utils.get_column_letter(col[0].column)
             ws.column_dimensions[col_letter].width = min(max(max_len + 3, 12), 80)
 
+    # ── Sheet 5: QID-Cost (per-QID cost per concurrency + overall average) ────
+    if qid_cost_results:
+        ws_qc = wb.create_sheet(title="QID-Cost")
+        # Per-QID level rows
+        hdrs_qc = [
+            "Run ID", "Record Type", "Question ID", "N Questions",
+            "Concurrency", "Output tok/s", "TTFT p95 ms",
+            "Input Tokens", "Output Tokens", "Runtime s",
+            "Instance $/hr", "Run Cost ($)",
+            "Cost/Question ($)", "QID Total Cost ($)", "Status",
+        ]
+        # Overall average rows
+        hdrs_avg = [
+            "Run ID", "Record Type", "Concurrency",
+            "Total Questions", "N QIDs",
+            "Avg Cost/Question ($)", "Total Run Cost ($)",
+        ]
+        # Write QID-level rows first, then overall-average rows.
+        ws_qc.append(hdrs_qc)
+        for col_num in range(1, len(hdrs_qc) + 1):
+            cell = ws_qc.cell(row=1, column=col_num)
+            cell.font = header_font
+            cell.fill = header_fill_qual
+            cell.alignment = Alignment(horizontal="center", vertical="center")
+
+        avg_rows_pending = []
+        for row in qid_cost_results:
+            rt = row.get("record_type", "")
+            if rt == "qid_level":
+                ws_qc.append([
+                    row.get("run_id", ""),
+                    "QID Level",
+                    row.get("question_id", ""),
+                    row.get("n_questions", ""),
+                    row.get("concurrency", ""),
+                    row.get("output_throughput_tokens_s", ""),
+                    row.get("ttft_p95_ms", ""),
+                    row.get("total_input_tokens", ""),
+                    row.get("total_output_tokens", ""),
+                    row.get("runtime_s", ""),
+                    row.get("instance_hourly_usd", ""),
+                    row.get("run_cost_usd", ""),
+                    row.get("cost_per_question", ""),
+                    row.get("qid_total_cost", ""),
+                    row.get("status", ""),
+                ])
+            elif rt == "overall_average":
+                avg_rows_pending.append(row)
+
+        # Blank separator + average headers + average rows.
+        if avg_rows_pending:
+            ws_qc.append([])
+            ws_qc.append(hdrs_avg)
+            for row in avg_rows_pending:
+                ws_qc.append([
+                    row.get("run_id", ""),
+                    "Overall Average",
+                    row.get("concurrency", ""),
+                    row.get("total_questions", ""),
+                    row.get("n_qids", ""),
+                    row.get("avg_cost_per_question", ""),
+                    row.get("total_run_cost_usd", ""),
+                ])
+
     xlsx_path.parent.mkdir(parents=True, exist_ok=True)
     wb.save(xlsx_path)
     print(f"\n[SUCCESS] Model comparison Excel report generated successfully!")
@@ -1344,6 +1436,7 @@ def main() -> None:
     perf_results = load_results_local(results_path)
     qual_results = load_quality_results(results_path)
     sample_results = load_quality_samples(results_path)
+    qid_cost_results = load_qid_cost_results(results_path)
 
     if args.fix_instance_labels:
         n = fix_instance_labels(perf_results) + fix_instance_labels(qual_results)
@@ -1358,6 +1451,7 @@ def main() -> None:
         # Sample rows have no started_at of their own, so they are matched on the
         # S3 run-folder date by the same range filter.
         sample_results = filter_by_date_range(sample_results, from_date, to_date)
+        qid_cost_results = filter_by_date_range(qid_cost_results, from_date, to_date)
         label = from_date if from_date == to_date else f"{from_date or 'earliest'} through {to_date or 'latest'}"
         print(
             f"[FILTER] Date = {label} (inclusive): "
@@ -1376,6 +1470,7 @@ def main() -> None:
         perf_results = filter_by_time_bounds(perf_results, lower_dt, upper_dt)
         qual_results = filter_by_time_bounds(qual_results, lower_dt, upper_dt)
         sample_results = filter_by_time_bounds(sample_results, lower_dt, upper_dt)
+        qid_cost_results = filter_by_time_bounds(qid_cost_results, lower_dt, upper_dt)
         lo = lower_dt.strftime("%Y-%m-%d %H:%M UTC") if lower_dt else "earliest"
         hi = upper_dt.strftime("%Y-%m-%d %H:%M UTC") if upper_dt else "latest"
         print(
@@ -1397,6 +1492,7 @@ def main() -> None:
             Path(args.export_excel),
             sample_results=sample_results,
             max_sample_rows=args.max_sample_rows,
+            qid_cost_results=qid_cost_results,
         )
 
 

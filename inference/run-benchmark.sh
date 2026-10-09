@@ -40,6 +40,9 @@ PROFILE="both"           # realtime | batch | both — 'both' submits two sequen
 HW="g6e"                 # matrix cell suffix: g5 | g6 | g6e
 MANIFEST_OVERRIDE=""     # optional explicit manifest path
 DATASET_OVERRIDE=""      # optional explicit dataset path / S3 key
+QID_COST="false"         # --qid-cost: segment dataset by QID and benchmark per-QID
+QID_CONFIG=""            # --qid-config: path to quality config YAML for QID-cost mode
+QID_SHEET=""             # --qid-sheet: xlsx sheet override for QID-cost mode
 IMAGE_OVERRIDE=""        # optional explicit benchmark runner image
 SVC_OVERRIDE=""          # optional explicit vLLM service name (for --tag parallel deploys)
 TAG=""                   # optional deploy tag — isolates the S3 results subfolder
@@ -54,6 +57,9 @@ while [[ $# -gt 0 ]]; do
         --hw)       HW="$2";       shift 2 ;;
         --manifest) MANIFEST_OVERRIDE="$2"; shift 2 ;;
         --dataset)  DATASET_OVERRIDE="$2";  shift 2 ;;
+        --qid-cost) QID_COST="true";        shift ;;
+        --qid-config) QID_CONFIG="$2";      shift 2 ;;
+        --qid-sheet)  QID_SHEET="$2";       shift 2 ;;
         --image)    IMAGE_OVERRIDE="$2";    shift 2 ;;
         --svc)      SVC_OVERRIDE="$2";      shift 2 ;;
         --tag)      TAG="$2";               shift 2 ;;
@@ -63,6 +69,14 @@ while [[ $# -gt 0 ]]; do
         *) log_error "Unknown: $1"; exit 1 ;;
     esac
 done
+
+# QID-cost defaults from config.env — applied ONLY when --qid-cost is active and
+# the caller did not pass the value explicitly. After the first dataset staging,
+# a bare `oai benchmark <model> --qid-cost` just works with no extra flags.
+if [[ "${QID_COST}" == "true" ]]; then
+    : "${DATASET_OVERRIDE:=${QID_COST_DATASET:-}}"
+    : "${QID_CONFIG:=${QID_COST_CONFIG:-}}"
+fi
 
 # Full instance type the model was deployed on (e.g. g7e.24xlarge). Passed into
 # the benchmark pod as OAI_INSTANCE_TYPE so load-test.py records the REAL instance
@@ -215,7 +229,16 @@ echo ""
 cd "${FRAMEWORK_ROOT}"
 
 # Handle custom dataset S3 sync (upload local dataset if missing from S3, else skip upload)
-if [[ -n "${DATASET_OVERRIDE:-}" ]]; then
+# QID-cost mode: dataset is already in S3 — skip the upload logic entirely.
+if [[ "${QID_COST}" == "true" && -n "${DATASET_OVERRIDE:-}" ]]; then
+    # For --qid-cost the dataset is already in S3. Resolve to the full S3 key so
+    # load-test.py's _run_qid_cost can download it, but do NOT upload anything.
+    if [[ "${DATASET_OVERRIDE}" != s3://* && "${DATASET_OVERRIDE}" != datasets/* ]]; then
+        DS_BASENAME=$(basename "${DATASET_OVERRIDE}")
+        DATASET_OVERRIDE="datasets/${DS_BASENAME}"
+    fi
+    log_info "QID-cost mode: dataset already in S3 at s3://${RESULTS_BUCKET}/${DATASET_OVERRIDE} (no upload)."
+elif [[ -n "${DATASET_OVERRIDE:-}" ]]; then
     DS_BASENAME=$(basename "${DATASET_OVERRIDE}")
     S3_KEY="datasets/${DS_BASENAME}"
 
@@ -248,8 +271,17 @@ log_info "Creating ConfigMaps..."
 SCRIPT_CM="${JOB_NAME_BASE}-script"
 MANIFEST_CM="${JOB_NAME_BASE}-manifest"
 
+# Build the script ConfigMap args without $(if ...) subshell — subshell command
+# substitution inside a kubectl argument list can hang on some shells/environments.
+SCRIPT_CM_EXTRA_ARGS=()
+if [[ "${QID_COST}" == "true" && -n "${QID_CONFIG}" ]]; then
+    SCRIPT_CM_EXTRA_ARGS=("--from-file=qid_config.yaml=${FRAMEWORK_ROOT}/${QID_CONFIG}")
+fi
+
 kubectl create configmap "${SCRIPT_CM}" \
     --from-file=load-test.py="${FRAMEWORK_ROOT}/inference/load-test.py" \
+    --from-file=qid_dataset.py="${FRAMEWORK_ROOT}/inference/qid_dataset.py" \
+    "${SCRIPT_CM_EXTRA_ARGS[@]}" \
     -n "${BENCHMARK_NAMESPACE}" --dry-run=client -o yaml | kubectl apply -f - >/dev/null
 
 kubectl create configmap "${MANIFEST_CM}" \
@@ -270,9 +302,25 @@ else
     log_info "ConfigMaps ready. (Inputs come from vllm bench serve's built-in 'random' dataset)."
 fi
 
-DATASET_JOB_ARG=""
-if [[ -n "${DATASET_OVERRIDE:-}" ]]; then
-    DATASET_JOB_ARG="--dataset ${DATASET_OVERRIDE}"
+# Dataset and QID-sheet are passed as env vars into the pod (OAI_DATASET_OVERRIDE,
+# OAI_QID_SHEET) rather than embedded in the shell command string inside the
+# heredoc. This avoids the classic bash word-splitting trap: a variable containing
+# --dataset "path with spaces" is still split on spaces when expanded unquoted
+# inside a heredoc, even with embedded quotes. Env vars bypass word-splitting
+# entirely — the value is never re-parsed by bash after assignment.
+# load-test.py reads OAI_DATASET_OVERRIDE and OAI_QID_SHEET from os.environ.
+# QID-cost args — only the flags that are safe to embed (no user-supplied values).
+QID_COST_ARGS=""
+if [[ "${QID_COST}" == "true" ]]; then
+    QID_COST_ARGS="--qid-cost"
+    if [[ -n "${QID_CONFIG}" ]]; then
+        # The quality config is bundled into the SAME script ConfigMap as
+        # load-test.py and qid_dataset.py (mounted at /app), so no separate
+        # volume or conditional YAML needed. The pod reads it from /app/qid_config.yaml.
+        # This avoids fragile conditional $(if ...) blocks inside the Job heredoc.
+        QID_COST_ARGS="${QID_COST_ARGS} --qid-config /app/qid_config.yaml"
+    fi
+    # QID_SHEET passed via OAI_QID_SHEET env var — see env block below.
 fi
 
 # ==============================================================================
@@ -472,8 +520,8 @@ ${INIT_CONTAINER}
               export HOME=/tmp
               export PYTHONPATH="/tmp/pip-packages:\${PYTHONPATH:-}"
               # Install required runner packages if not already present in the image
-              python3 -c "import boto3, vllm, yaml" 2>/dev/null || \\
-                pip install --quiet --no-cache-dir --target=/tmp/pip-packages boto3==1.34.0 pyyaml vllm || true
+              python3 -c "import boto3, yaml, openpyxl" 2>/dev/null || \\
+                pip install --quiet --no-cache-dir --target=/tmp/pip-packages boto3==1.34.0 pyyaml openpyxl || true
 
               TEST_EXIT=0
               echo "=== PROFILE: ${P} ==="
@@ -486,7 +534,7 @@ ${INIT_CONTAINER}
                 --profile  /configs/profiles/profile.yaml \\
                 --endpoint "${ENDPOINT}" \\
                 --output   /results/${P} \\
-                --wait-timeout 2400 ${DATASET_JOB_ARG} || TEST_EXIT=\$?
+                --wait-timeout 2400 ${QID_COST_ARGS} || TEST_EXIT=\$?
               echo "=== Uploading ${P} results to S3 ==="
               python3 -c "
               import boto3, os, glob
@@ -517,6 +565,13 @@ ${MARK_STEP}
             # no per-instance manifest edits. Empty → falls back to the manifest.
             - name: OAI_INSTANCE_TYPE
               value: "${INSTANCE_TYPE}"
+            # Dataset and QID-sheet passed as env vars to avoid bash word-splitting
+            # on filenames/sheet names that contain spaces (e.g. "AWS - Synthetic QA Data.xlsx").
+            # load-test.py reads these via os.getenv() — no shell re-parsing.
+            - name: OAI_DATASET_OVERRIDE
+              value: "${DATASET_OVERRIDE:-}"
+            - name: OAI_QID_SHEET
+              value: "${QID_SHEET:-}"
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
@@ -563,7 +618,7 @@ ${MARK_STEP}
             sizeLimit: 1Gi
         - name: tmp
           emptyDir:
-            sizeLimit: 4Gi
+            sizeLimit: 10Gi
 EOF
     log_info "${P} Job submitted: ${JOB_NAME}"
 }

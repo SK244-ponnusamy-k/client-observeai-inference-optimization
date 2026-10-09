@@ -109,6 +109,9 @@ def deploy(
     dump_inputs: bool = False,
     detach: bool = False,
     auto_stop: bool = False,
+    qid_cost: bool = False,
+    qid_config: str = "",
+    qid_sheet: str = "",
 ) -> int:
     spec = catalog.load(model_id)
 
@@ -261,6 +264,9 @@ def deploy(
             # When quality follows, return immediately after submitting both
             # performance Jobs so the quality Job can also be submitted up front.
             detach=do_quality,
+            qid_cost=qid_cost,
+            qid_config=qid_config,
+            qid_sheet=qid_sheet,
         )
         if rc != 0:
             return rc

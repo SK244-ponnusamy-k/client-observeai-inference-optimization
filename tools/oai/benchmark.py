@@ -15,10 +15,32 @@ successful deploy, so a user can onboard, deploy, and benchmark in one step.
 
 from __future__ import annotations
 
+import os
 import re
 
 from . import catalog, paths, shell, ui
 from .catalog import ModelSpec
+
+
+def _read_config_env(key: str) -> str:
+    """Read a variable value from config/config.env without requiring bash to
+    source it. Handles `export KEY="value"` and `export KEY="${KEY:-default}"`
+    forms. Returns "" when the key is not found or the file doesn't exist.
+    """
+    env_file = paths.CONFIG_ENV
+    if not env_file.exists():
+        return ""
+    for line in env_file.read_text(encoding="utf-8", errors="replace").splitlines():
+        line = line.strip()
+        # Match: export KEY="value" or export KEY=value (with or without quotes)
+        m = re.match(r'^export\s+' + re.escape(key) + r'\s*=\s*["\']?([^"\'$\n{][^"\'$\n]*?)["\']?\s*$', line)
+        if m:
+            return m.group(1).strip().strip("'\"")
+        # Match the default-value form: export KEY="${KEY:-actual_default}"
+        m2 = re.match(r'^export\s+' + re.escape(key) + r'\s*=\s*"\$\{' + re.escape(key) + r':-([^}]*)\}"', line)
+        if m2:
+            return m2.group(1).strip().strip("'\"")
+    return ""
 
 # Map a workload-profile path/name to the short name run-benchmark.sh expects.
 _PROFILE_RE = re.compile(r"(realtime|batch)")
@@ -101,6 +123,9 @@ def run(
     run_timestamp: str | None = None,
     auto_stop: bool = False,
     detach: bool = False,
+    qid_cost: bool = False,
+    qid_config: str = "",
+    qid_sheet: str = "",
 ) -> int:
     spec = catalog.load(model_id)
 
@@ -184,6 +209,15 @@ def run(
     ui.kv("Manifest", manifest_rel)
     ui.kv("Profiles", f"{', '.join(profiles)}  (separate sequential Jobs)" if profile_arg == "both" else profile_arg)
     ui.kv("Dataset", ds or "built-in random (no PII)")
+    if qid_cost:
+        import os as _os  # noqa: PLC0415
+        _ds_shown = ds or _os.environ.get("QID_COST_DATASET", "") or _read_config_env("QID_COST_DATASET") or "(not set)"
+        _cfg_shown = qid_config or _os.environ.get("QID_COST_CONFIG", "") or _read_config_env("QID_COST_CONFIG") or "(not set)"
+        ui.kv("QID-cost mode", "ON — per-QID benchmark across all concurrency levels")
+        ui.kv("QID dataset", _ds_shown + (" (from config.env default)" if not ds else ""))
+        ui.kv("QID config", _cfg_shown + (" (from config.env default)" if not qid_config else ""))
+        ui.warn("QID-cost runs N_qids x N_concurrency bench invocations — may take significantly longer.")
+        ui.warn("QID-cost runs N_qids x N_concurrency bench invocations — may take significantly longer.")
 
     args = ["--model", spec.id, "--profile", profile_arg, "--hw", hw_family, "--manifest", manifest_rel]
     if full_instance:
@@ -198,6 +232,29 @@ def run(
         args += ["--dataset", ds]
     if tag and svc:
         args += ["--tag", tag, "--svc", svc]
+    if qid_cost:
+        # Apply config.env defaults when the caller did not pass values
+        # explicitly. After the first staging, `--qid-cost` alone is enough.
+        import os as _os  # noqa: PLC0415
+        resolved_dataset = ds or _os.environ.get("QID_COST_DATASET", "") or _read_config_env("QID_COST_DATASET")
+        resolved_config  = qid_config or _os.environ.get("QID_COST_CONFIG", "") or _read_config_env("QID_COST_CONFIG")
+        if not resolved_dataset:
+            ui.fail(
+                "--qid-cost requires a dataset.",
+                "Pass --dataset <S3 key> or set QID_COST_DATASET in config/config.env.",
+            )
+        if not resolved_config:
+            ui.fail(
+                "--qid-cost requires a quality config.",
+                "Pass --qid-config <path> or set QID_COST_CONFIG in config/config.env.",
+            )
+        if not ds and resolved_dataset:
+            args += ["--dataset", resolved_dataset]
+        args += ["--qid-cost"]
+        if resolved_config:
+            args += ["--qid-config", resolved_config]
+        if qid_sheet:
+            args += ["--qid-sheet", qid_sheet]
 
     rc = shell.run_bash(script, args)
     if rc != 0:

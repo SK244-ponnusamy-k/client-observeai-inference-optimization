@@ -39,6 +39,10 @@ import logging
 import os
 import re
 import subprocess  # noqa: S404 - invoking the trusted `vllm` CLI, args are controlled
+
+# QID dataset parser (shared with quality-eval). Imported lazily inside
+# _run_qid_cost() so a missing qid_dataset.py never breaks the normal path.
+# sys.path is extended at call time (the module lives next to this script).
 import tempfile
 import threading
 import time
@@ -171,6 +175,13 @@ class BenchmarkResult:
     kv_cache_utilization_mean_pct: float | None = None
     telemetry_samples: int = 0        # vLLM /metrics samples taken during the level
     gpu_telemetry_samples: int = 0    # DCGM samples that matched the vLLM pod (0 => GPU fields are None)
+
+    # QID-cost mode only. Empty "" for the normal random/sharegpt benchmark, so
+    # existing rows and the report are unaffected. When set (e.g. "QID_1"), this
+    # row is one QID's benchmark at one concurrency level, and the cost fields
+    # (cost_per_qa_form, cost_per_1m_tokens) are that QID's REAL cost — because
+    # each QID is benchmarked as its own vllm bench serve invocation.
+    question_id: str = ""
 
 
 # ---------------------------------------------------------------------------
@@ -710,6 +721,7 @@ def _build_result(
     correlation_id: str,
     started_at: str,
     ended_at: str,
+    question_id: str = "",
 ) -> BenchmarkResult:
     runtime_s = _g(bench, "duration")
     total_out = int(_g(bench, "total_output_tokens"))
@@ -786,6 +798,7 @@ def _build_result(
         kv_cache_utilization_mean_pct=telemetry.get("kv_cache_utilization_mean_pct"),
         telemetry_samples=int(telemetry.get("telemetry_samples") or 0),
         gpu_telemetry_samples=int(telemetry.get("gpu_telemetry_samples") or 0),
+        question_id=question_id,
     )
 
 
@@ -968,6 +981,460 @@ def _normalize_dataset_to_sharegpt(file_path: str) -> None:
 
 
 # ---------------------------------------------------------------------------
+# QID-cost mode helpers
+# ---------------------------------------------------------------------------
+
+def _import_qid_dataset() -> Any:
+    """Lazily import the shared QID dataset parser.
+
+    The module lives next to this script. In-cluster both files are mounted
+    into /app via ConfigMap, so co-location is guaranteed. We extend sys.path
+    at import time rather than at module load so the normal path never fails
+    just because qid_dataset.py is absent on a minimal image.
+    """
+    import importlib  # noqa: PLC0415
+    import sys  # noqa: PLC0415
+    script_dir = str(Path(__file__).resolve().parent)
+    if script_dir not in sys.path:
+        sys.path.insert(0, script_dir)
+    return importlib.import_module("qid_dataset")
+
+
+def _write_qid_sharegpt(rows: list[dict[str, str]], system_prompt: str, out_path: str) -> int:
+    """Write a ShareGPT JSON file for one QID's rows.
+
+    Including the system_prompt as a leading human turn (if present) means
+    the token counts from vllm bench serve reflect the exact same payload the
+    quality eval sends, so per-QID cost is directly comparable. Returns the
+    number of prompts written.
+    """
+    items = []
+    for row in rows:
+        prompt = row.get("prompt", "")
+        if not prompt:
+            continue
+        if system_prompt:
+            human_val = f"{system_prompt}\n\n{prompt}"
+        else:
+            human_val = prompt
+        # vllm bench serve requires at least 4 tokens per turn.
+        answer = "Yes. Based on the evaluation of the conversation transcript."
+        items.append({"conversations": [
+            {"from": "human", "value": human_val},
+            {"from": "gpt",   "value": answer},
+        ]})
+    Path(out_path).write_text(json.dumps(items, indent=2), encoding="utf-8")
+    logger.info("Wrote %d prompts to QID ShareGPT file: %s", len(items), out_path)
+    return len(items)
+
+
+def _run_one_level(
+    *,
+    endpoint: str,
+    served_model: str,
+    tokenizer: str,
+    manifest: dict[str, Any],
+    opt: dict[str, Any],
+    profile: dict[str, Any],
+    profile_id: str,
+    concurrency: int,
+    dataset_path: str,
+    max_new: int,
+    seed: int,
+    reasoning_effort: str,
+    reasoning_observed: str,
+    correlation_id: str,
+    extra_args: list[str],
+    dcgm_url: str,
+    vllm_deployment: str | None,
+    vllm_namespace: str | None,
+    question_id: str = "",
+) -> BenchmarkResult | None:
+    """Run vllm bench serve for ONE (QID, concurrency) level. Returns None on error."""
+    num_prompts_factor = int(profile.get("num_prompts_factor", 5))
+    min_prompts = int(profile.get("min_prompts", 100))
+    num_prompts = max(concurrency * num_prompts_factor, min_prompts)
+    slo = profile.get("slo", {})
+
+    level_extra = list(extra_args)
+    if "--dataset-path" not in level_extra:
+        level_extra.extend(["--dataset-path", dataset_path])
+
+    started_at = datetime.now(tz=timezone.utc).isoformat()
+    vmetrics_before = _scrape_vllm_metrics(endpoint)
+    try:
+        with _TelemetrySampler(endpoint, dcgm_url, vllm_deployment, vllm_namespace) as sampler:
+            bench = _run_vllm_bench(
+                base_url=endpoint,
+                served_model=served_model,
+                tokenizer=tokenizer,
+                concurrency=concurrency,
+                num_prompts=num_prompts,
+                dataset_name="sharegpt",
+                random_input_len=0,
+                random_output_len=max_new,
+                seed=seed,
+                ignore_eos=False,
+                extra_args=level_extra,
+            )
+    except Exception as exc:  # noqa: BLE001
+        logger.error("QID=%s concurrency=%d failed: %s", question_id, concurrency, exc)
+        return None
+    vmetrics_after = _scrape_vllm_metrics(endpoint)
+    telemetry = sampler.summary()
+    ended_at = datetime.now(tz=timezone.utc).isoformat()
+
+    result = _build_result(
+        bench=bench, vmetrics_before=vmetrics_before, vmetrics_after=vmetrics_after,
+        telemetry=telemetry, concurrency=concurrency, profile_id=profile_id,
+        manifest=manifest, opt=opt,
+        reasoning_effort=reasoning_effort, reasoning_observed=reasoning_observed,
+        correlation_id=correlation_id,
+        started_at=started_at, ended_at=ended_at,
+        question_id=question_id,
+    )
+    result = _check_slo(result, slo)
+    logger.info(
+        "QID=%s concurrency=%d: out=%.1f tok/s cost_per_qa=%.6f status=%s",
+        question_id, concurrency,
+        result.output_throughput_tokens_s,
+        result.cost_per_qa_form or 0.0,
+        result.status,
+    )
+    return result
+
+
+def _run_qid_cost(args: Any) -> None:
+    """QID-cost mode: segment the dataset by question_id and benchmark each QID
+    across all concurrency levels in the workload profile.
+
+    Dataset is read FROM S3 (already there — no upload). The quality config
+    drives parsing so prompts are assembled identically to the quality eval,
+    making per-QID cost directly comparable to the quality run's token sizes.
+
+    Outputs:
+      • The same per-level BenchmarkResult JSONL as the normal path
+        (with question_id stamped on every row).
+      • A qid-cost-summary.jsonl with per-QID aggregate metrics and the
+        overall average cost per question across all QIDs.
+    """
+    # ---- import shared parser -----------------------------------------------
+    qid_dataset = _import_qid_dataset()
+
+    # ---- download dataset from S3 -------------------------------------------
+    qid_config_path = getattr(args, "qid_config", "") or ""
+    # Dataset and qid_sheet can arrive via CLI args OR via env vars injected by
+    # run-benchmark.sh. Env vars are the preferred path for in-cluster runs because
+    # filenames with spaces cannot be safely passed through bash heredoc word-splitting.
+    dataset_s3_key = getattr(args, "dataset", "") or os.getenv("OAI_DATASET_OVERRIDE", "") or ""
+    region = os.getenv("AWS_DEFAULT_REGION", "us-east-2")
+    default_bucket = os.getenv("RESULTS_BUCKET", "shellkode-ai-results")
+    sheet = getattr(args, "qid_sheet", "") or os.getenv("OAI_QID_SHEET", "") or ""
+
+    if not dataset_s3_key:
+        raise SystemExit("--qid-cost requires --dataset <S3 key of the QID workbook/csv>.")
+    if not qid_config_path:
+        raise SystemExit("--qid-cost requires --qid-config <path to autoqa_v1.yaml or similar>.")
+
+    # Resolve S3 coordinates (same logic as the normal dataset_target block).
+    if dataset_s3_key.startswith("s3://"):
+        s3_path = dataset_s3_key[5:]
+        bucket_name, key_name = s3_path.split("/", 1)
+    elif "/" in dataset_s3_key or dataset_s3_key.endswith((".jsonl", ".csv", ".xlsx")):
+        bucket_name = default_bucket
+        key_name = dataset_s3_key.lstrip("/")
+    else:
+        bucket_name = default_bucket
+        key_name = f"datasets/{dataset_s3_key}"
+
+    suffix = Path(key_name).suffix or ".jsonl"
+    local_ds = f"/tmp/qid_dataset{suffix}"
+    logger.info("Downloading QID dataset from s3://%s/%s -> %s", bucket_name, key_name, local_ds)
+    import boto3  # noqa: PLC0415
+    s3 = boto3.client("s3", region_name=region)
+    s3.download_file(bucket_name, key_name, local_ds)
+
+    # ---- parse quality config + dataset -------------------------------------
+    with open(qid_config_path) as f:
+        qcfg = yaml.safe_load(f)
+
+    system_prompt = str(qcfg.get("model", {}).get("system_prompt", "") or "")
+
+    # When the dataset is an xlsx and --qid-sheet is NOT specified, load ALL
+    # transcript sheets (everything except the QIDs lookup sheet) and combine
+    # them into one dataset. This covers Test-ORG + Test-XL in a single run so
+    # per-QID cost reflects the FULL dataset — both short-context (ORG ~4k chars)
+    # and long-context (XL ~13k chars) transcripts.
+    #
+    # When --qid-sheet IS given, load that single sheet only (useful for
+    # targeted runs or debugging a specific sheet).
+    is_xlsx = local_ds.lower().endswith((".xlsx", ".xlsm"))
+    if is_xlsx and not sheet:
+        # Auto-discover all transcript sheets by loading the workbook header.
+        # Exclude the QID lookup sheet (qid_sheet key, default "QIDs").
+        qid_sheet_name = qcfg.get("dataset", {}).get("qid_sheet", "QIDs")
+        try:
+            import openpyxl  # noqa: PLC0415
+            wb = openpyxl.load_workbook(local_ds, read_only=True, data_only=False)
+            transcript_sheets = [s for s in wb.sheetnames if s != qid_sheet_name]
+            wb.close()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Could not auto-detect sheets (%s); falling back to config default.", exc)
+            transcript_sheets = [qcfg.get("dataset", {}).get("sheet", "")]
+
+        logger.info("xlsx detected, no --qid-sheet given — loading ALL transcript sheets: %s", transcript_sheets)
+        rows = []
+        for ts in transcript_sheets:
+            sheet_rows = qid_dataset.load_dataset(local_ds, qcfg, sheet=ts)
+            logger.info("  sheet=%r: %d rows", ts, len(sheet_rows))
+            # Tag each row with its source sheet so the summary can break down
+            # per-sheet if needed, and so duplicate data_ids across sheets don't
+            # collide.
+            for r in sheet_rows:
+                r["_sheet"] = ts
+            rows.extend(sheet_rows)
+        logger.info("Combined total: %d rows across %d sheets.", len(rows), len(transcript_sheets))
+    else:
+        rows = qid_dataset.load_dataset(local_ds, qcfg, sheet=sheet)
+        logger.info("Parsed %d rows from QID dataset (sheet=%r).", len(rows), sheet or "(default)")
+
+    # Segment by question_id. Rows without a question_id go to a fallback bucket.
+    from collections import defaultdict  # noqa: PLC0415
+    by_qid: dict[str, list[dict[str, str]]] = defaultdict(list)
+    for row in rows:
+        qid = row.get("question_id") or row.get("question") or "UNKNOWN"
+        by_qid[qid].append(row)
+
+    qids = sorted(by_qid.keys())
+    logger.info("QIDs found: %s  (%d unique)", qids, len(qids))
+
+    # ---- benchmark setup ----------------------------------------------------
+    manifest = load_yaml(args.manifest)
+    profile = load_yaml(args.profile)
+
+    run_id = manifest["run_id"]
+    profile_id = profile["profile_id"]
+    concurrency_levels: list[int] = profile["concurrency_levels"]
+    out_cfg = profile.get("output", {})
+    max_new = int(out_cfg.get("max_new_tokens", 512))
+    seed = int(out_cfg.get("seed", 42))
+    reasoning_effort = str(out_cfg.get("reasoning_effort", "medium"))
+    # Strip --random-range-ratio AND its value (the next element) from extra_args.
+    # This flag is only valid for the `random` dataset; in QID-cost mode the
+    # dataset is sharegpt, so passing it makes vllm bench serve fail with
+    # "unrecognized arguments: <value>" (the flag itself is stripped elsewhere
+    # but the bare value was left behind as a dangling positional argument).
+    _raw_extra = profile.get("bench_extra_args", [])
+    extra_args: list[str] = []
+    _skip_next = False
+    for _arg in _raw_extra:
+        if _skip_next:
+            _skip_next = False
+            continue
+        if _arg == "--random-range-ratio":
+            _skip_next = True   # also drop the value that follows
+            continue
+        extra_args.append(_arg)
+
+    opt = manifest["optimization_variants"][0]
+    hf_id = manifest["model"]["hf_id"]
+    served_model = manifest["model"].get("served_name") or hf_id.split("/")[-1]
+    tokenizer = manifest["model"].get("tokenizer", hf_id)
+    endpoint = args.endpoint.rstrip("/")
+    dcgm_url = (
+        os.getenv("DCGM_METRICS_URL") or os.getenv("DCGM_EXPORTER_URL")
+        or "http://dcgm-exporter.monitoring.svc.cluster.local:9400/metrics"
+    )
+    vllm_deployment = os.getenv("OAI_VLLM_DEPLOYMENT", "").strip() or None
+    vllm_namespace  = os.getenv("OAI_VLLM_NAMESPACE",  "").strip() or None
+    correlation_id  = str(__import__("uuid").uuid4())
+
+    try:
+        _wait_for_vllm(endpoint, timeout_s=args.wait_timeout)
+    except TimeoutError as exc:
+        raise SystemExit(EXIT_MODEL_NOT_READY) from exc
+
+    reasoning_observed = _probe_reasoning(endpoint, served_model)
+    _reset_results_file(args.output, run_id)
+
+    # ---- per-QID x per-concurrency sweep ------------------------------------
+    all_results: list[BenchmarkResult] = []
+    tmp_dir = Path(tempfile.mkdtemp(prefix="qid_bench_"))
+
+    for qid in qids:
+        qid_rows = by_qid[qid]
+        qid_file = str(tmp_dir / f"qid_{qid}.json")
+        n_prompts_written = _write_qid_sharegpt(qid_rows, system_prompt, qid_file)
+        if n_prompts_written == 0:
+            logger.warning("QID=%s: no prompts written — skipping.", qid)
+            continue
+
+        logger.info("=== QID=%s (%d prompts) across %d concurrency levels ===",
+                    qid, n_prompts_written, len(concurrency_levels))
+
+        for conc in concurrency_levels:
+            result = _run_one_level(
+                endpoint=endpoint,
+                served_model=served_model,
+                tokenizer=tokenizer,
+                manifest=manifest,
+                opt=opt,
+                profile=profile,
+                profile_id=profile_id,
+                concurrency=conc,
+                dataset_path=qid_file,
+                max_new=max_new,
+                seed=seed,
+                reasoning_effort=reasoning_effort,
+                reasoning_observed=reasoning_observed,
+                correlation_id=correlation_id,
+                extra_args=extra_args,
+                dcgm_url=dcgm_url,
+                vllm_deployment=vllm_deployment,
+                vllm_namespace=vllm_namespace,
+                question_id=qid,
+            )
+            if result is None:
+                continue
+            all_results.append(result)
+            _push_metrics_to_prometheus([result])
+            try:
+                level_file = _append_result_to_disk(result, args.output, run_id)
+                _upload_file_to_s3(level_file)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Upload skipped (qid=%s conc=%d): %s", qid, conc, exc)
+
+    if not all_results:
+        raise SystemExit("QID-cost mode: no successful benchmark runs — check vLLM endpoint and logs.")
+
+    _save_results(all_results, args.output, run_id)
+    _print_summary(all_results)
+
+    # ---- compute + write per-QID cost summary (tasks #3) --------------------
+    _save_qid_cost_summary(all_results, args.output, run_id, qids, by_qid)
+
+
+def _save_qid_cost_summary(
+    results: list[BenchmarkResult],
+    output_dir: str,
+    run_id: str,
+    qids: list[str],
+    by_qid: dict[str, list[dict[str, str]]],
+) -> None:
+    """Compute per-QID cost per concurrency + overall average cost per question.
+
+    Cost model (matches _derive_cost exactly):
+        run_cost          = (instance_hourly_usd / 3600) * runtime_s
+        cost_per_qa_form  = run_cost / successful_requests   (already on each row)
+
+    Each (QID, concurrency) row was a SEPARATE vllm bench serve invocation, so
+    cost_per_qa_form on that row IS that QID's real per-question cost at that
+    concurrency — not a dataset average. No token-weighting needed here because
+    the segmentation was already done.
+
+    Average cost per question (across all QIDs at a concurrency level):
+        avg_cost_per_question = Σ(qid_cost_per_qa_form * qid_n_questions)
+                                / Σ(qid_n_questions)
+    This is a QUESTION-COUNT-WEIGHTED average so a QID with more questions
+    contributes proportionally more to the overall average.
+    """
+    from collections import defaultdict  # noqa: PLC0415
+
+    # Index rows by (qid, concurrency) for easy lookup.
+    by_qid_conc: dict[tuple[str, int], BenchmarkResult] = {}
+    for r in results:
+        if r.question_id:
+            by_qid_conc[(r.question_id, r.concurrency)] = r
+
+    # ---- per-QID rows -------------------------------------------------------
+    concurrency_levels = sorted({r.concurrency for r in results})
+    qid_summary_rows = []
+    for qid in qids:
+        n_questions = len(by_qid.get(qid, []))
+        for conc in concurrency_levels:
+            r = by_qid_conc.get((qid, conc))
+            if r is None:
+                continue
+            run_cost = (r.instance_hourly_usd / 3600.0) * r.runtime_s if r.instance_hourly_usd > 0 else None
+            qid_summary_rows.append({
+                "run_id": run_id,
+                "question_id": qid,
+                "n_questions": n_questions,
+                "concurrency": conc,
+                "output_throughput_tokens_s": round(r.output_throughput_tokens_s, 2),
+                "ttft_p95_ms": round(r.ttft_p95_ms, 1),
+                "total_input_tokens": r.total_input_tokens,
+                "total_output_tokens": r.total_output_tokens,
+                "runtime_s": round(r.runtime_s, 2),
+                "instance_hourly_usd": r.instance_hourly_usd,
+                "run_cost_usd": round(run_cost, 6) if run_cost is not None else None,
+                # This QID's per-question cost at this concurrency — the real number
+                # (not a dataset average) because this was its own benchmark run.
+                "cost_per_question": round(r.cost_per_qa_form, 8) if r.cost_per_qa_form is not None else None,
+                # Total cost for all questions in this QID at this concurrency.
+                "qid_total_cost": round(r.cost_per_qa_form * n_questions, 6) if r.cost_per_qa_form else None,
+                "status": r.status,
+            })
+
+    # ---- average cost per question across all QIDs (per concurrency) --------
+    avg_rows = []
+    for conc in concurrency_levels:
+        conc_rows = [s for s in qid_summary_rows if s["concurrency"] == conc and s["cost_per_question"] is not None]
+        if not conc_rows:
+            continue
+        total_questions = sum(s["n_questions"] for s in conc_rows)
+        weighted_cost_sum = sum(
+            (s["cost_per_question"] * s["n_questions"]) for s in conc_rows
+        )
+        avg_cost = weighted_cost_sum / total_questions if total_questions > 0 else None
+        total_run_cost = sum(s["run_cost_usd"] for s in conc_rows if s["run_cost_usd"] is not None)
+        avg_rows.append({
+            "run_id": run_id,
+            "record_type": "overall_average",
+            "concurrency": conc,
+            "total_questions": total_questions,
+            "n_qids": len(conc_rows),
+            # Weighted average: each QID's cost × its question count, then divide
+            # by total questions — a QID with 200 questions drives the average more
+            # than one with 40.
+            "avg_cost_per_question": round(avg_cost, 8) if avg_cost is not None else None,
+            "total_run_cost_usd": round(total_run_cost, 4),
+        })
+
+    # ---- write + upload ------------------------------------------------------
+    out = Path(output_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    summary_file = out / f"{run_id}-qid-cost-summary.jsonl"
+    with summary_file.open("w", encoding="utf-8") as f:
+        for row in qid_summary_rows:
+            f.write(json.dumps({**row, "record_type": "qid_level"}) + "\n")
+        for row in avg_rows:
+            f.write(json.dumps(row) + "\n")
+    logger.info("QID-cost summary written: %s", summary_file)
+
+    # Print a human-readable summary.
+    sep = "=" * 72
+    print(f"\n{sep}\n  QID-COST SUMMARY  —  {run_id}\n{sep}")
+    print(f"\n  {'QID':<12} {'N':>5}  " + "  ".join(f"conc={c}" for c in concurrency_levels))
+    for qid in qids:
+        n = len(by_qid.get(qid, []))
+        costs = []
+        for conc in concurrency_levels:
+            r = by_qid_conc.get((qid, conc))
+            costs.append(f"${r.cost_per_qa_form:.5f}" if r and r.cost_per_qa_form else "  n/a  ")
+        print(f"  {qid:<12} {n:>5}  " + "  ".join(costs))
+    print()
+    for a in avg_rows:
+        print(f"  [avg] conc={a['concurrency']:>4}  avg_cost/question=${a['avg_cost_per_question']:.6f}"
+              f"  total_run_cost=${a['total_run_cost_usd']:.4f}"
+              f"  ({a['n_qids']} QIDs, {a['total_questions']} questions total)")
+    print(f"{sep}\n")
+
+    # Upload summary to S3 (best-effort, same pattern as normal results).
+    _upload_file_to_s3(str(summary_file))
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 def _run(args: argparse.Namespace) -> None:
@@ -981,6 +1448,12 @@ def _run(args: argparse.Namespace) -> None:
 
     logging.setLogRecordFactory(record_factory)
     logger.info("Starting benchmark run (correlation_id=%s)", correlation_id)
+
+    # ── QID-cost mode: branch early, normal random-dataset path untouched ────
+    if getattr(args, "qid_cost", False):
+        _run_qid_cost(args)
+        return
+    # ─────────────────────────────────────────────────────────────────────────
 
     manifest = load_yaml(args.manifest)
     profile = load_yaml(args.profile)
@@ -999,7 +1472,21 @@ def _run(args: argparse.Namespace) -> None:
     ignore_eos = bool(in_cfg.get("ignore_eos", dataset_name == "random"))
     extra_args: list[str] = list(profile.get("bench_extra_args", []))
 
-    dataset_target = getattr(args, "dataset", None) or in_cfg.get("dataset_s3_key")
+    dataset_target = getattr(args, "dataset", None) or os.getenv("OAI_DATASET_OVERRIDE") or in_cfg.get("dataset_s3_key")
+    if dataset_target:
+        # Strip --random-range-ratio AND its value when using a custom dataset
+        # (sharegpt / xlsx) — the flag is only valid for the random dataset.
+        _raw2 = extra_args
+        extra_args = []
+        _skip2 = False
+        for _a in _raw2:
+            if _skip2:
+                _skip2 = False
+                continue
+            if _a == "--random-range-ratio":
+                _skip2 = True
+                continue
+            extra_args.append(_a)
     if dataset_target:
         local_ds = "/tmp/custom_dataset.jsonl"
         default_bucket = os.getenv("RESULTS_BUCKET", "shellkode-ai-results")
@@ -1165,6 +1652,23 @@ def main() -> None:
                         help="Seconds to wait for vLLM /health")
     parser.add_argument("--dataset", default=None,
                         help="Optional custom dataset override (S3 key, S3 URI, or file path)")
+    # ── QID-cost mode ─────────────────────────────────────────────────────────
+    parser.add_argument("--qid-cost", action="store_true", default=False,
+                        help="Enable QID-cost mode: segment the dataset by question_id and "
+                             "benchmark each QID separately across all concurrency levels to "
+                             "get a fair per-QID and average cost/question. "
+                             "Requires --dataset (S3 key of the QID workbook/csv — already "
+                             "in S3, no upload) and --qid-config. "
+                             "The random-dataset path is completely unaffected.")
+    parser.add_argument("--qid-config", default="",
+                        help="Path to the quality config YAML (e.g. configs/quality/autoqa_v1.yaml). "
+                             "Drives dataset parsing (sheet, field names, prompt template, "
+                             "system_prompt) so per-QID token sizes match the quality eval exactly.")
+    parser.add_argument("--qid-sheet", default="",
+                        help="Worksheet name override for xlsx datasets (e.g. "
+                             "synthetic_autoqa_transcripts for Test-ORG). "
+                             "Overrides the sheet set in the quality config.")
+    # ─────────────────────────────────────────────────────────────────────────
     args = parser.parse_args()
     _run(args)
 
