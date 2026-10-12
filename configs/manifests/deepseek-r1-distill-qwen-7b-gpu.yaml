@@ -9,7 +9,7 @@
 # For Trainium/Neuron, use the separate <id>-neuron-*.yaml manifest (--manifest).
 # Edit catalog/models/deepseek-r1-distill-qwen-7b.yaml and re-generate. Every field is read by inference/load-test.py.
 # ==============================================================================
-run_id: deepseek-r1-distill-qwen-7b-2026-10-09-001
+run_id: deepseek-r1-distill-qwen-7b-2026-10-10-001
 description: "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B none, any NVIDIA G instance (TP=1)"
 
 model:
@@ -50,4 +50,4 @@ tags:
   ManagedBy: oai-cli
   Owner: TBD
   CostCenter: TBD
-  RunId: deepseek-r1-distill-qwen-7b-2026-10-09-001
+  RunId: deepseek-r1-distill-qwen-7b-2026-10-10-001

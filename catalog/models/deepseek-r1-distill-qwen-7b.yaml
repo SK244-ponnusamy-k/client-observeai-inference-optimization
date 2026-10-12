@@ -1,23 +1,66 @@
+# ==============================================================================
 # catalog/models/deepseek-r1-distill-qwen-7b.yaml
-# Created by 'oai model new'. Edit freely; see catalog/SCHEMA.md for all options.
+#
+# deepseek-ai/DeepSeek-R1-Distill-Qwen-7B — dense 7B reasoning model distilled
+# from DeepSeek-R1. bf16 weights ~18 GB → fits a single GPU on g5/g6/g6e/g7e (TP=1).
+#
+# Reasoning: parser is loaded so the <think> block is extracted into the
+# response `reasoning` field. enable_thinking is set FALSE (reasoning OFF) for
+# consistent benchmark numbers — matches the gpt-oss-20b convention.
+# To run with reasoning ON, set enable_thinking to true and set reasoning_effort
+# in the workload profile.
+# ==============================================================================
 
 id: deepseek-r1-distill-qwen-7b
 display_name: DeepSeek-R1-Distill-Qwen-7B
 hardware: gpu
+
 source:
   hf_id: deepseek-ai/DeepSeek-R1-Distill-Qwen-7B
-  gated: true
+  gated: true                   # accept license at https://huggingface.co/deepseek-ai/DeepSeek-R1-Distill-Qwen-7B
   size_gb: 18.0
+
 serving:
+  served_name: deepseek-r1-distill-qwen-7b
+  tokenizer: deepseek-ai/DeepSeek-R1-Distill-Qwen-7B
   quantization: none
-  max_model_len: 16384
+  max_model_len: 16384          # reasoning model — needs headroom for chain-of-thought
+  gpu_memory_utilization: 0.90
+  max_num_seqs: 256
+  max_num_batched_tokens: 8192
+  extra_args:
+    - "--enable-chunked-prefill"
+    - "--enable-prefix-caching"
+    # Reasoning OFF. Uncomment both lines below to turn reasoning ON:
+    # - "--reasoning-parser=deepseek_r1"
+    - '--default-chat-template-kwargs={\"enable_thinking\": false}'
+
+resources:
+  cpu_request: "4"
+  cpu_limit: "8"
+  memory_request: "24Gi"
+  memory_limit: "30Gi"
+  vram_gb_required: 23          # ~18 GB weights + KV cache headroom
+
 instances:
-  candidates:
-  - g5.2xlarge
-  - g6.2xlarge
-  - g6e.2xlarge
-  - g7e.2xlarge
   tensor_parallel_size: 1
+  candidates:
+    - g5.2xlarge
+    - g6.2xlarge
+    - g6e.2xlarge
+    - g7e.2xlarge
+
 benchmark:
   auto: false
-  instance_hourly_usd: 0.0
+  profiles:
+    - configs/workload_profiles/realtime_v1.yaml
+    - configs/workload_profiles/batch_v1.yaml
+  instance_hourly_usd: 0.0      # resolved dynamically from EC2 price book at run time
+
+tags:
+  Project: observeai-inference-optimization
+  Engagement: shellkode-sow
+  Environment: sandbox
+  ManagedBy: oai-cli
+  Owner: TBD
+  CostCenter: TBD
