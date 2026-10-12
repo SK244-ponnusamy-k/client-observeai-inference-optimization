@@ -208,6 +208,41 @@ else
 fi
 
 # ==============================================================================
+# Sync HF token from Secrets Manager → Kubernetes secret (hf-token)
+# The download job looks for kubectl secret 'hf-token' in BENCHMARK_NAMESPACE.
+# Create or update it now so downloads work without manual intervention.
+# ==============================================================================
+log_step "Kubernetes secret — hf-token"
+
+HF_SECRET_ARN_CHECK=$(aws secretsmanager describe-secret \
+    --secret-id "${HF_TOKEN_SECRET_NAME}" \
+    --region "${AWS_REGION}" \
+    --query "ARN" --output text 2>/dev/null || echo "NOT_FOUND")
+
+if [[ "${HF_SECRET_ARN_CHECK}" != "NOT_FOUND" ]]; then
+    HF_TOKEN_VALUE=$(aws secretsmanager get-secret-value \
+        --secret-id "${HF_TOKEN_SECRET_NAME}" \
+        --region "${AWS_REGION}" \
+        --query 'SecretString' \
+        --output text 2>/dev/null | grep -o '"token":"[^"]*"' | cut -d'"' -f4 || echo "")
+
+    if [[ -n "${HF_TOKEN_VALUE}" ]]; then
+        kubectl create secret generic hf-token \
+            --from-literal=token="${HF_TOKEN_VALUE}" \
+            --namespace "${BENCHMARK_NAMESPACE}" \
+            --dry-run=client -o yaml | kubectl apply -f -
+        log_info "Kubernetes secret 'hf-token' created/updated in namespace '${BENCHMARK_NAMESPACE}'."
+        unset HF_TOKEN_VALUE
+    else
+        log_warn "Could not read HF token from Secrets Manager — skipping k8s secret creation."
+        log_warn "Create manually: kubectl create secret generic hf-token --from-literal=token=<hf_token> -n ${BENCHMARK_NAMESPACE}"
+    fi
+else
+    log_warn "HF token not in Secrets Manager — skipping k8s secret creation."
+    log_warn "Create manually: kubectl create secret generic hf-token --from-literal=token=<hf_token> -n ${BENCHMARK_NAMESPACE}"
+fi
+
+# ==============================================================================
 # Step 2 — Download Role (S3 write + Secrets Manager read for HF token)
 # ==============================================================================
 log_step "Download IAM Role: ${DOWNLOAD_IAM_ROLE_NAME}"
