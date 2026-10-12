@@ -34,6 +34,7 @@ resources:
 instances:
   neuron_cores: 8               # = tensor-parallel degree; must match compile time
   candidates:
+    - trn2.3xlarge
     - trn2.48xlarge
     - trn1.32xlarge
   node_group: trn2-48xl-ngc     # managed node-group fallback when Karpenter can't provision trn2
@@ -51,4 +52,5 @@ benchmark:
   profiles:
     - configs/workload_profiles/realtime_v1.yaml
     - configs/workload_profiles/batch_v1.yaml
-  instance_hourly_usd: 12.00        # trn2.48xlarge — VERIFY before run
+  instance_hourly_usd: 2.235        # trn2.3xlarge sa-east-1 on-demand — verified
+  # instance_hourly_usd: 12.00       # trn2.48xlarge — uncomment if using 48xlarge

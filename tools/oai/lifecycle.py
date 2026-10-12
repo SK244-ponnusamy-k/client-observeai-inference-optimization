@@ -175,6 +175,10 @@ def deploy(
             args += ["--managed-ng"]
             ui.step("Using the managed node-group path for this deploy.")
         args += ["--cores", str(spec.instances.neuron_cores)]
+        # Pass the selected instance so deploy.sh can set OAI_INSTANCE_TYPE
+        # for cost tracking in benchmark runs — same as the GPU path.
+        if chosen:
+            args += ["--hw", chosen]
     else:
         args += ["--hw", chosen]
         if tag:

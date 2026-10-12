@@ -168,8 +168,18 @@ def _gen_gpu(spec: ModelSpec, ctx: dict[str, object], cfg: config.Config, result
 def _gen_neuron(spec: ModelSpec, ctx: dict[str, object], cfg: config.Config, result: GenResult, force: bool) -> None:
     assert spec.neuron is not None
     mdir = paths.model_dir(spec.id)
-    # trn2.48xlarge exposes 16 neuron devices; request all to avoid the scheduler extender.
-    device_count = 16 if spec.preferred_instance.startswith("trn2") else spec.instances.neuron_cores
+    # Device count per instance:
+    #   trn2.3xlarge  = 1 chip  = 1 neuron device
+    #   trn2.48xlarge = 16 chips = 16 neuron devices
+    #   trn1.32xlarge = 16 chips = 16 neuron devices
+    # Request exactly as many devices as chips — avoids needing the k8s-neuron-scheduler extender.
+    preferred = spec.preferred_instance
+    if preferred.startswith("trn2.3xlarge"):
+        device_count = 1
+    elif preferred.startswith("trn2"):
+        device_count = 16
+    else:
+        device_count = spec.instances.neuron_cores
     nctx = dict(ctx)
     nctx.update(
         {

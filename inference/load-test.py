@@ -607,6 +607,7 @@ EC2_HOURLY_USD: dict[str, float] = {
     "g7.2xlarge": 2.52,
     # Trainium — carried over from manifests; VERIFY (not covered by G-family sheet)
     "trn1.32xlarge": 21.50,
+    "trn2.3xlarge": 2.235,   # sa-east-1 on-demand — verified
     "trn2.48xlarge": 12.0,
 }
 

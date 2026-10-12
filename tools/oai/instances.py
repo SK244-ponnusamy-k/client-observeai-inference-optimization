@@ -34,7 +34,7 @@ _VCPUS = {
     "g6.xlarge": 4, "g6.2xlarge": 8, "g6.4xlarge": 16, "g6.12xlarge": 48, "g6.48xlarge": 192,
     "g6e.xlarge": 4, "g6e.2xlarge": 8, "g6e.4xlarge": 16, "g6e.12xlarge": 48, "g6e.48xlarge": 192,
     "trn1.2xlarge": 8, "trn1.32xlarge": 128,
-    "trn2.48xlarge": 192,
+    "trn2.3xlarge": 12, "trn2.48xlarge": 192,
     "inf2.xlarge": 4, "inf2.8xlarge": 32, "inf2.24xlarge": 96, "inf2.48xlarge": 192,
 }
 
@@ -57,7 +57,7 @@ _GPU_COUNT = {
     "g7e.12xlarge": 4, "g7e.24xlarge": 4, "g7e.48xlarge": 8,
     # Trainium NeuronCores (used as the "accelerator" count for TP checks).
     "trn1.2xlarge": 2, "trn1.32xlarge": 16,
-    "trn2.48xlarge": 16,
+    "trn2.3xlarge": 8, "trn2.48xlarge": 16,
 }
 
 

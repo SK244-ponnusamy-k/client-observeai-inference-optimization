@@ -25,7 +25,7 @@ import yaml
 from . import catalog, paths, ui
 
 _GPU_DEFAULTS = ["g6e.2xlarge", "g6.2xlarge", "g5.2xlarge"]
-_NEURON_DEFAULTS = ["trn2.48xlarge", "trn1.32xlarge"]
+_NEURON_DEFAULTS = ["trn2.3xlarge", "trn2.48xlarge", "trn1.32xlarge"]
 
 # Reasoning parsers known to this framework — shown as a pick-list.
 _REASONING_PARSERS = {

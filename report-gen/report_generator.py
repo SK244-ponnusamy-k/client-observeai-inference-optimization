@@ -523,7 +523,7 @@ _EC2_HOURLY_USD = {
     "g6e.12xlarge": 10.6032, "g6e.16xlarge": 7.5772, "g6e.24xlarge": 15.0656, "g6e.48xlarge": 30.1312,
     "g7e.2xlarge": 3.3631, "g7e.4xlarge": 3.9982, "g7e.8xlarge": 5.2682,
     "g7e.12xlarge": 8.2861, "g7e.24xlarge": 16.5722, "g7e.48xlarge": 33.1443,
-    "g7.2xlarge": 2.52, "trn1.32xlarge": 21.50, "trn2.48xlarge": 12.0,
+    "g7.2xlarge": 2.52, "trn1.32xlarge": 21.50, "trn2.3xlarge": 2.235, "trn2.48xlarge": 12.0,
 }
 
 # Known hardware families that can appear as an S3 run-folder segment.

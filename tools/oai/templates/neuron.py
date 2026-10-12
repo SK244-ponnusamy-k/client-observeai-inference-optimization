@@ -490,12 +490,13 @@ while [[ $# -gt 0 ]]; do
     case "$1" in
         --compile)    RUN_COMPILE="true"; shift ;;
         --cores)      NEURON_CORES="$2"; shift 2 ;;
+        --hw)         NEURON_INSTANCE_TYPE="$2"; export OAI_INSTANCE_TYPE="$2"; shift 2 ;;
         --validate)   VALIDATE="true"; shift ;;
         --managed-ng) USE_MANAGED_NG="true"; shift ;;
         *) log_warn "Unknown argument: $1"; shift ;;
     esac
 done
-export NEURON_CORES MODEL_FOLDER SERVED_NAME NEURON_VLLM_IMAGE NEURON_COMPILE_IMAGE
+export NEURON_CORES NEURON_INSTANCE_TYPE OAI_INSTANCE_TYPE MODEL_FOLDER SERVED_NAME NEURON_VLLM_IMAGE NEURON_COMPILE_IMAGE
 
 echo ""
 echo "=============================================================="

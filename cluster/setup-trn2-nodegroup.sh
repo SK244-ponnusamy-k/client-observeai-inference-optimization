@@ -61,6 +61,9 @@ DRY_RUN="false"
 # Capacity type: spot (cheaper, interruptible) or on-demand.
 # Per AWS guidance, trn2 capacity is most readily available via spot.
 CAPACITY_TYPE="${TRN2_CAPACITY_TYPE:-spot}"
+# Trainium instance type — trn2.3xlarge is the available size in sa-east-1.
+# trn2.48xlarge is not offered in sa-east-1 as of 2026-10.
+TRN2_INSTANCE_TYPE="${TRN2_INSTANCE_TYPE:-trn2.3xlarge}"
 CFN_TEMPLATE_URL="https://raw.githubusercontent.com/aws-neuron/aws-neuron-eks-samples/master/dp_bert_hf_pretrain/cfn/eks_trn2_ng_stack_al2023.yaml"
 CFN_TEMPLATE_FILE="${FRAMEWORK_ROOT}/cluster/eks_trn2_ng_stack_al2023.yaml"
 
@@ -110,25 +113,25 @@ fi
 log_info "Cluster found: ${CLUSTER_NAME}"
 
 # ==============================================================================
-# Step 2 — Find best AZ for trn2.48xlarge
+# Step 2 — Find best AZ for ${TRN2_INSTANCE_TYPE}
 # ==============================================================================
-log_step "Finding available AZ for trn2.48xlarge"
+log_step "Finding available AZ for ${TRN2_INSTANCE_TYPE}"
 
-# Get AZs where trn2.48xlarge is supported
+# Get AZs where the target instance type is supported
 SUPPORTED_AZS=$(aws ec2 describe-instance-type-offerings \
     --location-type availability-zone \
-    --filters "Name=instance-type,Values=trn2.48xlarge" \
+    --filters "Name=instance-type,Values=${TRN2_INSTANCE_TYPE}" \
     --region "${AWS_REGION}" \
     --query 'InstanceTypeOfferings[].Location' \
     --output text 2>/dev/null | tr '\t' ' ')
 
 if [[ -z "${SUPPORTED_AZS}" ]]; then
-    log_error "trn2.48xlarge not available in region ${AWS_REGION}."
-    log_error "Check availability: aws ec2 describe-instance-type-offerings --filters Name=instance-type,Values=trn2.48xlarge --region <region>"
+    log_error "${TRN2_INSTANCE_TYPE} not available in region ${AWS_REGION}."
+    log_error "Check availability: aws ec2 describe-instance-type-offerings --filters Name=instance-type,Values=${TRN2_INSTANCE_TYPE} --region ${AWS_REGION}"
     exit 1
 fi
 
-log_info "trn2.48xlarge supported in: ${SUPPORTED_AZS}"
+log_info "${TRN2_INSTANCE_TYPE} supported in: ${SUPPORTED_AZS}"
 
 # Get cluster VPC (needed for subnet lookup in both paths)
 VPC_ID=$(aws eks describe-cluster --name "${CLUSTER_NAME}" --region "${AWS_REGION}" \
@@ -137,7 +140,7 @@ VPC_ID=$(aws eks describe-cluster --name "${CLUSTER_NAME}" --region "${AWS_REGIO
 # Use specified AZ or pick the first supported one
 if [[ -n "${TARGET_AZ}" ]]; then
     if ! echo "${SUPPORTED_AZS}" | grep -q "${TARGET_AZ}"; then
-        log_error "AZ ${TARGET_AZ} does not support trn2.48xlarge. Supported: ${SUPPORTED_AZS}"
+        log_error "AZ ${TARGET_AZ} does not support ${TRN2_INSTANCE_TYPE}. Supported: ${SUPPORTED_AZS}"
         exit 1
     fi
     SELECTED_AZ="${TARGET_AZ}"
@@ -156,11 +159,9 @@ else
     # Auto-select: try each AZ with a dry-run to find one with live capacity
     SELECTED_AZ=""
 
-    # Get Neuron AMI for dry-run test. Neuron AMIs may lag the cluster K8s version,
-    # so try the cluster version first, then fall back to known-good versions.
+    # Get Neuron AMI for dry-run test
     NEURON_AMI=""
     for AMI_VER in "${EKS_VERSION}" "1.34" "1.33"; do
-        # MSYS_NO_PATHCONV=1: prevent Git Bash from mangling the leading-slash SSM name.
         NEURON_AMI=$(MSYS_NO_PATHCONV=1 aws ssm get-parameter \
             --name "/aws/service/eks/optimized-ami/${AMI_VER}/amazon-linux-2023/x86_64/neuron/recommended/image_id" \
             --region "${AWS_REGION}" \
@@ -186,7 +187,7 @@ else
             # Dry-run launch to test capacity
             RESULT=$(aws ec2 run-instances \
                 --image-id "${NEURON_AMI}" \
-                --instance-type trn2.48xlarge \
+                --instance-type "${TRN2_INSTANCE_TYPE}" \
                 --subnet-id "${SUBNET}" \
                 --count 1 \
                 --dry-run \
@@ -198,7 +199,7 @@ else
                 SELECTED_SUBNET="${SUBNET}"
                 break
             else
-                log_warn "AZ ${AZ}: ${RESULT}" | grep -o "InsufficientInstance\|Unsupported\|DryRun" || true
+                log_warn "AZ ${AZ}: capacity check inconclusive — trying next."
             fi
         else
             # Can't test capacity — just use first supported AZ
@@ -210,7 +211,7 @@ else
     done
 
     if [[ -z "${SELECTED_AZ}" ]]; then
-        log_error "No AZ with available trn2.48xlarge capacity found in ${AWS_REGION}."
+        log_error "No AZ with available ${TRN2_INSTANCE_TYPE} capacity found in ${AWS_REGION}."
         log_error "Options:"
         log_error "  1. Retry later (capacity fluctuates)"
         log_error "  2. Specify AZ manually: bash setup-trn2-nodegroup.sh --az <az>"
@@ -243,7 +244,7 @@ log_info "Endpoint : ${CLUSTER_ENDPOINT}"
 log_info "CIDR     : ${CLUSTER_SERVICE_CIDR}"
 
 # ==============================================================================
-# Step 4 — Download CloudFormation template
+# Step 4 — Download CloudFormation template and patch instance type
 # ==============================================================================
 log_step "Downloading CloudFormation template"
 
@@ -253,6 +254,43 @@ if [[ ! -f "${CFN_TEMPLATE_FILE}" ]]; then
     log_info "Template saved: ${CFN_TEMPLATE_FILE}"
 else
     log_info "Template already exists: ${CFN_TEMPLATE_FILE}"
+fi
+
+# Patch instance type in the template if it differs from default trn2.48xlarge.
+# The AWS template hardcodes trn2.48xlarge — replace it with TRN2_INSTANCE_TYPE.
+if [[ "${TRN2_INSTANCE_TYPE}" != "trn2.48xlarge" ]]; then
+    log_info "Patching template instance type: trn2.48xlarge → ${TRN2_INSTANCE_TYPE}"
+    sed -i "s/trn2\.48xlarge/${TRN2_INSTANCE_TYPE}/g" "${CFN_TEMPLATE_FILE}"
+fi
+
+# trn2.3xlarge has only 1 network card (index 0) and supports only 1 EFA interface.
+# trn2.48xlarge has 16 EFA interfaces across multiple network cards.
+# For trn2.3xlarge: keep only the first interface entry in each NetworkInterfaces block.
+if [[ "${TRN2_INSTANCE_TYPE}" == "trn2.3xlarge" ]]; then
+    log_info "Patching template for trn2.3xlarge: removing extra EFA interfaces (keeping only 1)"
+    awk '
+    /^        NetworkInterfaces:/ {
+        in_ni = 1
+        first_entry = 0
+        print
+        next
+    }
+    in_ni && /^          - / {
+        if (first_entry == 0) {
+            first_entry = 1
+            skip = 0
+        } else {
+            skip = 1
+        }
+    }
+    in_ni && /^        [A-Z]/ {
+        in_ni = 0
+        skip = 0
+    }
+    !skip { print }
+    ' "${CFN_TEMPLATE_FILE}" > "${CFN_TEMPLATE_FILE}.patched"
+    mv "${CFN_TEMPLATE_FILE}.patched" "${CFN_TEMPLATE_FILE}"
+    log_info "Patched: kept only first EFA interface per NetworkInterfaces block"
 fi
 
 # ==============================================================================
@@ -300,7 +338,7 @@ EOF
     aws cloudformation wait stack-create-complete \
         --stack-name "${CFN_STACK_NAME}" \
         --region "${AWS_REGION}"
-    log_info "Stack created."
+    log_info "Stack created successfully."
 else
     log_error "Stack '${CFN_STACK_NAME}' is in unexpected state: ${STACK_STATUS}"
     exit 1
@@ -328,9 +366,20 @@ else
 fi
 
 NODEGROUP_YAML="${FRAMEWORK_ROOT}/cluster/trn2_nodegroup.yaml"
+
+# eksctl requires >= 2 AZs at cluster level even when the node group pins to 1.
+# Pick a second AZ from the region — just needs to exist, not have trn2 capacity.
+SECOND_AZ=$(aws ec2 describe-availability-zones \
+    --region "${AWS_REGION}" \
+    --filters "Name=state,Values=available" \
+    --query "AvailabilityZones[?ZoneName!='${SELECTED_AZ}'].ZoneName | [0]" \
+    --output text)
+log_info "Cluster-level AZs: ${SELECTED_AZ}, ${SECOND_AZ}"
+
 cat > "${NODEGROUP_YAML}" << EOF
 # Auto-generated by setup-trn2-nodegroup.sh
-# Cluster: ${CLUSTER_NAME} | AZ: ${SELECTED_AZ} | LT: ${LT_ID} | Capacity: ${CAPACITY_TYPE}
+# Docs: https://awsdocs-neuron.readthedocs-hosted.com/en/latest/containers/tutorials/k8s-setup.html
+# Cluster: ${CLUSTER_NAME} | AZ: ${SELECTED_AZ} | LT: ${LT_ID} | Instance: ${TRN2_INSTANCE_TYPE} | Capacity: ${CAPACITY_TYPE}
 apiVersion: eksctl.io/v1alpha5
 kind: ClusterConfig
 metadata:
@@ -339,16 +388,15 @@ metadata:
   version: "${EKS_VERSION}"
 iam:
   withOIDC: true
+availabilityZones: ["${SELECTED_AZ}", "${SECOND_AZ}"]
 managedNodeGroups:
   - name: ${NODEGROUP_NAME}
     launchTemplate:
       id: ${LT_ID}
     minSize: 0
-    desiredCapacity: 1
+    desiredCapacity: 0
     maxSize: 1
-    spot: ${SPOT_FLAG}
-    subnets:
-      - ${SELECTED_SUBNET}
+    availabilityZones: ["${SELECTED_AZ}"]
     privateNetworking: true
     efaEnabled: true
     tags:
@@ -428,7 +476,7 @@ echo ""
 echo "  Deploy model:"
 echo "    bash vllm/models/gpt-oss-20b-neuron/deploy.sh --managed-ng"
 echo ""
-echo "  Scale back to 0 after benchmarking (~\$98/hr):"
+echo "  Scale back to 0 after benchmarking (~\$2.235/hr for trn2.3xlarge):"
 echo "    aws eks update-nodegroup-config \\"
 echo "      --cluster-name ${CLUSTER_NAME} \\"
 echo "      --nodegroup-name ${NODEGROUP_NAME} \\"
