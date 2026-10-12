@@ -241,10 +241,25 @@ log_info "Namespace '${MONITORING_NAMESPACE}' ready."
 
 for SA in amp-iamproxy-ingest-service-account grafana-sa "${COLLECTOR_SA}"; do
     if kubectl get serviceaccount "${SA}" -n "${MONITORING_NAMESPACE}" >/dev/null 2>&1; then
-        log_warn "ServiceAccount '${SA}' already exists — skipping."
+        log_warn "ServiceAccount '${SA}' already exists — annotating for Helm adoption."
+        kubectl annotate serviceaccount "${SA}" -n "${MONITORING_NAMESPACE}" \
+            meta.helm.sh/release-name=kube-prometheus-stack \
+            meta.helm.sh/release-namespace="${MONITORING_NAMESPACE}" \
+            --overwrite
+        kubectl label serviceaccount "${SA}" -n "${MONITORING_NAMESPACE}" \
+            app.kubernetes.io/managed-by=Helm \
+            --overwrite
     else
         kubectl create serviceaccount "${SA}" -n "${MONITORING_NAMESPACE}"
         log_info "ServiceAccount created: ${SA}"
+        # Pre-annotate so Helm can adopt them seamlessly on install
+        kubectl annotate serviceaccount "${SA}" -n "${MONITORING_NAMESPACE}" \
+            meta.helm.sh/release-name=kube-prometheus-stack \
+            meta.helm.sh/release-namespace="${MONITORING_NAMESPACE}" \
+            --overwrite
+        kubectl label serviceaccount "${SA}" -n "${MONITORING_NAMESPACE}" \
+            app.kubernetes.io/managed-by=Helm \
+            --overwrite
     fi
 done
 
