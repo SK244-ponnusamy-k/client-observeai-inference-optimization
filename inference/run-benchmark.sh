@@ -452,14 +452,21 @@ spec:
         seccompProfile:
           type: RuntimeDefault
       # Do NOT co-locate the runner on the GPU inference node (latency contamination).
+      # On trn2-only clusters, use preferred (soft) anti-affinity so the runner
+      # can still schedule on the trn2 node if no CPU nodes have capacity.
       affinity:
         podAntiAffinity:
-          requiredDuringSchedulingIgnoredDuringExecution:
-            - labelSelector:
-                matchLabels:
-                  app.kubernetes.io/component: inference-server
-              topologyKey: kubernetes.io/hostname
-      tolerations: []
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    app.kubernetes.io/component: inference-server
+                topologyKey: kubernetes.io/hostname
+      tolerations:
+        - key: aws.amazon.com/neuron
+          operator: Exists
+          effect: NoSchedule
 ${INIT_CONTAINER}
       containers:
         - name: benchmark

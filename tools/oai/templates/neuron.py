@@ -150,6 +150,8 @@ spec:
         - key: aws.amazon.com/neuron
           operator: Exists
           effect: NoSchedule
+        - key: CriticalAddonsOnly
+          operator: Exists
 
       affinity:
         podAntiAffinity:
@@ -226,7 +228,10 @@ spec:
                 --max-num-seqs {{max_num_seqs}} \\
                 --tensor-parallel-size "${NEURON_CORES}" \\
                 --block-size 8 \\
-                --no-enable-prefix-caching \\
+                --enable-prefix-caching \\
+                --no-disable-hybrid-kv-cache-manager \\
+                --hf-overrides '{"quantization_config": {}}' \\
+                --additional-config '{"neuron_config": {"num_batched_tokens_buckets": [{{max_num_batched_tokens}}], "num_seqs_buckets": [{{max_num_seqs}}]}}' \\
                 --port 8000
           ports:
             - name: http
@@ -253,6 +258,11 @@ spec:
               value: "/tmp/neuron-compiled-artifacts"
             - name: AWS_DEFAULT_REGION
               value: "${AWS_REGION}"
+            # Compilation and execution timeouts for gpt-oss MoE (per AWS docs)
+            - name: VLLM_NEURON_COMPILATION_TIMEOUT
+              value: "1200"
+            - name: VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS
+              value: "1200"
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: false
@@ -364,6 +374,8 @@ spec:
         - key: aws.amazon.com/neuron
           operator: Exists
           effect: NoSchedule
+        - key: CriticalAddonsOnly
+          operator: Exists
       securityContext:
         runAsNonRoot: true
         runAsUser: 1000

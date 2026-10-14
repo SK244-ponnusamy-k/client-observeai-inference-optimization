@@ -135,14 +135,20 @@ spec:
 
       # Runner MUST NOT co-locate on the GPU node (contaminates latency), and
       # must NOT tolerate the GPU taint → lands on a CPU node in the same VPC/AZ.
+      # On trn2-only clusters, allow scheduling on the trn2 node.
       affinity:
         podAntiAffinity:
-          requiredDuringSchedulingIgnoredDuringExecution:
-            - labelSelector:
-                matchLabels:
-                  app.kubernetes.io/component: inference-server
-              topologyKey: kubernetes.io/hostname
-      tolerations: []
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    app.kubernetes.io/component: inference-server
+                topologyKey: kubernetes.io/hostname
+      tolerations:
+        - key: aws.amazon.com/neuron
+          operator: Exists
+          effect: NoSchedule
 
       containers:
         - name: benchmark
@@ -304,14 +310,20 @@ spec:
 
       # Runner MUST NOT co-locate on the GPU node (contaminates latency), and
       # must NOT tolerate the GPU taint → lands on a CPU node in the same VPC/AZ.
+      # On trn2-only clusters, allow scheduling on the trn2 node.
       affinity:
         podAntiAffinity:
-          requiredDuringSchedulingIgnoredDuringExecution:
-            - labelSelector:
-                matchLabels:
-                  app.kubernetes.io/component: inference-server
-              topologyKey: kubernetes.io/hostname
-      tolerations: []
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    app.kubernetes.io/component: inference-server
+                topologyKey: kubernetes.io/hostname
+      tolerations:
+        - key: aws.amazon.com/neuron
+          operator: Exists
+          effect: NoSchedule
 
       containers:
         - name: benchmark

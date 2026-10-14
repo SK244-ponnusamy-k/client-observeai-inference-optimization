@@ -26,18 +26,18 @@ serving:
   max_num_batched_tokens: 8192
 
 resources:
-  cpu_request: "16"
-  cpu_limit: "32"
+  cpu_request: "8"
+  cpu_limit: "12"
   memory_request: "64Gi"
   memory_limit: "128Gi"
 
 instances:
-  neuron_cores: 8               # = tensor-parallel degree; must match compile time
+  neuron_cores: 4               # LNC=2 on trn2: 4 logical cores (each = 2 physical); must match compile time
   candidates:
     - trn2.3xlarge
     - trn2.48xlarge
     - trn1.32xlarge
-  node_group: trn2-48xl-ngc     # managed node-group fallback when Karpenter can't provision trn2
+  node_group: trn2-neuron            # managed node group in ai-eks-cluster-trn2, ap-southeast-4
 
 neuron:
   source_folder: gpt-oss-20b        # bf16 weights (compile input)
