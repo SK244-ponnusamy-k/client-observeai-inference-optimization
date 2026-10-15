@@ -1,0 +1,62 @@
+# ==============================================================================
+# catalog/models/qwen3-5-4b-neuron.yaml
+#
+# Qwen/Qwen3.5-4B (Vision-Language Model) on AWS Trainium2 via vLLM-Neuron.
+#
+# Architecture: Qwen3_5ForConditionalGeneration (multimodal VLM)
+# Supports: text + images (similar to Qwen3-VL-8B)
+# 
+# NOTE: Qwen3.5-4B is NOT officially supported by vLLM-Neuron 0.24.0 yet.
+# Only Qwen3-VL-8B and Qwen3-VL-32B are in the AWS Neuron documentation.
+# This config is for future compatibility when support is added.
+#
+# Hardware: trn2.3xlarge
+# Tensor parallelism: TP=4
+# ==============================================================================
+
+id: qwen3-5-4b-neuron
+display_name: Qwen3.5-4B VLM (Trainium / Neuron)
+hardware: neuron
+
+source:
+  hf_id: Qwen/Qwen3.5-4B
+  gated: false
+  size_gb: 9
+
+serving:
+  served_name: Qwen3.5-4B
+  tokenizer: Qwen/Qwen3.5-4B
+  quantization: bf16
+  max_model_len: 8192
+  max_num_seqs: 8
+  max_num_batched_tokens: 8192
+  tensor_parallel_size: 4
+
+resources:
+  cpu_request: "4"
+  cpu_limit: "8"
+  memory_request: "32Gi"
+  memory_limit: "64Gi"
+
+instances:
+  neuron_cores: 4
+  candidates:
+    - trn2.48xlarge
+    - trn2.3xlarge
+  node_group: trn2-neuron
+
+neuron:
+  source_folder: Qwen3.5-4B
+  neff_folder: qwen3-5-4b-neuron
+  sequence_length: 8192
+  batch_size: 8
+  auto_cast_type: bf16
+  instance_family: trn2
+  vision_encoder_parallelism: true
+
+benchmark:
+  auto: false
+  profiles:
+    - configs/workload_profiles/realtime_v1.yaml
+    - configs/workload_profiles/batch_v1.yaml
+  instance_hourly_usd: 2.235

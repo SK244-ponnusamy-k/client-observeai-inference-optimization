@@ -1,0 +1,51 @@
+# ==============================================================================
+# configs/manifests/qwen3-5-4b-neuron-trn2-bf16.yaml
+#
+# Benchmark run manifest for Qwen/Qwen3.5-4B (VLM, bf16) on trn2.3xlarge.
+#
+# NOTE: Qwen3.5-4B is a Vision-Language Model (Qwen3_5ForConditionalGeneration).
+# Currently NOT supported by vLLM-Neuron 0.24.0 - this config is for when
+# AWS adds support in a future release.
+# ==============================================================================
+run_id: qwen3-5-4b-neuron-vlm-2026-10-15-001
+description: "Qwen/Qwen3.5-4B VLM bf16, trn2.3xlarge, TP=4, max_seqs=8"
+
+model:
+  hf_id: Qwen/Qwen3.5-4B
+  served_name: Qwen3.5-4B
+  tokenizer: Qwen/Qwen3.5-4B
+  s3_prefix: Qwen3.5-4B/
+  source: neuron
+  multimodal: true
+
+serving:
+  image: public.ecr.aws/neuron/pytorch-inference-vllm-neuronx:0.24.0.1.1.0-neuronx-py313-sdk2.32.0-ubuntu24.04
+  nodepool: neuron-inf
+  instance_type: trn2.3xlarge
+
+optimization_variants:
+  - label: bf16-vlm-tp4
+    quantization: bf16
+    tensor_parallel_size: 4
+    max_num_seqs: 8
+    max_num_batched_tokens: 8192
+    max_model_len: 8192
+    kv_cache_dtype: auto
+    vision_encoder_parallelism: true
+
+benchmark:
+  workload_profiles:
+    - configs/workload_profiles/realtime_v1.yaml
+    - configs/workload_profiles/batch_v1.yaml
+
+cost:
+  instance_hourly_usd: 2.235
+
+tags:
+  Project: observeai-inference-optimization
+  Engagement: shellkode-sow
+  Environment: sandbox
+  ManagedBy: oai-cli
+  Owner: TBD
+  CostCenter: TBD
+  RunId: qwen3-5-4b-neuron-vlm-2026-10-15-001

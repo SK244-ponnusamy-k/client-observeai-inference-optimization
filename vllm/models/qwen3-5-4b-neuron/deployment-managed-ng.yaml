@@ -1,0 +1,230 @@
+# ==============================================================================
+# vllm/models/qwen3-5-4b-neuron/deployment-managed-ng.yaml
+#
+# Managed node-group path — nodeSelector targets the trn2-neuron node group.
+# Used with:  oai deploy qwen3-5-4b-neuron --managed-ng
+#
+# Runtime values injected via envsubst by deploy.sh:
+#   ${BENCHMARK_NAMESPACE} ${NEURON_VLLM_IMAGE} ${MODEL_BUCKET}
+#   ${MODEL_FOLDER} ${MODEL_HF_ID} ${SERVED_NAME} ${NEURON_CORES} ${AWS_REGION}
+# ==============================================================================
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: oai-infopt-vllm-qwen3-5-4b-neuron
+  namespace: ${BENCHMARK_NAMESPACE}
+  labels:
+    app.kubernetes.io/name: oai-infopt-vllm-qwen3-5-4b-neuron
+    app.kubernetes.io/component: inference-server
+    app.kubernetes.io/managed-by: oai-cli
+    project: observeai-inference-optimization
+    engagement: shellkode-sow
+    environment: sandbox
+    model: qwen3-5-4b-neuron
+    source: neuron
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: oai-infopt-vllm-qwen3-5-4b-neuron
+  template:
+    metadata:
+      labels:
+        app: oai-infopt-vllm-qwen3-5-4b-neuron
+        app.kubernetes.io/name: oai-infopt-vllm-qwen3-5-4b-neuron
+        app.kubernetes.io/component: inference-server
+        project: observeai-inference-optimization
+        engagement: shellkode-sow
+        environment: sandbox
+        model: qwen3-5-4b-neuron
+        source: neuron
+    spec:
+      serviceAccountName: oai-infopt-serving-sa
+      automountServiceAccountToken: false
+      hostPID: false
+      hostIPC: false
+      hostNetwork: false
+
+      nodeSelector:
+        eks.amazonaws.com/nodegroup: trn2-neuron
+
+      tolerations:
+        - key: aws.amazon.com/neuron
+          operator: Exists
+          effect: NoSchedule
+
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    app.kubernetes.io/component: benchmark-runner
+                topologyKey: kubernetes.io/hostname
+
+      securityContext:
+        runAsNonRoot: false
+        runAsUser: 0
+        runAsGroup: 0
+        fsGroup: 0
+        seccompProfile:
+          type: RuntimeDefault
+
+      terminationGracePeriodSeconds: 180
+
+      initContainers:
+        - name: model-sync
+          image: amazon/aws-cli:2.15.0
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              if [ -f /model/config.json ]; then
+                echo "Model weights already cached at /model/ — skipping S3 download."
+                ls -lh /model/
+              else
+                echo "Syncing weights from s3://${MODEL_BUCKET}/${MODEL_FOLDER}/ -> /model/"
+                aws s3 sync "s3://${MODEL_BUCKET}/${MODEL_FOLDER}/" /model/ \
+                  --region "${AWS_DEFAULT_REGION}" --no-progress
+                echo "Sync complete. Files:"; ls -lh /model/
+              fi
+              test -f /model/config.json && echo "config.json OK" || { echo "ERROR: config.json missing"; exit 1; }
+          env:
+            - name: AWS_DEFAULT_REGION
+              value: "ap-southeast-4"
+            - name: MODEL_BUCKET
+              value: "${MODEL_BUCKET}"
+            - name: MODEL_FOLDER
+              value: "${MODEL_FOLDER}"
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: false
+            runAsNonRoot: false
+            runAsUser: 0
+            runAsGroup: 0
+            capabilities:
+              drop: ["ALL"]
+            seccompProfile:
+              type: RuntimeDefault
+          resources:
+            requests:
+              cpu: "2"
+              memory: "4Gi"
+            limits:
+              cpu: "4"
+              memory: "8Gi"
+          volumeMounts:
+            - name: model-weights
+              mountPath: /model
+
+      containers:
+        - name: vllm-neuron
+          image: ${NEURON_VLLM_IMAGE}
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              echo "vLLM-Neuron serving  model=/model  cores=4"
+              mkdir -p /workspace/vllm && chmod 777 /workspace/vllm || true
+              
+              # Try to serve Qwen3.5-4B VLM with text-only mode override
+              # Note: This will likely fail - Qwen3.5-4B is not supported yet
+              NEURON_SKIP_EFA_AFFINITY=1 vllm serve /model \
+                --served-model-name "${SERVED_NAME}" \
+                --max-model-len 8192 \
+                --max-num-batched-tokens 8192 \
+                --max-num-seqs 8 \
+                --tensor-parallel-size 4 \
+                --block-size 8 \
+                --no-enable-prefix-caching \
+                --no-disable-hybrid-kv-cache-manager \
+                --trust-remote-code \
+                --additional-config '{"neuron_config": {"num_batched_tokens_buckets": [8192], "num_seqs_buckets": [8]}}' \
+                --port 8000
+          ports:
+            - name: http
+              containerPort: 8000
+              protocol: TCP
+          env:
+            - name: HOME
+              value: "/tmp"
+            - name: USER
+              value: "vllm"
+            - name: MODEL_BUCKET
+              value: "${MODEL_BUCKET}"
+            - name: MODEL_FOLDER
+              value: "${MODEL_FOLDER}"
+            - name: SERVED_NAME
+              value: "${SERVED_NAME}"
+            - name: NEURON_CORES
+              value: "4"
+            - name: NEURONX_CACHE
+              value: "/tmp/neuronx_cache"
+            - name: NEURON_RT_NUM_CORES
+              value: "4"
+            - name: NEURON_COMPILE_CACHE_URL
+              value: "/tmp/neuron-compiled-artifacts"
+            - name: AWS_DEFAULT_REGION
+              value: "ap-southeast-4"
+            - name: VLLM_NEURON_COMPILATION_TIMEOUT
+              value: "1200"
+            - name: VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS
+              value: "1200"
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: false
+            runAsNonRoot: false
+            runAsUser: 0
+            runAsGroup: 0
+            capabilities:
+              drop: ["ALL"]
+            seccompProfile:
+              type: RuntimeDefault
+          resources:
+            requests:
+              cpu: "4"
+              memory: "32Gi"
+              aws.amazon.com/neuron: "4"
+            limits:
+              cpu: "8"
+              memory: "64Gi"
+              aws.amazon.com/neuron: "4"
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 180
+            periodSeconds: 10
+            failureThreshold: 30
+            timeoutSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 240
+            periodSeconds: 30
+            failureThreshold: 10
+            timeoutSeconds: 5
+          volumeMounts:
+            - name: model-weights
+              mountPath: /model
+            - name: dshm
+              mountPath: /dev/shm
+            - name: tmp
+              mountPath: /tmp
+
+      volumes:
+        - name: model-weights
+          emptyDir:
+            sizeLimit: 20Gi
+        - name: dshm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 16Gi
+        - name: tmp
+          emptyDir:
+            sizeLimit: 100Gi
