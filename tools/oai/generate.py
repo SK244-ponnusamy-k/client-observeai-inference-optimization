@@ -180,6 +180,12 @@ def _gen_neuron(spec: ModelSpec, ctx: dict[str, object], cfg: config.Config, res
         device_count = 16
     else:
         device_count = spec.instances.neuron_cores
+    # Compiled bucket lists: use explicit catalog lists if given, else fall back
+    # to a single-element list from the serving caps (back-compat with old catalogs).
+    seqs_buckets = spec.neuron.num_seqs_buckets or [spec.serving.max_num_seqs]
+    tokens_buckets = spec.neuron.num_batched_tokens_buckets or [spec.serving.max_num_batched_tokens]
+    # LNC: prefer the neuron block, else instances; 1 is a safe default (no fusion).
+    lnc = spec.neuron.logical_neuron_config or spec.instances.logical_neuron_config or 1
     nctx = dict(ctx)
     nctx.update(
         {
@@ -190,11 +196,25 @@ def _gen_neuron(spec: ModelSpec, ctx: dict[str, object], cfg: config.Config, res
             "auto_cast_type": spec.neuron.auto_cast_type,
             "instance_family": spec.neuron.instance_family,
             "neuron_cores": spec.instances.neuron_cores,
+            "logical_neuron_config": lnc,
+            "num_seqs_buckets": ", ".join(str(x) for x in seqs_buckets),
+            "num_batched_tokens_buckets": ", ".join(str(x) for x in tokens_buckets),
             "neuron_device_count": device_count,
             "node_group": spec.instances.node_group,
             "weights_scratch_gi": max(int(spec.source.size_gb * 1.5), 60) if spec.source.size_gb else 60,
         }
     )
+
+    # Compile-job nodeSelector: a managed node group stamps the nodegroup label,
+    # NOT eks.amazonaws.com/instance-family (that is a Karpenter-only label). When
+    # a node_group is configured, target it so the compile pod schedules there;
+    # otherwise keep the Karpenter instance-family selector.
+    if spec.instances.node_group:
+        nctx["compile_node_selector_key"] = "eks.amazonaws.com/nodegroup"
+        nctx["compile_node_selector_value"] = spec.instances.node_group
+    else:
+        nctx["compile_node_selector_key"] = "eks.amazonaws.com/instance-family"
+        nctx["compile_node_selector_value"] = spec.neuron.instance_family
 
     _write(mdir / "model.env", render(t_neuron.MODEL_ENV, nctx), False, result, force)
     _write(mdir / "service.yaml", render(t_neuron.SERVICE_YAML, nctx), False, result, force)

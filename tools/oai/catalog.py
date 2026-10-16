@@ -71,6 +71,9 @@ class Resources:
 class Instances:
     tensor_parallel_size: int = 1
     neuron_cores: int = 0
+    # LNC — logical NeuronCore config (NEURON_LOGICAL_NC_CONFIG). On trn2, LNC=2
+    # fuses 2 physical NeuronCores into one logical core. 0/None -> not emitted.
+    logical_neuron_config: int = 0
     candidates: list[str] = field(default_factory=list)
     node_group: str = ""
 
@@ -83,6 +86,19 @@ class Neuron:
     batch_size: int = 8
     auto_cast_type: str = "bf16"
     instance_family: str = "trn2"
+    logical_neuron_config: int = 0
+    num_cores: int = 0
+    # Compiled bucket lists. Empty -> derive a single-element list from
+    # batch_size / max_num_batched_tokens at render time (back-compat).
+    num_seqs_buckets: list[int] = field(default_factory=list)
+    num_batched_tokens_buckets: list[int] = field(default_factory=list)
+    # How the NEFF is produced:
+    #   "ahead_of_time" (default) -> optimum-cli export neuron compile job, then
+    #       serve from the cached NEFF. Works for architectures optimum supports.
+    #   "serve_time" -> no AOT job; vLLM-Neuron (NxDI) compiles in-process on first
+    #       startup from the bf16 weights. REQUIRED for MoE models like gpt-oss,
+    #       which optimum's exporter does not support.
+    compile_mode: str = "ahead_of_time"
 
 
 @dataclass
@@ -209,6 +225,7 @@ def from_dict(data: dict[str, Any]) -> ModelSpec:
     instances = Instances(
         tensor_parallel_size=int(inst_raw.get("tensor_parallel_size", 1)),
         neuron_cores=int(inst_raw.get("neuron_cores", 0)),
+        logical_neuron_config=int(inst_raw.get("logical_neuron_config", 0) or 0),
         candidates=list(inst_raw.get("candidates", []) or []),
         node_group=inst_raw.get("node_group", "") or "",
     )
@@ -217,6 +234,8 @@ def from_dict(data: dict[str, Any]) -> ModelSpec:
     if hardware == "neuron":
         neu_raw = data.get("neuron", {}) or {}
         source_folder = neu_raw.get("source_folder") or model_id
+        # LNC may be declared under instances or neuron; neuron wins if both set.
+        lnc = int(neu_raw.get("logical_neuron_config", instances.logical_neuron_config) or 0)
         neuron = Neuron(
             source_folder=source_folder,
             neff_folder=neu_raw.get("neff_folder") or f"{source_folder}-neuron",
@@ -224,6 +243,11 @@ def from_dict(data: dict[str, Any]) -> ModelSpec:
             batch_size=int(neu_raw.get("batch_size", 8)),
             auto_cast_type=neu_raw.get("auto_cast_type", "bf16"),
             instance_family=neu_raw.get("instance_family", "trn2"),
+            logical_neuron_config=lnc,
+            num_cores=int(neu_raw.get("num_cores", instances.neuron_cores) or 0),
+            num_seqs_buckets=[int(x) for x in (neu_raw.get("num_seqs_buckets", []) or [])],
+            num_batched_tokens_buckets=[int(x) for x in (neu_raw.get("num_batched_tokens_buckets", []) or [])],
+            compile_mode=str(neu_raw.get("compile_mode", "ahead_of_time") or "ahead_of_time"),
         )
 
     bench_raw = data.get("benchmark", {}) or {}

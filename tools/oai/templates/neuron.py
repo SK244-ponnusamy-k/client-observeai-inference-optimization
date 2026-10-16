@@ -43,12 +43,18 @@ export SERVICE_NAME="{{service_name}}"
 
 # ── Hardware defaults ─────────────────────────────────────────────────────────
 export NEURON_INSTANCE_TYPE="{{preferred_instance}}"
+# LNC (logical NeuronCore config): fuse N physical NeuronCores per logical core.
+# Must be identical at compile AND serve time.
+export NEURON_LOGICAL_NC_CONFIG="{{logical_neuron_config}}"
 # NEURON_CORES = tensor-parallel degree; must equal the compile-time value.
 export NEURON_CORES="{{neuron_cores}}"
 
 # Compile-time bucket parameters - must match compile-job.yaml.
 export SEQ_LEN="{{sequence_length}}"
 export BATCH_SIZE="{{batch_size}}"
+# Compiled bucket lists (must match deployment --additional-config and compile-job).
+export NUM_SEQS_BUCKETS="{{num_seqs_buckets}}"
+export NUM_BATCHED_TOKENS_BUCKETS="{{num_batched_tokens_buckets}}"
 
 export MANIFEST_PATH="configs/manifests/{{manifest_filename}}"
 export PORT_FORWARD_PORT="{{port_forward_port}}"
@@ -180,14 +186,18 @@ spec:
           command: ["/bin/bash", "-c"]
           args:
             - |
-              echo "Syncing weights from s3://${MODEL_BUCKET}/${MODEL_FOLDER}/ -> /model/"
+              echo "Syncing weights from s3://${MODEL_BUCKET}/${MODEL_FOLDER}/ -> /model/ (bucket region=${S3_BUCKET_REGION})"
               aws s3 sync "s3://${MODEL_BUCKET}/${MODEL_FOLDER}/" /model/ \\
-                --region "${AWS_DEFAULT_REGION}" --no-progress
+                --region "${S3_BUCKET_REGION}" --no-progress
               echo "Sync complete. Files:"; ls -lh /model/
               test -f /model/config.json && echo "config.json OK" || { echo "ERROR: config.json missing"; exit 1; }
           env:
             - name: AWS_DEFAULT_REGION
               value: "${AWS_REGION}"
+            # S3 bucket region (may differ from cluster region). Cross-region
+            # sync fails if this is wrong; defaults to AWS_REGION via deploy.sh.
+            - name: S3_BUCKET_REGION
+              value: "${S3_BUCKET_REGION}"
             - name: MODEL_BUCKET
               value: "${MODEL_BUCKET}"
             - name: MODEL_FOLDER
@@ -220,7 +230,7 @@ spec:
           command: ["/bin/bash", "-c"]
           args:
             - |
-              echo "vLLM-Neuron serving  model=/model  cores=${NEURON_CORES}"
+              echo "vLLM-Neuron serving  model=/model  LNC=${NEURON_LOGICAL_NC_CONFIG}  cores/TP=${NEURON_CORES}"
               NEURON_SKIP_EFA_AFFINITY=1 vllm serve /model \\
                 --served-model-name "${SERVED_NAME}" \\
                 --max-model-len {{max_model_len}} \\
@@ -231,7 +241,7 @@ spec:
                 --enable-prefix-caching \\
                 --no-disable-hybrid-kv-cache-manager \\
                 --hf-overrides '{"quantization_config": {}}' \\
-                --additional-config '{"neuron_config": {"num_batched_tokens_buckets": [{{max_num_batched_tokens}}], "num_seqs_buckets": [{{max_num_seqs}}]}}' \\
+                --additional-config '{"neuron_config": {"num_batched_tokens_buckets": [{{num_batched_tokens_buckets}}], "num_seqs_buckets": [{{num_seqs_buckets}}]}}' \\
                 --port 8000
           ports:
             - name: http
@@ -250,6 +260,9 @@ spec:
               value: "${SERVED_NAME}"
             - name: NEURON_CORES
               value: "${NEURON_CORES}"
+            # LNC (logical NeuronCore config): must match the compile-time value exactly.
+            - name: NEURON_LOGICAL_NC_CONFIG
+              value: "{{logical_neuron_config}}"
             - name: NEURONX_CACHE
               value: "/tmp/neuronx_cache"
             - name: NEURON_RT_NUM_CORES
@@ -368,8 +381,11 @@ spec:
       hostPID: false
       hostIPC: false
       hostNetwork: false
+      # Managed node groups stamp eks.amazonaws.com/nodegroup (NOT instance-family,
+      # which is a Karpenter label). The generator picks the matching selector:
+      # nodegroup label when a node_group is configured, else instance-family.
       nodeSelector:
-        eks.amazonaws.com/instance-family: {{instance_family}}
+        {{compile_node_selector_key}}: {{compile_node_selector_value}}
       tolerations:
         - key: aws.amazon.com/neuron
           operator: Exists
@@ -393,6 +409,8 @@ spec:
               set -euo pipefail
               SRC_FOLDER="{{source_folder}}"
               NEFF_FOLDER="{{neff_folder}}"
+              # LNC must match serve-time NEURON_LOGICAL_NC_CONFIG exactly.
+              export NEURON_LOGICAL_NC_CONFIG="{{logical_neuron_config}}"
               NEURON_CORES="{{neuron_cores}}"
               SEQ_LEN="{{sequence_length}}"
               BATCH="{{batch_size}}"
@@ -400,7 +418,7 @@ spec:
               DST_S3="s3://${MODEL_BUCKET}/${NEFF_FOLDER}/"
               WORK_DIR="/tmp/model"; NEFF_DIR="/tmp/neff"
 
-              echo "Compile {{id}}: ${SRC_S3} -> ${DST_S3} (cores=${NEURON_CORES}, seq=${SEQ_LEN}, batch=${BATCH})"
+              echo "Compile {{id}}: ${SRC_S3} -> ${DST_S3} (LNC=${NEURON_LOGICAL_NC_CONFIG}, cores/TP=${NEURON_CORES}, seq=${SEQ_LEN}, batch=${BATCH})"
 
               echo "[1/4] Checking S3 NEFF cache..."
               if aws s3 ls "${DST_S3}" --region "${AWS_DEFAULT_REGION}" 2>/dev/null | grep -q .; then
@@ -566,8 +584,10 @@ if [[ "${USE_MANAGED_NG}" == "true" ]]; then
 else
     DEPLOY_FILE="${SCRIPT_DIR}/deployment.yaml"
 fi
-log_info "Applying deployment: ${DEPLOYMENT_NAME} (NeuronCores=${NEURON_CORES})..."
-envsubst '${MODEL_BUCKET} ${BENCHMARK_NAMESPACE} ${NEURON_VLLM_IMAGE} ${MODEL_FOLDER} ${MODEL_HF_ID} ${SERVED_NAME} ${NEURON_CORES} ${AWS_REGION}' \\
+# S3 buckets may live in a different region than the cluster; default to AWS_REGION.
+export S3_BUCKET_REGION="${S3_BUCKET_REGION:-$AWS_REGION}"
+log_info "Applying deployment: ${DEPLOYMENT_NAME} (NeuronCores=${NEURON_CORES}, S3 region=${S3_BUCKET_REGION})..."
+envsubst '${MODEL_BUCKET} ${BENCHMARK_NAMESPACE} ${NEURON_VLLM_IMAGE} ${MODEL_FOLDER} ${MODEL_HF_ID} ${SERVED_NAME} ${NEURON_CORES} ${AWS_REGION} ${S3_BUCKET_REGION}' \\
     < "${DEPLOY_FILE}" | kubectl apply -f -
 
 log_info "Waiting for pod..."

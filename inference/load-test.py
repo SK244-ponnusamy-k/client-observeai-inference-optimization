@@ -559,6 +559,26 @@ def _g(d: dict[str, Any], *keys: str, default: float = 0.0) -> float:
     return default
 
 
+def _engine_generation_delta(
+    before: dict[str, float | None],
+    after: dict[str, float | None],
+) -> int | None:
+    """Tokens the vLLM engine generated during this level, from its own counter.
+
+    vllm:generation_tokens_total is a monotonic cumulative counter that includes
+    EVERY generated token — gpt-oss reasoning_content included. The per-level
+    count is the after-minus-before delta. Returns None if the counter was not
+    scraped at both ends (so the caller falls back to the bench number), and
+    never returns a negative value (guards a counter reset / pod restart).
+    """
+    b = before.get("generation_tokens_total")
+    a = after.get("generation_tokens_total")
+    if a is None or b is None:
+        return None
+    delta = int(a) - int(b)
+    return delta if delta > 0 else None
+
+
 # ---------------------------------------------------------------------------
 # EC2 on-demand $/hr price book — us-east-1 / us-east-2 (identical for these
 # GPU/accelerator families). Keyed by "<family>.<size>". Any instance type in a
@@ -605,9 +625,10 @@ EC2_HOURLY_USD: dict[str, float] = {
     "g7e.48xlarge": 33.1443,
     # G7  — (retained from prior manifest value; not in G-family price sheet above)
     "g7.2xlarge": 2.52,
-    # Trainium — carried over from manifests; VERIFY (not covered by G-family sheet)
+    # Trainium — Capacity Block reservation rate (NOT on-demand). Reported in the
+    # cost comparison labelled "Capacity Block". VERIFY for your region/term.
     "trn1.32xlarge": 21.50,
-    "trn2.3xlarge": 2.235,   # sa-east-1 on-demand — verified
+    "trn2.3xlarge": 2.235,   # trn2 Capacity Block — verified
     "trn2.48xlarge": 12.0,
 }
 
@@ -715,9 +736,33 @@ def _build_result(
     runtime_s = _g(bench, "duration")
     total_out = int(_g(bench, "total_output_tokens"))
     total_in = int(_g(bench, "total_input_tokens"))
+
+    # ── gpt-oss output-token correction ──────────────────────────────────────
+    # The openai-chat backend tallies output tokens from streamed delta.content.
+    # gpt-oss streams its chain-of-thought in a SEPARATE `reasoning_content`
+    # field, which some vLLM bench-serve versions omit from total_output_tokens —
+    # so gpt-oss output tokens (and therefore throughput and cost-per-output-tok)
+    # are undercounted. The vLLM engine's own counter, vllm:generation_tokens_total,
+    # ALWAYS counts every generated token (reasoning included). We take its delta
+    # across this level and, if it is materially higher than what bench reported,
+    # trust the engine. This is a no-op for models without a reasoning channel
+    # (bench and engine agree) and when the engine counter is unavailable.
+    engine_out = _engine_generation_delta(vmetrics_before, vmetrics_after)
+    if engine_out is not None and engine_out > total_out * 1.05 and engine_out > 0:
+        logger.info(
+            "gpt-oss token correction: bench reported %d output tokens; vLLM engine "
+            "counted %d (reasoning included). Using engine count.",
+            total_out, engine_out,
+        )
+        total_out = engine_out
+
     total_tokens = total_in + total_out
     completed = int(_g(bench, "completed", "num_prompts"))
     completed_per_min = completed / max(runtime_s / 60.0, 1e-9)
+    # Recompute output throughput from the (possibly corrected) token count so the
+    # reported tokens/s matches total_output_tokens instead of the undercount.
+    bench_out_tps = _g(bench, "output_throughput")
+    output_tps = (total_out / runtime_s) if (runtime_s > 0 and total_out > 0) else bench_out_tps
     instance_usd = _resolve_instance_hourly_usd(manifest)
 
     cost = _derive_cost(instance_usd, runtime_s, total_tokens, total_out, completed,
@@ -756,7 +801,7 @@ def _build_result(
         e2e_p95_ms=_g(bench, "p95_e2el_ms", "p99_e2el_ms"),
         e2e_p99_ms=_g(bench, "p99_e2el_ms"),
         request_throughput_rps=_g(bench, "request_throughput"),
-        output_throughput_tokens_s=_g(bench, "output_throughput"),
+        output_throughput_tokens_s=round(output_tps, 4),
         total_token_throughput_s=_g(bench, "total_token_throughput"),
         total_input_tokens=total_in,
         total_output_tokens=total_out,

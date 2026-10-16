@@ -449,6 +449,26 @@ fi
 log_info "DCGM exporter ready (runs on GPU nodes when provisioned)."
 
 # ==============================================================================
+# Step 9b — Neuron monitor (Trainium/Inferentia hardware metrics)
+# ==============================================================================
+log_step "Step 9b — Neuron monitor exporter"
+
+# neuron-monitor is the Neuron analogue of DCGM: a DaemonSet that only lands on
+# aws.amazon.com/neuron nodes and exports NeuronCore utilisation / device memory
+# to Prometheus on :8000. Reuses the pinned Neuron DLC image.
+export NEURON_VLLM_IMAGE
+if [[ -z "${NEURON_VLLM_IMAGE:-}" ]]; then
+    log_warn "NEURON_VLLM_IMAGE not set in config/config.env — skipping neuron-monitor."
+    log_warn "Set it and re-apply: envsubst < k8s/serving/neuron-monitor.yaml | kubectl apply -f -"
+else
+    log_info "Applying neuron-monitor DaemonSet + Service (oai-infopt ns)..."
+    envsubst '${NEURON_VLLM_IMAGE}' < "${FRAMEWORK_ROOT}/k8s/serving/neuron-monitor.yaml" | kubectl apply -f -
+    log_info "Applying neuron-monitor ServiceMonitor (monitoring ns)..."
+    kubectl apply -f "${FRAMEWORK_ROOT}/k8s/serving/neuron-servicemonitor.yaml"
+    log_info "Neuron monitor ready (scrapes on Trainium nodes when provisioned)."
+fi
+
+# ==============================================================================
 # Step 10 — Apply metrics-collector ConfigMap + CronJob
 # ==============================================================================
 log_step "Step 10 — Metrics collector CronJob"

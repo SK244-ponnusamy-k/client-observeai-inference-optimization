@@ -43,8 +43,12 @@ spec:
       hostPID: false
       hostIPC: false
       hostNetwork: false
+      # Managed node group places the trn2 node; it stamps the nodegroup label,
+      # NOT eks.amazonaws.com/instance-family (that is a Karpenter label). Select
+      # on the nodegroup so this compile pod lands on the trn2-neuron node — same
+      # selector the managed-ng serving deployment uses.
       nodeSelector:
-        eks.amazonaws.com/instance-family: trn2
+        eks.amazonaws.com/nodegroup: trn2-neuron
       tolerations:
         - key: aws.amazon.com/neuron
           operator: Exists
@@ -66,14 +70,17 @@ spec:
               set -euo pipefail
               SRC_FOLDER="gpt-oss-20b"
               NEFF_FOLDER="gpt-oss-20b-neuron"
-              NEURON_CORES="8"
-              SEQ_LEN="16384"
-              BATCH="8"
+              # LNC=2, TP=4: 4 logical cores (each fuses 2 physical NeuronCores on trn2).
+              export NEURON_LOGICAL_NC_CONFIG="2"
+              NEURON_CORES="4"
+              SEQ_LEN="8192"
+              # BATCH = top num_seqs bucket. Recompile pass 1 = 32, follow-up pass 2 = 64.
+              BATCH="32"
               SRC_S3="s3://${MODEL_BUCKET}/${SRC_FOLDER}/"
               DST_S3="s3://${MODEL_BUCKET}/${NEFF_FOLDER}/"
               WORK_DIR="/tmp/model"; NEFF_DIR="/tmp/neff"
 
-              echo "Compile gpt-oss-20b-neuron: ${SRC_S3} -> ${DST_S3} (cores=${NEURON_CORES}, seq=${SEQ_LEN}, batch=${BATCH})"
+              echo "Compile gpt-oss-20b-neuron: ${SRC_S3} -> ${DST_S3} (LNC=${NEURON_LOGICAL_NC_CONFIG}, cores/TP=${NEURON_CORES}, seq=${SEQ_LEN}, batch=${BATCH})"
 
               echo "[1/4] Checking S3 NEFF cache..."
               if aws s3 ls "${DST_S3}" --region "${AWS_DEFAULT_REGION}" 2>/dev/null | grep -q .; then
@@ -121,14 +128,22 @@ spec:
               drop: ["ALL"]
             seccompProfile:
               type: RuntimeDefault
+          # Compile is Neuron-bound (neuronx-cc runs on the NeuronCores); the
+          # container itself only drives the S3 sync + pip install + CLI, so a
+          # modest vCPU/RAM request is enough. Keep requests small so the pod
+          # fits trn2.3xlarge's allocatable CPU (the 16-vCPU request did not fit);
+          # limits stay higher for burst during the sync/compile.
+          # trn2.3xlarge allocatable is ~11.9 vCPU / ~124Gi (verified on-node),
+          # NOT the full instance spec — the kubelet/system reserve the rest.
+          # Keep request small and the limit UNDER allocatable so the pod fits.
           resources:
             requests:
-              cpu: "16"
-              memory: "64Gi"
+              cpu: "4"
+              memory: "24Gi"
               aws.amazon.com/neuron: "1"
             limits:
-              cpu: "32"
-              memory: "128Gi"
+              cpu: "10"
+              memory: "96Gi"
               aws.amazon.com/neuron: "1"
           volumeMounts:
             - name: tmp

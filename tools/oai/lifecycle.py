@@ -165,7 +165,15 @@ def deploy(
         if tag:
             ui.warn("--tag is not supported for Neuron models (they use the managed node group); ignoring it.")
             tag = None
-        if compile_first:
+        serve_time_compile = (spec.neuron is not None
+                              and spec.neuron.compile_mode == "serve_time")
+        if compile_first and serve_time_compile:
+            ui.warn(
+                f"'{spec.id}' compiles at serve time (MoE/NxDI), so the ahead-of-time "
+                "optimum compile job does not apply — ignoring --compile. vLLM-Neuron "
+                "will compile the NEFF in-process on first startup (allow ~15-20 min)."
+            )
+        elif compile_first:
             args += ["--compile"]
         want_managed = managed_ng or (
             chosen and not chosen.startswith(spec.neuron.instance_family)  # type: ignore[union-attr]

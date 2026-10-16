@@ -21,9 +21,12 @@ serving:
   served_name: gpt-oss-20b
   tokenizer: openai/gpt-oss-20b
   quantization: bf16
-  max_model_len: 16384
-  max_num_seqs: 4               # must match a compiled batch bucket
-  max_num_batched_tokens: 8192
+  max_model_len: 8192           # sized to real transcripts (XL prompts 2k-7k tok + verdict/CoT budget)
+  max_num_seqs: 32              # primary recompile pass; 64 is the follow-up pass. Must match top num_seqs bucket.
+  # MUST be < max_model_len so vLLM-Neuron enables SEGMENTED prefill, which
+  # --enable-prefix-caching (APC) requires. Equal values -> single-shot prefill
+  # -> APC refuses to start. Supported segmented sizes: 512/1024/2048/4096/8192.
+  max_num_batched_tokens: 4096  # == the single prefill bucket / KV segment size
 
 resources:
   cpu_request: "8"
@@ -32,7 +35,8 @@ resources:
   memory_limit: "128Gi"
 
 instances:
-  neuron_cores: 4               # LNC=2 on trn2: 4 logical cores (each = 2 physical); must match compile time
+  logical_neuron_config: 2      # LNC=2 explicit (NEURON_LOGICAL_NC_CONFIG): 2 physical NeuronCores fused per logical core
+  neuron_cores: 4               # TP=4 -> 4 logical cores; must equal compile-time --num_cores and tensor_parallel_size
   candidates:
     - trn2.3xlarge
     - trn2.48xlarge
@@ -40,11 +44,22 @@ instances:
   node_group: trn2-neuron            # managed node group in ai-eks-cluster-trn2, ap-southeast-4
 
 neuron:
-  source_folder: gpt-oss-20b        # bf16 weights (compile input)
-  neff_folder: gpt-oss-20b-neuron   # compiled NEFF cache (compile output)
-  sequence_length: 16384
-  batch_size: 8
+  # gpt-oss is a MoE model: optimum-cli export neuron does NOT support the gpt_oss
+  # architecture. vLLM-Neuron (NxDI backend) compiles the NEFF in-process on first
+  # serve from the bf16 weights, keyed to the neuron_config buckets + LNC below.
+  # So there is NO ahead-of-time compile job for this model.
+  compile_mode: serve_time
+  source_folder: gpt-oss-20b        # bf16 weights (serve-time compile input)
+  neff_folder: gpt-oss-20b-neuron   # (unused for serve_time) local NxDI cache at serve time
+  sequence_length: 8192             # == max_model_len; sized to real transcripts
+  batch_size: 32                    # == max_num_seqs (top bucket). Pass 2 uses 64.
   auto_cast_type: bf16
+  logical_neuron_config: 2          # LNC=2 (NEURON_LOGICAL_NC_CONFIG) — serve-time value
+  num_cores: 4                      # TP=4; must equal serving tensor_parallel_size
+  num_seqs_buckets: [1, 2, 4, 8, 16, 32]       # compiled batch buckets
+  # The segmented-prefill kernel requires EXACTLY ONE prefill bucket, equal to
+  # the KV segment size (== max_num_batched_tokens). Multiple values are rejected.
+  num_batched_tokens_buckets: [4096]           # single prefill bucket == max_num_batched_tokens
   instance_family: trn2             # gpt-oss needs trn2/trn3 (sink attention unsupported on trn1)
 
 benchmark:
@@ -52,5 +67,5 @@ benchmark:
   profiles:
     - configs/workload_profiles/realtime_v1.yaml
     - configs/workload_profiles/batch_v1.yaml
-  instance_hourly_usd: 2.235        # trn2.3xlarge sa-east-1 on-demand — verified
-  # instance_hourly_usd: 12.00       # trn2.48xlarge — uncomment if using 48xlarge
+  instance_hourly_usd: 2.235        # trn2.3xlarge Capacity Block rate — verified (labelled "Capacity Block" in cost report)
+  # instance_hourly_usd: 12.00       # trn2.48xlarge Capacity Block — uncomment if using 48xlarge

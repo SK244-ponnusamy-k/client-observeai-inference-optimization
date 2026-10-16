@@ -134,18 +134,18 @@ spec:
           command: ["/bin/bash", "-c"]
           args:
             - |
-              echo "vLLM-Neuron serving  model=/model  cores=${NEURON_CORES}"
+              echo "vLLM-Neuron serving  model=/model  LNC=${NEURON_LOGICAL_NC_CONFIG}  cores/TP=${NEURON_CORES}"
               NEURON_SKIP_EFA_AFFINITY=1 vllm serve /model \
                 --served-model-name "${SERVED_NAME}" \
-                --max-model-len 16384 \
-                --max-num-batched-tokens 8192 \
-                --max-num-seqs 4 \
+                --max-model-len 8192 \
+                --max-num-batched-tokens 4096 \
+                --max-num-seqs 32 \
                 --tensor-parallel-size "${NEURON_CORES}" \
                 --block-size 8 \
                 --enable-prefix-caching \
                 --no-disable-hybrid-kv-cache-manager \
                 --hf-overrides '{"quantization_config": {}}' \
-                --additional-config '{"neuron_config": {"num_batched_tokens_buckets": [8192], "num_seqs_buckets": [4]}}' \
+                --additional-config '{"neuron_config": {"num_batched_tokens_buckets": [4096], "num_seqs_buckets": [1, 2, 4, 8, 16, 32]}}' \
                 --port 8000
           ports:
             - name: http
@@ -164,6 +164,9 @@ spec:
               value: "${SERVED_NAME}"
             - name: NEURON_CORES
               value: "${NEURON_CORES}"
+            # LNC=2 explicit: must match the compile-time value exactly.
+            - name: NEURON_LOGICAL_NC_CONFIG
+              value: "2"
             - name: NEURONX_CACHE
               value: "/tmp/neuronx_cache"
             - name: NEURON_RT_NUM_CORES

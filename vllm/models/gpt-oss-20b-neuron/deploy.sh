@@ -97,8 +97,10 @@ if [[ "${USE_MANAGED_NG}" == "true" ]]; then
 else
     DEPLOY_FILE="${SCRIPT_DIR}/deployment.yaml"
 fi
-log_info "Applying deployment: ${DEPLOYMENT_NAME} (NeuronCores=${NEURON_CORES})..."
-envsubst '${MODEL_BUCKET} ${BENCHMARK_NAMESPACE} ${NEURON_VLLM_IMAGE} ${MODEL_FOLDER} ${MODEL_HF_ID} ${SERVED_NAME} ${NEURON_CORES} ${AWS_REGION}' \
+# S3 buckets may live in a different region than the cluster; default to AWS_REGION.
+export S3_BUCKET_REGION="${S3_BUCKET_REGION:-$AWS_REGION}"
+log_info "Applying deployment: ${DEPLOYMENT_NAME} (NeuronCores=${NEURON_CORES}, S3 region=${S3_BUCKET_REGION})..."
+envsubst '${MODEL_BUCKET} ${BENCHMARK_NAMESPACE} ${NEURON_VLLM_IMAGE} ${MODEL_FOLDER} ${MODEL_HF_ID} ${SERVED_NAME} ${NEURON_CORES} ${AWS_REGION} ${S3_BUCKET_REGION}' \
     < "${DEPLOY_FILE}" | kubectl apply -f -
 
 log_info "Waiting for pod..."

@@ -523,17 +523,39 @@ _EC2_HOURLY_USD = {
     "g6e.12xlarge": 10.6032, "g6e.16xlarge": 7.5772, "g6e.24xlarge": 15.0656, "g6e.48xlarge": 30.1312,
     "g7e.2xlarge": 3.3631, "g7e.4xlarge": 3.9982, "g7e.8xlarge": 5.2682,
     "g7e.12xlarge": 8.2861, "g7e.24xlarge": 16.5722, "g7e.48xlarge": 33.1443,
-    "g7.2xlarge": 2.52, "trn1.32xlarge": 21.50, "trn2.3xlarge": 2.235, "trn2.48xlarge": 12.0,
+    "g7.2xlarge": 2.52,
+    # Trainium rates are EC2 Capacity Block reservation prices, not on-demand;
+    # the cost comparison labels them "Capacity Block" (see _pricing_basis).
+    "trn1.32xlarge": 21.50, "trn2.3xlarge": 2.235, "trn2.48xlarge": 12.0,
 }
 
 # Known hardware families that can appear as an S3 run-folder segment.
 _HW_FAMILIES = ("g5", "g6e", "g6", "g7e", "g7", "trn2", "trn1")
+
+# Trainium (trn1/trn2) capacity is obtained via an EC2 Capacity Block
+# reservation, NOT on-demand. The $/hr in the price book is the Capacity Block
+# rate, so the cost comparison must label it as such rather than implying an
+# on-demand price. GPU families remain on-demand.
+_CAPACITY_BLOCK_FAMILIES = ("trn1", "trn2")
 
 
 def _family_of_instance(instance_type: str) -> str | None:
     """'g6.12xlarge' -> 'g6', 'g7e.2xlarge' -> 'g7e'. None if empty."""
     it = str(instance_type or "").strip().lower()
     return it.split(".")[0] if it else None
+
+
+def _pricing_basis(instance_type: str) -> str:
+    """Pricing basis label for an instance: 'Capacity Block' for Trainium (its
+    $/hr is a reserved Capacity Block rate), 'On-Demand' for everything else."""
+    return "Capacity Block" if _family_of_instance(instance_type) in _CAPACITY_BLOCK_FAMILIES else "On-Demand"
+
+
+def _hw_with_basis(instance_type: str) -> str:
+    """Instance type annotated with its pricing basis for display, e.g.
+    'trn2.3xlarge (Capacity Block)'. On-demand instances are shown unannotated."""
+    it = str(instance_type or "-").strip() or "-"
+    return f"{it} (Capacity Block)" if _family_of_instance(it) in _CAPACITY_BLOCK_FAMILIES else it
 
 
 def _folder_family_from_path(path: str) -> str | None:
@@ -614,6 +636,86 @@ def fix_instance_labels(results: list[dict[str, Any]]) -> int:
         print(f"[FIX] {labeled} -> {corrected_instance}  (cost x {new_price/old_price:.3f})" if old_price else
               f"[FIX] {labeled} -> {corrected_instance}")
     return fixed
+
+
+def dedup_trn_rows(
+    perf_results: list[dict[str, Any]],
+    qual_results: list[dict[str, Any]],
+) -> int:
+    """Collapse DUPLICATE Trainium (trn) rows in the current export.
+
+    Why this exists: a trn run that was recorded more than once (a re-export, or
+    a run re-launched with the same profile/concurrency) survives the normal
+    export dedup because that dedup keys on `started_at`, which differs between
+    the copies. The result is two visually identical trn rows in the report.
+
+    This pass removes those duplicates — but ONLY for Trainium rows (instance
+    family trn1/trn2), so GPU results are never touched. The run identity used
+    here deliberately EXCLUDES `started_at`:
+        perf: (hf_id, profile, reasoning, concurrency, instance_type)
+        qual: (model, testset, quant, hw, reasoning)
+    When two trn rows share that identity, we keep the one with the LATEST
+    started_at (the freshest measurement) and drop the rest.
+
+    Returns the total number of duplicate rows removed (perf + quality).
+    """
+    def _is_trn(instance_type: str) -> bool:
+        fam = _family_of_instance(instance_type)
+        return fam in ("trn1", "trn2")
+
+    def _started(row: dict[str, Any]) -> str:
+        return str(row.get("started_at", "") or "")
+
+    removed = 0
+
+    # ── Performance rows ─────────────────────────────────────────────────────
+    best_perf: dict[tuple, dict[str, Any]] = {}
+    passthrough_perf: list[dict[str, Any]] = []
+    for r in perf_results:
+        if not _is_trn(r.get("instance_type", "")):
+            passthrough_perf.append(r)  # non-trn rows are never deduped here
+            continue
+        key = (
+            r.get("hf_id", ""),
+            r.get("profile", ""),
+            _reasoning_flag(r),
+            r.get("concurrency", 0),
+            str(r.get("instance_type", "")).strip().lower(),
+        )
+        prev = best_perf.get(key)
+        if prev is None:
+            best_perf[key] = r
+        else:
+            removed += 1
+            # Keep the freshest (latest started_at); drop the older copy.
+            if _started(r) > _started(prev):
+                best_perf[key] = r
+    perf_results[:] = passthrough_perf + list(best_perf.values())
+
+    # ── Quality rows ─────────────────────────────────────────────────────────
+    best_qual: dict[tuple, dict[str, Any]] = {}
+    passthrough_qual: list[dict[str, Any]] = []
+    for q in qual_results:
+        if not _is_trn(q.get("_clean_hw", "") or q.get("instance_type", "")):
+            passthrough_qual.append(q)
+            continue
+        key = (
+            q.get("_clean_model", ""),
+            q.get("_clean_testset", ""),
+            q.get("_clean_quant", ""),
+            str(q.get("_clean_hw", "")).strip().lower(),
+            _reasoning_flag(q),
+        )
+        prev = best_qual.get(key)
+        if prev is None:
+            best_qual[key] = q
+        else:
+            removed += 1
+            if _started(q) > _started(prev):
+                best_qual[key] = q
+    qual_results[:] = passthrough_qual + list(best_qual.values())
+
+    return removed
 
 
 def _confusion_from_samples(sample_results: list[dict[str, Any]]) -> dict[tuple, dict[str, int]]:
@@ -836,6 +938,7 @@ def export_excel(
         "GPU Mem Used (MiB)",
         "KV Cache Usage (%)",
         "Instance Type",
+        "Pricing Basis",
         "Status",
     ]
 
@@ -875,6 +978,7 @@ def export_excel(
             round(_v(r, "gpu_memory_used_mib", "gpu_mem_used_mib"), 0),
             round(_v(r, "gpu_cache_usage_pct", "kv_cache_utilization_pct"), 1),
             r.get("instance_type", "unknown"),
+            _pricing_basis(r.get("instance_type", "")),
             "PASSED" if r.get("status") == "passed" else "SLO FAIL",
         ])
 
@@ -886,6 +990,7 @@ def export_excel(
         "Model",
         "Test Set",
         "Instance Type / HW",
+        "Pricing Basis",
         "Quantization",
         "Total Transcripts",
         "Accuracy (%)",
@@ -940,6 +1045,7 @@ def export_excel(
             q.get("_clean_model", "gpt-oss-20b"),
             q.get("_clean_testset", "-"),
             q.get("_clean_hw", "-"),
+            _pricing_basis(q.get("_clean_hw", "")),
             q.get("_clean_quant", "-"),
             q.get("_clean_rows", 1200),
             round(q.get("_clean_acc", 0.0), 2),
@@ -1148,11 +1254,11 @@ def print_comparison_table(
     if perf_results:
         print("\n  [ PERFORMANCE & EFFICIENCY BENCHMARKS ]")
         print(
-            f"  {'Model':<22} {'HW':<8} {'Profile':<9} {'Reason':<7} {'Concur':>6} "
+            f"  {'Model':<22} {'HW':<30} {'Profile':<9} {'Reason':<7} {'Concur':>6} "
             f"{'TTFT p95':>10} {'ITL p95':>9} {'Tok/s':>9} "
             f"{'Cost/1M':>9} {'GPU Util':>9} {'Status':<9}"
         )
-        print(f"  {'-'*108}")
+        print(f"  {'-'*130}")
 
         seen = set()
         unique_perf = []
@@ -1165,7 +1271,7 @@ def print_comparison_table(
 
         for r in sorted(unique_perf, key=lambda x: (x.get("hf_id", ""), x.get("profile", ""), _reasoning_flag(x), x.get("concurrency", 0))):
             model = r.get("hf_id", "unknown").split("/")[-1]
-            hw = r.get("instance_type", r.get("hardware", "-"))
+            hw = _hw_with_basis(r.get("instance_type", r.get("hardware", "-")))
             profile = r.get("profile", "unknown")
             reasoning = _reasoning_flag(r)
             concurrency = r.get("concurrency", 1)
@@ -1177,7 +1283,7 @@ def print_comparison_table(
             status = "PASSED" if r.get("status") == "passed" else "SLO FAIL"
 
             print(
-                f"  {model:<22} {hw:<8} {profile:<9} {reasoning:<7} {concurrency:>6} "
+                f"  {model:<22} {hw:<30} {profile:<9} {reasoning:<7} {concurrency:>6} "
                 f"{ttft_p95:>10} {itl_p95:>9} {throughput:>9} "
                 f"{cost:>9} {gpu_util:>9} {status:<9}"
             )
@@ -1186,11 +1292,11 @@ def print_comparison_table(
     if qual_results:
         print("\n  [ QUALITY & ACCURACY BENCHMARKS (AutoQA F1 Score) ]")
         print(
-            f"  {'Model':<22} {'HW':<8} {'Quant':<8} {'Reason':<7} {'Rows':>6} "
+            f"  {'Model':<22} {'HW':<30} {'Quant':<8} {'Reason':<7} {'Rows':>6} "
             f"{'Accuracy':>10} {'Precision':>10} {'Recall':>9} {'F1 Score':>10} "
             f"{'Unparse':>8} {'Trunc':>6}"
         )
-        print(f"  {'-'*113}")
+        print(f"  {'-'*135}")
 
         seen_q = set()
         unique_qual = []
@@ -1203,7 +1309,7 @@ def print_comparison_table(
 
         for q in sorted(unique_qual, key=lambda x: (x.get("_clean_model", ""), x.get("_clean_quant", ""), _reasoning_flag(x))):
             model = str(q.get("_clean_model", "gpt-oss-20b"))
-            hw = str(q.get("_clean_hw", "-"))
+            hw = _hw_with_basis(q.get("_clean_hw", "-"))
             quant = str(q.get("_clean_quant", "-"))
             reasoning = _reasoning_flag(q)
             rows = q.get("_clean_rows", 1200)
@@ -1215,7 +1321,7 @@ def print_comparison_table(
             trunc = str(q.get("n_truncated", "-"))
 
             print(
-                f"  {model:<22} {hw:<8} {quant:<8} {reasoning:<7} {rows:>6} "
+                f"  {model:<22} {hw:<30} {quant:<8} {reasoning:<7} {rows:>6} "
                 f"{acc:>10} {prec:>10} {rec:>9} {f1:>10} "
                 f"{unparse:>8} {trunc:>6}"
             )
@@ -1334,6 +1440,16 @@ def main() -> None:
             "exactly as-is. Performance metrics are never changed."
         ),
     )
+    parser.add_argument(
+        "--dedup-trn",
+        action="store_true",
+        help=(
+            "Remove duplicate Trainium (trn1/trn2) rows from this export. Two trn "
+            "rows with the same model/profile/concurrency (perf) or "
+            "model/testset/quant/hw (quality) but different started_at are "
+            "collapsed to the freshest one. GPU rows are never touched."
+        ),
+    )
     args = parser.parse_args()
 
     results_path = Path(args.results_dir)
@@ -1348,6 +1464,11 @@ def main() -> None:
     if args.fix_instance_labels:
         n = fix_instance_labels(perf_results) + fix_instance_labels(qual_results)
         print(f"[FIX] Corrected {n} mislabeled row(s) (instance_type + cost) from S3 folder family.")
+
+    if args.dedup_trn:
+        # Run AFTER label fixes so trn rows carry their final instance_type/_clean_hw.
+        n = dedup_trn_rows(perf_results, qual_results)
+        print(f"[DEDUP] Removed {n} duplicate Trainium row(s) from the export (kept freshest per run).")
 
     from_date, to_date = resolve_date_range(args.date, args.from_date, args.to_date)
     if from_date or to_date:

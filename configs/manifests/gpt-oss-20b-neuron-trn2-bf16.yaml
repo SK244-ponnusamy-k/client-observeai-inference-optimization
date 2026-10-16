@@ -23,10 +23,10 @@ serving:
 optimization_variants:
   - label: bf16-trn2
     quantization: bf16
-    tensor_parallel_size: 8
-    max_num_seqs: 4
-    max_num_batched_tokens: 8192
-    max_model_len: 16384
+    tensor_parallel_size: 4       # TP=4 (LNC=2 -> 4 logical cores); must equal compile-time --num_cores
+    max_num_seqs: 32              # top num_seqs bucket (recompile pass 1; pass 2 = 64)
+    max_num_batched_tokens: 4096  # < max_model_len so segmented prefill (required by APC) is enabled
+    max_model_len: 8192           # sized to real transcripts
     kv_cache_dtype: auto
 
 benchmark:
@@ -35,7 +35,7 @@ benchmark:
     - configs/workload_profiles/batch_v1.yaml
 
 cost:
-  instance_hourly_usd: 2.235    # VERIFY before run
+  instance_hourly_usd: 2.235    # trn2.3xlarge Capacity Block rate — VERIFY before run (labelled "Capacity Block" in cost report)
 
 tags:
   Project: observeai-inference-optimization

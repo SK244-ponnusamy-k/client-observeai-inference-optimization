@@ -1,0 +1,40 @@
+# ==============================================================================
+# k8s/serving/neuron-servicemonitor.yaml
+#
+# ServiceMonitor — tells Prometheus to scrape the neuron-monitor exporter
+# (:8000/metrics) running as a DaemonSet on every Trainium/Inferentia node.
+# This is the Neuron analogue of the DCGM GPU ServiceMonitor.
+#
+# Depends on: k8s/serving/neuron-monitor.yaml (the DaemonSet + headless Service).
+#
+# Apply:
+#   kubectl apply -f k8s/serving/neuron-servicemonitor.yaml
+# ==============================================================================
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: neuron-monitor
+  namespace: monitoring            # must be in monitoring ns for Prometheus to discover
+  labels:
+    release: kube-prometheus-stack # matches the Prometheus operator selector
+    app.kubernetes.io/name: neuron-monitor
+    project: observeai-inference-optimization
+spec:
+  namespaceSelector:
+    matchNames:
+      - oai-infopt                 # scrape the neuron-monitor Service in this ns
+  selector:
+    matchLabels:
+      app.kubernetes.io/component: neuron-exporter
+  endpoints:
+    - port: metrics
+      path: /metrics
+      interval: 15s
+      scrapeTimeout: 10s
+      relabelings:
+        - sourceLabels: [__meta_kubernetes_pod_node_name]
+          targetLabel: node
+        - sourceLabels: [__meta_kubernetes_namespace]
+          targetLabel: namespace
+        - sourceLabels: [__meta_kubernetes_pod_name]
+          targetLabel: pod

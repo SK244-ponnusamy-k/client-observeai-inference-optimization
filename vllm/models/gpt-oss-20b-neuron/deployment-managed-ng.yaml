@@ -96,15 +96,20 @@ spec:
                 echo "Model weights already cached at /model/ — skipping S3 download."
                 ls -lh /model/
               else
-                echo "Syncing weights from s3://${MODEL_BUCKET}/${MODEL_FOLDER}/ -> /model/"
+                echo "Syncing weights from s3://${MODEL_BUCKET}/${MODEL_FOLDER}/ -> /model/ (bucket region=${S3_BUCKET_REGION})"
                 aws s3 sync "s3://${MODEL_BUCKET}/${MODEL_FOLDER}/" /model/ \
-                  --region "${AWS_DEFAULT_REGION}" --no-progress
+                  --region "${S3_BUCKET_REGION}" --no-progress
                 echo "Sync complete. Files:"; ls -lh /model/
               fi
               test -f /model/config.json && echo "config.json OK" || { echo "ERROR: config.json missing"; exit 1; }
           env:
             - name: AWS_DEFAULT_REGION
               value: "${AWS_REGION}"
+            # The S3 model bucket lives in its own region (may differ from the
+            # cluster region). S3 sync MUST target the bucket's region or it fails
+            # with AuthorizationHeaderMalformed. Defaults to AWS_REGION if unset.
+            - name: S3_BUCKET_REGION
+              value: "${S3_BUCKET_REGION}"
             - name: MODEL_BUCKET
               value: "${MODEL_BUCKET}"
             - name: MODEL_FOLDER
@@ -137,21 +142,22 @@ spec:
           command: ["/bin/bash", "-c"]
           args:
             - |
-              echo "vLLM-Neuron serving  model=/model  cores=4"
+              echo "vLLM-Neuron serving  model=/model  LNC=2  cores/TP=4"
               mkdir -p /workspace/vllm && chmod 777 /workspace/vllm || true
+              export NEURON_LOGICAL_NC_CONFIG=2
               export VLLM_NEURON_COMPILATION_TIMEOUT=1200
               export VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS=1200
               NEURON_SKIP_EFA_AFFINITY=1 vllm serve /model \
                 --served-model-name "${SERVED_NAME}" \
                 --hf-overrides '{"quantization_config": {}}' \
-                --max-model-len 16384 \
-                --max-num-batched-tokens 8192 \
-                --max-num-seqs 4 \
+                --max-model-len 8192 \
+                --max-num-batched-tokens 4096 \
+                --max-num-seqs 32 \
                 --tensor-parallel-size 4 \
                 --block-size 8 \
                 --enable-prefix-caching \
                 --no-disable-hybrid-kv-cache-manager \
-                --additional-config '{"neuron_config": {"num_batched_tokens_buckets": [8192], "num_seqs_buckets": [4]}}' \
+                --additional-config '{"neuron_config": {"num_batched_tokens_buckets": [4096], "num_seqs_buckets": [1, 2, 4, 8, 16, 32]}}' \
                 --port 8000
           ports:
             - name: http
@@ -170,6 +176,9 @@ spec:
               value: "${SERVED_NAME}"
             - name: NEURON_CORES
               value: "${NEURON_CORES}"
+            # LNC=2 explicit: must match the compile-time value exactly.
+            - name: NEURON_LOGICAL_NC_CONFIG
+              value: "2"
             - name: NEURONX_CACHE
               value: "/tmp/neuronx_cache"
             - name: NEURON_COMPILE_CACHE_URL
@@ -190,13 +199,16 @@ spec:
               drop: ["ALL"]
             seccompProfile:
               type: RuntimeDefault
+          # trn2.3xlarge allocatable is ~11.9 vCPU / ~124Gi (verified on-node).
+          # Request 8 (fits), keep the limit just under allocatable.
           resources:
             requests:
               cpu: "8"
               memory: "96Gi"
               aws.amazon.com/neuron: "1"
             limits:
-              cpu: "12"
+              cpu: "11"
+              memory: "120Gi"
               aws.amazon.com/neuron: "1"
           readinessProbe:
             httpGet:

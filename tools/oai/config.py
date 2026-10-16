@@ -71,14 +71,15 @@ class Config:
         return dict(self._values)
 
 
-@lru_cache(maxsize=1)
-def load() -> Config:
-    """Parse config/config.env once and cache it."""
-    values: dict[str, str] = {}
-    path = paths.CONFIG_ENV
-    if not path.exists():
-        return Config(values)
+def _parse_env_file(path, values: dict[str, str]) -> None:
+    """Parse one bash-style env file (export KEY=val) into `values`, in place.
 
+    Values already in `values` act as the resolution context for ${VAR} refs, so
+    a later file can reference earlier keys. Later files override earlier ones —
+    call with config.env first, then config/.env, so local overrides win.
+    """
+    if not path.exists():
+        return
     for raw in path.read_text(encoding="utf-8").splitlines():
         m = _EXPORT_RE.match(raw)
         if not m:
@@ -98,4 +99,17 @@ def load() -> Config:
         rhs = _VAR_RE.sub(repl, rhs)
         values[key] = rhs
 
+
+@lru_cache(maxsize=1)
+def load() -> Config:
+    """Parse config/config.env, then layer config/.env overrides on top.
+
+    config/.env (gitignored) holds per-environment overrides and secrets — e.g.
+    a cross-region S3_BUCKET_REGION or a different CLUSTER_NAME. It is parsed
+    AFTER config.env so its values win, matching the bash sourcing order in
+    config.env (which sources .env first for the same effect)."""
+    values: dict[str, str] = {}
+    _parse_env_file(paths.CONFIG_ENV, values)
+    # config/.env lives next to config.env; override layer.
+    _parse_env_file(paths.CONFIG_ENV.parent / ".env", values)
     return Config(values)

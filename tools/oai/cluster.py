@@ -104,7 +104,7 @@ def bootstrap(*, compute: str | None = None, force: bool = False) -> int:
     idempotent, so --force re-runs it to reconcile/add missing pieces).
     """
     cfg = config.load()
-    region = cfg.get("AWS_REGION", "us-east-2")
+    region = cfg.get("AWS_REGION", "ap-southeast-4")
     cluster = cfg.get("CLUSTER_NAME", "")
 
     ui.banner("Cluster bootstrap")
@@ -151,7 +151,7 @@ def setup_monitoring(*, force: bool = False) -> int:
     we report it and stop unless --force. The underlying script is idempotent.
     """
     cfg = config.load()
-    region = cfg.get("AWS_REGION", "us-east-2")
+    region = cfg.get("AWS_REGION", "ap-southeast-4")
     cluster = cfg.get("CLUSTER_NAME", "")
 
     ui.banner("Monitoring stack setup")
@@ -201,7 +201,7 @@ def teardown(*, assume_yes: bool = False) -> int:
     confirmation here in addition to the prompt inside teardown.sh.
     """
     cfg = config.load()
-    region = cfg.get("AWS_REGION", "us-east-2")
+    region = cfg.get("AWS_REGION", "ap-southeast-4")
     cluster = cfg.get("CLUSTER_NAME", "")
 
     ui.banner("Cluster teardown (DESTRUCTIVE)")
@@ -246,7 +246,7 @@ def setup_neuron(*, dry_run: bool = False, az: str | None = None, capacity_type:
     common "already there" case is instant and obvious.
     """
     cfg = config.load()
-    region = cfg.get("AWS_REGION", "us-east-2")
+    region = cfg.get("AWS_REGION", "ap-southeast-4")
     cluster = cfg.get("CLUSTER_NAME", "")
     nodegroup = cfg.get("TRN2_NODEGROUP_NAME", "trn2-48xl-ngc")
 
@@ -307,7 +307,7 @@ def setup_neuron(*, dry_run: bool = False, az: str | None = None, capacity_type:
 def status() -> int:
     """Unified one-view health: cluster, monitoring, and Trainium node group."""
     cfg = config.load()
-    region = cfg.get("AWS_REGION", "us-east-2")
+    region = cfg.get("AWS_REGION", "ap-southeast-4")
     cluster = cfg.get("CLUSTER_NAME", "")
     nodegroup = cfg.get("TRN2_NODEGROUP_NAME", "trn2-48xl-ngc")
 
