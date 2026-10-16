@@ -1,0 +1,48 @@
+# catalog/models/glm-4-1v-9b-thinking-tp1.yaml
+# Created by 'oai model new'. Edit freely; see catalog/SCHEMA.md for all options.
+
+id: glm-4-1v-9b-thinking-tp1
+display_name: GLM-4.1V-9B-Thinking
+hardware: gpu
+source:
+  hf_id: zai-org/GLM-4.1V-9B-Thinking
+  gated: true
+  size_gb: 22.0
+  s3_folder: glm-4-1v-9b-thinking
+serving:
+  served_name: glm-4-1v-9b-thinking-tp1
+  tokenizer: zai-org/GLM-4.1V-9B-Thinking
+  quantization: none
+  max_model_len: 16384
+  gpu_memory_utilization: 0.9
+  max_num_seqs: 256
+  max_num_batched_tokens: 8192
+  extra_args:
+  - --enable-chunked-prefill
+  - --enable-prefix-caching
+  #- --reasoning-parser=deepseek_r1
+  - '--default-chat-template-kwargs={\"enable_thinking\": true}'
+resources:
+  cpu_request: '4'
+  cpu_limit: '8'
+  memory_request: 24Gi
+  memory_limit: 30Gi
+  vram_gb_required: 28
+instances:
+  candidates:
+  - g6e.2xlarge
+  - g7e.2xlarge
+  tensor_parallel_size: 1
+benchmark:
+  auto: false
+  profiles:
+  - configs/workload_profiles/realtime_v1.yaml
+  - configs/workload_profiles/batch_v1.yaml
+  instance_hourly_usd: 0.0
+tags:
+  Project: observeai-inference-optimization
+  Engagement: shellkode-sow
+  Environment: sandbox
+  ManagedBy: oai-cli
+  Owner: TBD
+  CostCenter: TBD
