@@ -1,0 +1,79 @@
+# ==============================================================================
+# catalog/models/gemma-4-31b-fp8-tp1.yaml
+#
+# FP8 (block-quantized) google/gemma-4-31B-it via the pre-quantized RedHatAI
+# checkpoint, TP=1 variant for SINGLE 48 GB GPUs (L40S / Blackwell).
+#
+# FP8 roughly halves memory: ~63 GB bf16 -> ~33 GB FP8, which fits on ONE 48 GB
+# card with room for KV. This TP=1 entry owns the S3 weights folder; the TP=4
+# companion (gemma-4-31b-fp8-tp4.yaml) reuses the SAME folder via s3_folder, so
+# the FP8 weights are downloaded only once.
+#
+# vLLM auto-detects FP8 from the checkpoint's config.json (compressed-tensors),
+# so NO explicit --quantization flag is emitted; `quantization: fp8` below is
+# documentation/manifest metadata only.
+#
+# HARDWARE: g6e (L40S, Ada SM89) is the clean FP8 target. g7e (RTX PRO 6000,
+# Blackwell SM120) is included to A/B, but note vLLM has had block-FP8 Gemma-4
+# kernel issues on SM120 (garbage output) — verify g7e output before trusting it.
+# A10G (g5) is NOT a candidate here: Ampere has no FP8 compute.
+# ==============================================================================
+
+id: gemma-4-31b-fp8-tp1
+display_name: Gemma 4 31B (Instruction-tuned) - FP8 block, TP1
+
+hardware: gpu
+
+source:
+  hf_id: RedHatAI/gemma-4-31B-it-FP8-block
+  gated: false                  # RedHatAI redistributes under the Gemma license; no gate/token
+  size_gb: 33                   # ~half of the 63 GB bf16 baseline (FP8)
+  s3_folder: gemma-4-31B-it-FP8-block   # FP8 weights folder in S3 (matches the download job; tp4 reuses it)
+
+serving:
+  served_name: gemma-4-31b-fp8
+  tokenizer: RedHatAI/gemma-4-31B-it-FP8-block
+  quantization: fp8             # documentation/manifest only; vLLM auto-detects from the checkpoint
+  max_model_len: 32768          # FP8 frees memory -> larger context than the bf16 8192
+  gpu_memory_utilization: 0.90
+  max_num_seqs: 256
+  # Gemma4's vision encoder forces vLLM to disable chunked MM input, which requires
+  # max_num_batched_tokens >= the model's per-image token budget (2496). 4096 is safe.
+  max_num_batched_tokens: 4096
+  extra_args:
+    - "--trust-remote-code"          # required by the gemma4 model code
+    - "--enable-chunked-prefill"
+    - "--async-scheduling"           # from the RedHatAI/vLLM recipe
+    # Reasoning ON. Gemma 4's chat template reads `enable_thinking | default(false)`,
+    # so set it explicitly, and load the gemma4 reasoning parser so vLLM extracts
+    # the chain-of-thought into the response `reasoning` field.
+    - "--reasoning-parser=gemma4"
+    - '--default-chat-template-kwargs={\"enable_thinking\": true}'
+
+resources:
+  cpu_request: "8"
+  cpu_limit: "16"
+  memory_request: "64Gi"
+  memory_limit: "120Gi"
+  vram_gb_required: 40          # ~33 GB weights + KV; fits a single 48 GB L40S
+
+instances:
+  tensor_parallel_size: 1       # single 48 GB GPU
+  candidates:
+    - g6e.2xlarge               # 1x L40S 48 GB (Ada, SM89) — primary FP8 target
+    - g7e.2xlarge               # 1x RTX PRO 6000 (Blackwell) — A/B; watch for SM120 FP8 bug
+
+benchmark:
+  auto: false
+  profiles:
+    - configs/workload_profiles/realtime_v1.yaml
+    - configs/workload_profiles/batch_v1.yaml
+  instance_hourly_usd: 2.24     # g6e.2xlarge — VERIFY against the load-test.py price book
+
+tags:
+  Project: observeai-inference-optimization
+  Engagement: shellkode-sow
+  Environment: sandbox
+  ManagedBy: oai-cli
+  Owner: TBD
+  CostCenter: TBD

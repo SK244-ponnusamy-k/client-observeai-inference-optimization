@@ -1,0 +1,58 @@
+# ==============================================================================
+# catalog/models/qwen3-vl-8b-neuron.yaml
+#
+# Qwen/Qwen3-VL-8B-Instruct (Vision-Language) on AWS Trainium2 via vLLM-Neuron.
+#
+# Official AWS Neuron support - tested and validated multimodal VLM
+# Architecture: Qwen3_5ForConditionalGeneration
+# Supports: text + images, multi-image input (up to 30 images @ 512x512)
+#
+# Hardware: trn2.48xlarge (16 NeuronCores)
+# Tensor parallelism: TP=16 (AWS recommended configuration)
+# ==============================================================================
+
+id: qwen3-vl-8b-neuron
+display_name: Qwen3-VL 8B Instruct (Trainium / Neuron)
+hardware: neuron
+
+source:
+  hf_id: Qwen/Qwen3-VL-8B-Instruct
+  gated: false
+  size_gb: 18
+
+serving:
+  served_name: Qwen3-VL-8B-Instruct
+  tokenizer: Qwen/Qwen3-VL-8B-Instruct
+  quantization: bf16
+  max_model_len: 8192
+  max_num_seqs: 4
+  max_num_batched_tokens: 8192
+  tensor_parallel_size: 4       # Reduced from 16 for trn2.3xlarge
+
+resources:
+  cpu_request: "4"
+  cpu_limit: "8"
+  memory_request: "32Gi"
+  memory_limit: "64Gi"
+
+instances:
+  neuron_cores: 4               # trn2.3xlarge has 4 NeuronCores
+  candidates:
+    - trn2.3xlarge
+  node_group: trn2-neuron
+
+neuron:
+  source_folder: Qwen3-VL-8B-Instruct
+  neff_folder: qwen3-vl-8b-neuron
+  sequence_length: 8192
+  batch_size: 4
+  auto_cast_type: bf16
+  instance_family: trn2
+  vision_encoder_parallelism: true
+
+benchmark:
+  auto: false
+  profiles:
+    - configs/workload_profiles/realtime_v1.yaml
+    - configs/workload_profiles/batch_v1.yaml
+  instance_hourly_usd: 2.235    # trn2.3xlarge on-demand

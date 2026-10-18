@@ -1,0 +1,88 @@
+# ==============================================================================
+# cluster/autostop-rbac.yaml
+#
+# RBAC for the auto-stop cleanup Job (submitted by `oai deploy --auto-stop`).
+#
+# Unlike the download/serving/benchmark ServiceAccounts (which only need AWS S3
+# access via Pod Identity), the auto-stop Job must talk to the Kubernetes API to:
+#   - watch the quality/benchmark Jobs until the pipeline finishes, then
+#   - delete the vLLM Deployment / Service / PVC for the finished model so the
+#     GPU node goes idle and Karpenter reaps it (billing stops).
+#
+# Scope is namespace-local (Role, not ClusterRole) and limited to exactly the
+# object kinds the cleanup needs. This SA DOES auto-mount its token (the Job
+# needs an API credential), unlike the S3-only SAs.
+#
+# Apply once (idempotent):
+#   kubectl apply -f cluster/autostop-rbac.yaml
+# ==============================================================================
+
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: oai-infopt-autostop-sa
+  namespace: oai-infopt
+  labels:
+    app.kubernetes.io/name: oai-infopt-autostop-sa
+    app.kubernetes.io/component: service-account
+    app.kubernetes.io/managed-by: kubectl
+    project: observeai-inference-optimization
+    engagement: shellkode-sow
+    environment: sandbox
+    workload: auto-stop
+# The cleanup Job DOES need an API token (to watch Jobs + delete the Deployment),
+# so token auto-mount is left at the default. The Job's pod spec still keeps
+# every other hardening (non-root, read-only FS, dropped caps).
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: oai-infopt-autostop-role
+  namespace: oai-infopt
+  labels:
+    app.kubernetes.io/name: oai-infopt-autostop-role
+    app.kubernetes.io/component: rbac
+    app.kubernetes.io/managed-by: kubectl
+    project: observeai-inference-optimization
+    engagement: shellkode-sow
+    environment: sandbox
+rules:
+  # Watch the benchmark/quality Jobs to know when the pipeline is done.
+  - apiGroups: ["batch"]
+    resources: ["jobs"]
+    verbs: ["get", "list", "watch"]
+  # Read pods (for status/inspection while waiting).
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch"]
+  # Stop the model: delete its Deployment, Service, and PVC.
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    verbs: ["get", "list", "delete"]
+  - apiGroups: [""]
+    resources: ["services", "persistentvolumeclaims"]
+    verbs: ["get", "list", "delete"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: oai-infopt-autostop-rolebinding
+  namespace: oai-infopt
+  labels:
+    app.kubernetes.io/name: oai-infopt-autostop-rolebinding
+    app.kubernetes.io/component: rbac
+    app.kubernetes.io/managed-by: kubectl
+    project: observeai-inference-optimization
+    engagement: shellkode-sow
+    environment: sandbox
+subjects:
+  - kind: ServiceAccount
+    name: oai-infopt-autostop-sa
+    namespace: oai-infopt
+roleRef:
+  kind: Role
+  name: oai-infopt-autostop-role
+  apiGroup: rbac.authorization.k8s.io

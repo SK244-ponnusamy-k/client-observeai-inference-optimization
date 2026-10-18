@@ -1,0 +1,290 @@
+# ==============================================================================
+# inference/concurrency-probe-job.yaml
+#
+# Single fixed-concurrency load probe — reproduces the MANUAL `vllm bench serve`
+# runs we did by hand (g5/g6 128-concurrency investigation), but as a proper
+# in-cluster Job that survives terminal drops and can run in PARALLEL.
+#
+# WHAT IT DOES
+#   Runs ONE `vllm bench serve` against an already-deployed vLLM service at a
+#   single concurrency level and prints the standard summary block:
+#     TTFT (mean/median/p99), TPOT, ITL, request + output-token throughput,
+#     total/mean output tokens, peak concurrent requests.
+#   These are CLIENT-SIDE metrics (measured by the load generator).
+#
+# WHAT IT DOES NOT DO (by design)
+#   Running / Waiting / GPU KV cache % / preemptions are SERVER-SIDE and come
+#   from the vLLM SERVER pod, not this Job. Capture them separately while it runs:
+#     kubectl logs -f <vllm-server-pod> -n oai-infopt --tail=5 \
+#       | grep -E "Running:|Waiting:|GPU KV"
+#     kubectl logs <vllm-server-pod> -n oai-infopt | grep -c -i preempt
+#
+# PARAMETERISED via envsubst — every run gets a UNIQUE name so multiple probes
+# against DIFFERENT services run in parallel. Variables (export before apply):
+#   PROBE_NAME    unique suffix for this run   (e.g. gpt-g5-256)
+#   SERVICE       target vLLM service          (e.g. oai-infopt-vllm-gpt-oss-20b-g5)
+#   SERVED_NAME   served-model-name in request (e.g. gpt-oss-20b)
+#   TOKENIZER     HF tokenizer repo id         (e.g. openai/gpt-oss-20b)
+#   CONCURRENCY   in-flight cap for this probe (e.g. 256)
+#   NUM_PROMPTS   total requests (~10x conc)   (e.g. 2560)
+#   INPUT_LEN / OUTPUT_LEN / RANGE_RATIO / IGNORE_EOS / SEED (match batch_v1)
+#   VLLM_IMAGE / AWS_REGION resolve from config/config.env
+#
+# ── PARALLEL RULE ────────────────────────────────────────────────────────────
+#   Multiple probes may run at once ONLY if they hit DIFFERENT services. Two
+#   probes against the SAME service corrupt each other's numbers (their loads
+#   add up). Run same-service levels SEQUENTIALLY.
+#
+# LAUNCH (example — one run):
+#   export PROBE_NAME=gpt-g5-256 \
+#          SERVICE=oai-infopt-vllm-gpt-oss-20b-g5 \
+#          SERVED_NAME=gpt-oss-20b TOKENIZER=openai/gpt-oss-20b \
+#          CONCURRENCY=256 NUM_PROMPTS=2560 \
+#          INPUT_LEN=1024 OUTPUT_LEN=512 RANGE_RATIO=0.5 IGNORE_EOS=true SEED=42
+#   set -a; source config/config.env; set +a          # for VLLM_IMAGE / AWS_REGION
+#   envsubst < inference/concurrency-probe-job.yaml | kubectl apply -f -
+#
+# READ RESULT (any time; logs kept 24h):
+#   kubectl logs -n oai-infopt job/oai-infopt-probe-${PROBE_NAME} -f
+#
+# CLEAN UP:
+#   kubectl delete -n oai-infopt job/oai-infopt-probe-${PROBE_NAME}
+# ==============================================================================
+
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: oai-infopt-probe-${PROBE_NAME}
+  namespace: oai-infopt
+  labels:
+    app.kubernetes.io/name: oai-infopt-probe-${PROBE_NAME}
+    app.kubernetes.io/component: benchmark-runner
+    app.kubernetes.io/managed-by: kubectl
+    probe: "${PROBE_NAME}"
+    project: observeai-inference-optimization
+    engagement: shellkode-sow
+    environment: sandbox
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 86400   # keep logs/results readable for 24 h
+  activeDeadlineSeconds: 10800     # 3 h hard cap
+
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: oai-infopt-probe-${PROBE_NAME}
+        app.kubernetes.io/component: benchmark-runner
+        probe: "${PROBE_NAME}"
+        project: observeai-inference-optimization
+        engagement: shellkode-sow
+        environment: sandbox
+    spec:
+      restartPolicy: Never
+      serviceAccountName: oai-infopt-benchmark-sa
+      automountServiceAccountToken: false
+
+      hostPID: false
+      hostIPC: false
+      hostNetwork: false
+
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65534
+        runAsGroup: 65534
+        fsGroup: 65534
+        seccompProfile:
+          type: RuntimeDefault
+
+      # Keep the load generator OFF the GPU inference node (latency contamination).
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels:
+                  app.kubernetes.io/component: inference-server
+              topologyKey: kubernetes.io/hostname
+      tolerations: []
+
+      containers:
+        - name: probe
+          image: ${VLLM_IMAGE}
+          imagePullPolicy: IfNotPresent
+
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              set -euo pipefail
+
+              BASE_URL="http://${SERVICE}:8000"
+              echo "=================================================="
+              echo "  Concurrency probe : ${PROBE_NAME}"
+              echo "  Service           : ${SERVICE}"
+              echo "  Served model      : ${SERVED_NAME}"
+              echo "  Tokenizer         : ${TOKENIZER}"
+              echo "  Concurrency       : ${CONCURRENCY}"
+              echo "  Num prompts       : ${NUM_PROMPTS}"
+              echo "  Input/Output      : ${INPUT_LEN} / ${OUTPUT_LEN}  (range ${RANGE_RATIO})"
+              echo "  ignore_eos        : ${IGNORE_EOS}"
+              echo "=================================================="
+
+              EOS_FLAG=""
+              if [ "${IGNORE_EOS}" = "true" ]; then EOS_FLAG="--ignore-eos"; fi
+
+              # Fail fast if SERVICE didn't propagate (empty -> http://:8000 -> InvalidUrl).
+              if [ -z "${SERVICE:-}" ]; then
+                echo "FATAL: SERVICE env is empty; cannot build endpoint URL." >&2
+                exit 1
+              fi
+              echo "Resolved BASE_URL: ${BASE_URL}"
+
+              METRICS_URL="${BASE_URL}/metrics"
+              SAMPLE_FILE="/tmp/server_samples.txt"
+              echo -n "" > "${SAMPLE_FILE}"
+
+              # Background sampler: every 3s fetch the vLLM SERVER /metrics and append
+              # "running waiting kv preemptions" to SAMPLE_FILE. Pure shell (wget/grep/
+              # awk); never fails the parent (all errors swallowed). Captures the
+              # SERVER-SIDE metrics the client bench output does NOT contain.
+              # Fetch tool: prefer curl, then wget, else python3 urllib (always present
+              # in the vLLM image). Whichever exists writes the metrics body to stdout.
+              fetch_metrics() {
+                if command -v curl >/dev/null 2>&1; then
+                  curl -s --max-time 3 "${METRICS_URL}" 2>/dev/null
+                elif command -v wget >/dev/null 2>&1; then
+                  wget -q -O - -T 3 "${METRICS_URL}" 2>/dev/null
+                else
+                  python3 -c "import sys,urllib.request; sys.stdout.write(urllib.request.urlopen('${METRICS_URL}',timeout=3).read().decode())" 2>/dev/null
+                fi
+              }
+              sample_server() {
+                while true; do
+                  BODY=$(fetch_metrics || echo "")
+                  RUN=$(printf '%s\n' "$BODY" | grep '^vllm:num_requests_running' | grep -v '#' | awk 'NR==1{print $2}')
+                  WAIT=$(printf '%s\n' "$BODY" | grep '^vllm:num_requests_waiting' | grep -v '#' | awk 'NR==1{print $2}')
+                  KV=$(printf '%s\n' "$BODY" | grep '^vllm:gpu_cache_usage_perc' | grep -v '#' | awk 'NR==1{print $2}')
+                  PRE=$(printf '%s\n' "$BODY" | grep '^vllm:num_preemptions_total' | grep -v '#' | awk '{s+=$2} END{print s+0}')
+                  echo "${RUN:-0} ${WAIT:-0} ${KV:-0} ${PRE:-0}" >> "${SAMPLE_FILE}"
+                  sleep 3
+                done
+              }
+              sample_server &
+              SAMPLER_PID=$!
+
+              # RESULT_FILE captures the full report so it can be uploaded to S3 and
+              # survives pod cleanup / network drops (the recurring problem with logs).
+              RESULT_FILE="/tmp/probe-${PROBE_NAME}.txt"
+
+              # Use --host/--port (robust) instead of --base-url, which some vllm
+              # versions mis-join with --endpoint and produce a bare '/v1/...' URL.
+              # tee the bench summary into RESULT_FILE as well as stdout.
+              vllm bench serve \
+                --backend openai-chat \
+                --host "${SERVICE}" \
+                --port 8000 \
+                --endpoint /v1/chat/completions \
+                --model "${SERVED_NAME}" \
+                --tokenizer "${TOKENIZER}" \
+                --dataset-name random \
+                --random-input-len "${INPUT_LEN}" \
+                --random-output-len "${OUTPUT_LEN}" \
+                --random-range-ratio "${RANGE_RATIO}" \
+                ${EOS_FLAG} \
+                --max-concurrency "${CONCURRENCY}" \
+                --num-prompts "${NUM_PROMPTS}" \
+                --seed "${SEED}" 2>&1 | tee "${RESULT_FILE}"
+
+              # Stop the sampler and summarise SERVER-SIDE peaks from the samples.
+              kill "${SAMPLER_PID}" 2>/dev/null || true
+              sleep 1
+
+              {
+                echo ""
+                echo "======= SERVER-SIDE METRICS (${PROBE_NAME}) ======="
+                if [ -s "${SAMPLE_FILE}" ]; then
+                  awk '
+                    { if ($1>maxr) maxr=$1; if ($2>maxw) maxw=$2;
+                      kv=$4; if (NR==1) first=$4; last=$4;
+                      kvpct=$3; if (kvpct<=1) kvpct=kvpct*100; if (kvpct>maxkv) maxkv=kvpct;
+                      n++ }
+                    END {
+                      printf "Peak Running reqs        : %d\n", maxr;
+                      printf "Peak Waiting reqs        : %d\n", maxw;
+                      printf "Peak GPU KV cache usage  : %.1f%%\n", maxkv;
+                      printf "Preemptions during run   : %d\n", (last-first);
+                      printf "Samples collected        : %d (every ~3s)\n", n;
+                    }
+                  ' "${SAMPLE_FILE}"
+                else
+                  echo "No server samples captured (metrics endpoint unreachable?)."
+                fi
+                echo "===================================================="
+              } | tee -a "${RESULT_FILE}"
+
+              # Upload the full report to S3 so it survives pod cleanup / network drops.
+              echo "=== Probe ${PROBE_NAME} complete. Client summary + server metrics above. ==="
+
+              # Keep the container ALIVE for 1h after the run so its log stays readable
+              # even on a flaky network / delayed read. Fixes the recurring "No resources
+              # found" (pod cleaned up before it could be read). The full report is also
+              # in RESULT_FILE inside the pod. Delete the job manually once captured:
+              #   kubectl delete job -n oai-infopt oai-infopt-probe-${PROBE_NAME}
+              echo "Holding container 1h. Read the report anytime with:"
+              echo "  kubectl logs -n oai-infopt job/oai-infopt-probe-${PROBE_NAME} | tail -60"
+              sleep 3600
+
+          env:
+            - name: PROBE_NAME
+              value: "${PROBE_NAME}"
+            - name: SERVICE
+              value: "${SERVICE}"
+            - name: SERVED_NAME
+              value: "${SERVED_NAME}"
+            - name: TOKENIZER
+              value: "${TOKENIZER}"
+            - name: CONCURRENCY
+              value: "${CONCURRENCY}"
+            - name: NUM_PROMPTS
+              value: "${NUM_PROMPTS}"
+            - name: INPUT_LEN
+              value: "${INPUT_LEN}"
+            - name: OUTPUT_LEN
+              value: "${OUTPUT_LEN}"
+            - name: RANGE_RATIO
+              value: "${RANGE_RATIO}"
+            - name: IGNORE_EOS
+              value: "${IGNORE_EOS}"
+            - name: SEED
+              value: "${SEED}"
+            - name: HF_HOME
+              value: /tmp/hf
+            - name: AWS_DEFAULT_REGION
+              value: "${AWS_REGION}"
+
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            runAsUser: 65534
+            runAsGroup: 65534
+            capabilities:
+              drop: ["ALL"]
+            seccompProfile:
+              type: RuntimeDefault
+
+          resources:
+            requests:
+              cpu: "2"
+              memory: "4Gi"
+            limits:
+              cpu: "4"
+              memory: "8Gi"
+
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+
+      volumes:
+        - name: tmp
+          emptyDir:
+            sizeLimit: 4Gi

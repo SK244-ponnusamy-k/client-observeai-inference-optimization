@@ -1,0 +1,80 @@
+# ==============================================================================
+# catalog/models/gemma-4-31b-fp8-tp4.yaml
+#
+# FP8 (block-quantized) google/gemma-4-31B-it via the pre-quantized RedHatAI
+# checkpoint, TP=4 variant for 4x 24 GB GPUs (L4 — the g6.12xlarge path).
+#
+# Why TP=4 here: the ~33 GB FP8 weights do NOT fit on a single 24 GB L4, so on
+# the g6 family the model must be split across all 4 GPUs of a .12xlarge. (On
+# 48 GB cards it fits on one GPU — use gemma-4-31b-fp8-tp1 for g6e/g7e.)
+#
+# Shares the SAME FP8 weights as the TP=1 entry via s3_folder, so there is NO
+# second download — run `oai download gemma-4-31b-fp8-tp1` once and both use it.
+#
+# vLLM auto-detects FP8 from the checkpoint's config.json; no --quantization flag.
+#
+# HARDWARE: g6 only (L4, Ada SM89 — has FP8). g5 (A10G, Ampere) is excluded: no
+# FP8 compute on Ampere.
+# ==============================================================================
+
+id: gemma-4-31b-fp8-tp4
+display_name: Gemma 4 31B (Instruction-tuned) - FP8 block, TP4
+
+hardware: gpu
+
+source:
+  hf_id: RedHatAI/gemma-4-31B-it-FP8-block
+  gated: false
+  size_gb: 33
+  s3_folder: gemma-4-31B-it-FP8-block   # SAME weights as the TP=1 entry (shared folder) — no second download
+
+serving:
+  served_name: gemma-4-31b-fp8
+  tokenizer: RedHatAI/gemma-4-31B-it-FP8-block
+  quantization: fp8             # documentation/manifest only; vLLM auto-detects from the checkpoint
+  max_model_len: 32768
+  # L4 is only 24 GB/GPU and vLLM has NO tuned FP8 block kernel for L4, so the
+  # fallback Triton kernel + CUDA-graph capture OOM'd the GPU at 0.90. Lower the
+  # utilization to leave headroom, and run eager (no graph capture) to remove the
+  # capture-time memory spike entirely. Quality is unaffected; only a small
+  # inference-speed cost that does not matter for an accuracy eval.
+  gpu_memory_utilization: 0.80
+  max_num_seqs: 256
+  max_num_batched_tokens: 4096
+  extra_args:
+    - "--trust-remote-code"
+    - "--enable-chunked-prefill"
+    - "--async-scheduling"
+    - "--enforce-eager"            # skip CUDA graph capture — avoids L4 OOM during warmup
+    - "--reasoning-parser=gemma4"
+    - '--default-chat-template-kwargs={\"enable_thinking\": true}'
+
+resources:
+  cpu_request: "8"
+  cpu_limit: "16"
+  # TP=4 means 4 worker processes each stream + materialize FP8 shards during
+  # load; combined with the Runai streamer buffers this OOMKilled (exit 137) at
+  # 120Gi. g6.12xlarge has 192 GB RAM, so give the pod a much larger ceiling.
+  memory_request: "96Gi"
+  memory_limit: "170Gi"
+  vram_gb_required: 40
+
+instances:
+  tensor_parallel_size: 4       # split ~33 GB FP8 across 4x 24 GB L4
+  candidates:
+    - g6.12xlarge               # 4x L4 24 GB (Ada, SM89) — the only 24 GB FP8-capable path
+
+benchmark:
+  auto: false
+  profiles:
+    - configs/workload_profiles/realtime_v1.yaml
+    - configs/workload_profiles/batch_v1.yaml
+  instance_hourly_usd: 6.68     # g6.12xlarge — VERIFY against the load-test.py price book
+
+tags:
+  Project: observeai-inference-optimization
+  Engagement: shellkode-sow
+  Environment: sandbox
+  ManagedBy: oai-cli
+  Owner: TBD
+  CostCenter: TBD

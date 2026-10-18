@@ -1,0 +1,78 @@
+# ==============================================================================
+# catalog/models/gemma-4-31b-opt2.yaml
+#
+# Optimization round 2 CANDIDATE for google/gemma-4-31B-it (dense 31B, bf16, TP=4).
+# Same weights as gemma-4-31b (shares the S3 folder) — deployed side-by-side under
+# its own resource names so it can be A/B'd against the baseline without editing it.
+#
+# What the 24-Sep sweep showed (baseline = gemma-4-31b.yaml):
+#   g5.12xlarge (4x A10G 24 GB): throughput FLAT at ~130 tok/s from C=16 to C=64
+#     with a constant ITL (57.8 ms) while TTFT grows linearly (24 s -> 208 s).
+#     => the running batch is not growing; requests just queue. At
+#        gpu_memory_utilization 0.85 each GPU keeps ~20.4 GB, minus ~15.8 GB of
+#        weights (63 GB / 4) and activations/CUDA graphs => only ~2-3 GB KV per GPU.
+#        KV capacity, not compute, is the ceiling.
+#   g6e.12xlarge (4x L40S 48 GB): 484 tok/s at C=128 AND C=256 (SLO is >=500),
+#     TTFT p95 40 s -> 173 s. ~100 GB of KV is free, so the cap is max_num_seqs=128:
+#     at C=256 half the requests sit in the waiting queue.
+#
+# Changes vs baseline (one knob per bottleneck):
+#   gpu_memory_utilization 0.85 -> 0.92   ~+1.7x KV blocks on 24 GB cards (g5/g6)
+#   max_num_seqs           128  -> 256    lets g6e actually run C=256 concurrently
+#   prefix caching         on   -> off    matches the gpt-oss/Qwen policy so rows are
+#                                         comparable (random dataset => ~0 hits anyway)
+#
+# Deliberately NOT changed (each needs its own A/B, noted in CHANGELOG):
+#   --kv-cache-dtype fp8   : would ~2x KV again, but Ampere (g5/A10G) has no FP8 and
+#                            the attention backend may refuse it at startup.
+#   --async-scheduling     : unverified with Gemma4's multimodal path at TP=4.
+#
+# STATUS: untested candidate — benchmark on g6e.12xlarge and g5.12xlarge, compare
+# against gemma-4-31b, then fold the winning knobs into gemma-4-31b.yaml.
+# ==============================================================================
+
+id: gemma-4-31b-opt2
+display_name: Gemma 4 31B (Instruction-tuned) - opt2 candidate
+hardware: gpu
+
+source:
+  hf_id: google/gemma-4-31B-it
+  gated: true                   # accept license at https://huggingface.co/google/gemma-4-31B-it
+  size_gb: 63
+  s3_folder: gemma-4-31B-it      # SAME weights as gemma-4-31b — no second download needed
+
+serving:
+  served_name: gemma-4-31b-opt2
+  tokenizer: google/gemma-4-31B-it
+  quantization: none            # dense bf16
+  max_model_len: 8192
+  gpu_memory_utilization: 0.92  # was 0.85 — KV capacity is the g5/g6 ceiling
+  max_num_seqs: 256             # was 128 — g6e has KV headroom for C=256
+  # Gemma4's vision encoder forces vLLM to disable chunked MM input, which
+  # requires max_num_batched_tokens >= the model's per-image token budget (2496).
+  max_num_batched_tokens: 4096
+  extra_args:
+    - "--trust-remote-code"       # required by the gemma4 model code
+    - "--enable-chunked-prefill"
+    - "--no-enable-prefix-caching" # was --enable-prefix-caching; comparable numbers
+
+resources:
+  cpu_request: "8"
+  cpu_limit: "16"
+  memory_request: "96Gi"
+  memory_limit: "170Gi"
+  vram_gb_required: 70
+
+instances:
+  tensor_parallel_size: 4
+  candidates:
+    - g6e.12xlarge              # 4x L40S 48 GB — primary target (SLO miss by 16 tok/s)
+    - g5.12xlarge               # 4x A10G 24 GB — KV-starved in baseline
+    - g6.12xlarge               # 4x L4 24 GB
+
+benchmark:
+  auto: false
+  profiles:
+    - configs/workload_profiles/realtime_v1.yaml
+    - configs/workload_profiles/batch_v1.yaml
+  instance_hourly_usd: 10.6032  # g6e.12xlarge, matches the load-test.py price book — VERIFY before run

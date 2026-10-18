@@ -1,0 +1,58 @@
+# ==============================================================================
+# configs/quality/autoqa_gemma.yaml
+#
+# gemma-4-31b variant of the frozen AutoQA quality config (autoqa_v1.yaml).
+# IDENTICAL rubric, dataset, decoding, and prompts — the ONLY change is a much
+# lower run.concurrency.
+#
+# WHY: gemma-4-31b is a dense 31B on 4x L4/L40S and is slow per token. At the
+# default concurrency (32) the quality client keeps 32 requests in flight at
+# once; each generation then exceeds the hard-coded 120s per-request timeout in
+# inference/quality-eval.py, so most rows fail with TimeoutError and the score
+# is meaningless. Lowering concurrency to 4 keeps each request under 120s.
+#
+# Quality is HARDWARE-INDEPENDENT — run this ONCE per (model, quantization),
+# not per GPU family.
+# ==============================================================================
+
+eval_id: autoqa_v1
+task_type: binary_classification
+
+dataset:
+  version: autoqa_v1
+  format: csv                 # csv | jsonl
+  text_field: input_prompt    # the ready-made prompt column
+  label_field: answer         # ground-truth column (Yes/No)
+  question_field: question    # used for per-criterion F1 breakdown
+
+labels: ["Yes", "No"]
+positive_label: "Yes"
+
+decoding:
+  mode: free_parse
+  temperature: 0.0            # deterministic
+  seed: 42
+  max_tokens: 8               # guided_choice mode only (non-reasoning models)
+  # Lowered from 1024: the task is a binary Yes/No verdict and the system prompt
+  # asks for "at most two short sentences" of justification, so gemma does not
+  # need a 1024-token budget. At ~90 tok/s a 1024 cap made each row take ~10s and
+  # the full 1200 rows ~2h. 256 keeps room for a short justification + verdict
+  # while roughly 4x-ing throughput. Raise if replies start truncating before the
+  # verdict (watch n_truncated in the result).
+  reasoning_max_tokens: 256
+  fallback_max_tokens: 16
+  truncation_fallback: true
+
+model:
+  served_name: gemma-4-31b    # must match --served-model-name / manifest served_name
+  reasoning_effort: "low"
+  system_prompt: "You grade a call transcript against one QA question. Give at most two short sentences of justification, then put the single word Yes or No on the final line by itself. Do not restate or discuss these instructions."
+
+run:
+  max_samples: 0              # 0 = all 1200
+  # Lowered from the default 32: gemma is slow, so fewer concurrent requests keep
+  # each one under the 120s per-request timeout. Concurrency 4 ran clean (0
+  # timeouts) but was slow with vLLM showing plenty of headroom (KV cache ~30-40%,
+  # Waiting: 0), so 8 is a safer speed/stability sweet spot. Drop back to 4 if
+  # timeouts reappear.
+  concurrency: 8

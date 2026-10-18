@@ -1,0 +1,55 @@
+# ==============================================================================
+# configs/manifests/gemma-4-31b-gpu.yaml  - single DYNAMIC GPU manifest
+#
+# ONE manifest for google/gemma-4-31B-it (bf16, no quant) across ALL 4-GPU
+# NVIDIA G instances (g6.12xlarge / g6e.12xlarge / g7e.12xlarge / g7e.24xlarge,
+# etc.). The actual instance is chosen at deploy time via `--hw`; instance_type,
+# cost, and node placement resolve DYNAMICALLY (OAI_INSTANCE_TYPE from --hw →
+# EC2 price book in load-test.py). serving.instance_type is only a FALLBACK label.
+#
+# gemma-4-31b is a DENSE 31B (~63 GB bf16) — it needs 4 GPUs (TP=4). The deploy
+# preflight (tools/oai/instances.check_tp_fits) blocks any --hw with < 4 GPUs, so
+# a 1-GPU instance is rejected up front rather than OOMing. Use a .12xlarge/.24xlarge.
+# Every field is read by inference/load-test.py.
+# ==============================================================================
+run_id: gemma-4-31b-gpu-2026-09-18-001
+description: "google/gemma-4-31B-it none, any 4-GPU NVIDIA G instance (TP=4)"
+
+model:
+  hf_id: google/gemma-4-31B-it
+  served_name: gemma-4-31b
+  tokenizer: google/gemma-4-31B-it
+  s3_prefix: gemma-4-31B-it/
+  source: eks_gpu
+
+serving:
+  image: public.ecr.aws/deep-learning-containers/vllm:0.26.0-gpu-py312-cu130-ubuntu22.04-ec2-v1.0-soci@sha256:e70d649d964dd0b568669453df523e764d23933987ea378d0f423cbe4ae56b81
+  # Fallback default only (a 4-GPU node). Real instance comes from --hw.
+  instance_type: g6e.12xlarge
+
+optimization_variants:
+  - label: none-gpu-tp4
+    quantization: none
+    tensor_parallel_size: 4
+    max_num_seqs: 128
+    max_num_batched_tokens: 4096
+    max_model_len: 8192
+    kv_cache_dtype: auto
+
+benchmark:
+  workload_profiles:
+    - configs/workload_profiles/realtime_v1.yaml
+    - configs/workload_profiles/batch_v1.yaml
+
+# cost.instance_hourly_usd is resolved DYNAMICALLY at run time from the deployed
+# instance (OAI_INSTANCE_TYPE / serving.instance_type) against the EC2 price book
+# in load-test.py. Set an explicit value here ONLY to override (spot, savings plan).
+
+tags:
+  Project: observeai-inference-optimization
+  Engagement: shellkode-sow
+  Environment: sandbox
+  ManagedBy: oai-cli
+  Owner: TBD
+  CostCenter: TBD
+  RunId: gemma-4-31b-gpu-2026-09-18-001

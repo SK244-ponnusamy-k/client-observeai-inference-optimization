@@ -1,0 +1,77 @@
+# ==============================================================================
+# configs/quality/autoqa_xl.yaml
+#
+# Test-XL variant of the frozen AutoQA quality config (autoqa_v1.yaml).
+#
+# SAME rubric, labels, decoding mode, prompts and parsing as autoqa_v1.yaml. The
+# ONLY differences are:
+#   * dataset.version  -> autoqa_xl  (keeps XL results in their OWN result files
+#                         and per-question breakdowns, separate from Test-ORG)
+#   * run.concurrency  -> lowered    (XL prompts are 2k-7k tokens and bundle
+#                         several calls per row, so each request is far slower to
+#                         prefill; fewer in flight keeps each under the 120s
+#                         per-request timeout in inference/quality-eval.py)
+#
+# Test-XL and Test-ORG are compared SEPARATELY (lead's instruction): run each as
+# its own quality Job and never merge their metrics. The oai wrapper does this by
+# pairing this config with the XL dataset key and its own result tag.
+#
+# The task is still a binary Yes/No verdict, so the OUTPUT token budgets are
+# unchanged from autoqa_v1.yaml — only the INPUT is larger. Accuracy is
+# HARDWARE-INDEPENDENT: run this ONCE per (model, quantization), not per GPU.
+# ==============================================================================
+
+eval_id: autoqa_xl
+task_type: binary_classification
+
+dataset:
+  version: autoqa_xl          # distinct from autoqa_v1 -> separate result files
+  format: csv                 # csv | jsonl
+  text_field: input_prompt    # the ready-made prompt column sent to the model
+  label_field: answer         # ground-truth column (Yes/No)
+  question_field: question    # full rubric question (fallback grouping key)
+  # Same QID column as Test-ORG. Grouping by QID is what lets the two sheets'
+  # per-question breakdowns be compared question-for-question.
+  question_id_field: question_id
+  # --- Multi-sheet .xlsx source ----------------------------------------------
+  # Same workbook as Test-ORG; only the worksheet differs. The prompt is the
+  # prebuilt input_prompt column verbatim (transcript_field left empty), so the
+  # larger XL prompts are sent exactly as authored.
+  transcript_field: ""                     # empty -> use input_prompt as-is
+  sheet: synthetic_autoqa_transcripts-v2   # Test-XL worksheet (overridden by --sheet)
+  qid_sheet: QIDs
+  qid_id_column: "Question Id"
+  qid_text_column: "Question Text"
+
+labels: ["Yes", "No"]
+positive_label: "Yes"
+
+decoding:
+  mode: free_parse
+  temperature: 0.0            # deterministic
+  seed: 42
+  max_tokens: 8               # guided_choice mode only (non-reasoning models)
+  # OUTPUT budget only — identical to autoqa_v1.yaml. The verdict is still a
+  # single Yes/No with at most two short sentences of justification; the larger
+  # XL prompt does not change how much the model needs to GENERATE. Raise only if
+  # replies start truncating before the verdict (watch n_truncated in the result).
+  reasoning_max_tokens: 1024
+  fallback_max_tokens: 16
+  truncation_fallback: true
+
+model:
+  served_name: gpt-oss-20b    # must match --served-model-name / manifest served_name
+  reasoning_effort: "low"     # gpt-oss: keep CoT short/cheap for a Yes/No verdict; "" = omit
+  system_prompt: "You grade a call transcript against one QA question. Give at most two short sentences of justification, then put the single word Yes or No on the final line by itself. Do not restate or discuss these instructions."
+  # Qwen3 enables thinking by default; uncomment to turn it off for that model.
+  # chat_template_kwargs:
+  #   enable_thinking: false
+
+run:
+  max_samples: 0              # 0 = all rows in the XL sheet
+  # Lowered from autoqa_v1.yaml's 32: XL prompts are 2k-7k tokens (some rows
+  # bundle several calls), so prefill dominates and each request is slow. Fewer
+  # concurrent requests keep each one under the 120s per-request timeout while
+  # still using vLLM continuous batching. Drop to 8 if timeouts appear; raise
+  # toward 32 if the endpoint has clear headroom.
+  concurrency: 16

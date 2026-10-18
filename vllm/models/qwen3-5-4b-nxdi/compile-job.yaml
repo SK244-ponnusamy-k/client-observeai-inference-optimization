@@ -1,0 +1,258 @@
+# ==============================================================================
+# vllm/models/qwen3-5-4b-nxdi/compile-job.yaml
+#
+# Traces/shards Qwen/Qwen3.5-4B (hybrid DeltaNet + GQA) to a Neuron NxDI artifact
+# via the vendored reference modeling code (src/modeling_qwen35.py + NKI kernels)
+# driven by compile.py. The artifact is cached in S3 so serving does not
+# recompile every run. Compile parameters are LOCKED at compile time — changing
+# QWEN35_SEQ_LEN / TP / batch / LNC requires a full recompile.
+#
+# Code (src/, compile.py, server.py) is mounted from ConfigMaps created by
+# deploy.sh (--from-file), matching this repo's ConfigMap-for-app-code pattern.
+#
+# Runtime values injected via envsubst by deploy.sh:
+#   ${BENCHMARK_NAMESPACE} ${DOWNLOAD_SERVICE_ACCOUNT} ${MODEL_BUCKET}
+#   ${AWS_REGION} ${S3_BUCKET_REGION} ${NEURON_NXDI_IMAGE} ${SOURCE_FOLDER}
+#   ${COMPILED_FOLDER} ${QWEN35_SEQ_LEN} ${QWEN35_MAX_BATCH_SIZE}
+#   ${QWEN35_TP_DEGREE} ${QWEN35_LOGICAL_NC_CONFIG} ${QWEN35_TORCH_DTYPE}
+#   ${QWEN35_TOP_K_ON_DEVICE} ${NEURON_CORES} ${NEURON_DEVICE_COUNT}
+#   ${COMPILE_NODE_SELECTOR_KEY} ${COMPILE_NODE_SELECTOR_VALUE}
+# ==============================================================================
+
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: oai-infopt-nxdi-compile-qwen3-5-4b-nxdi
+  namespace: ${BENCHMARK_NAMESPACE}
+  labels:
+    app.kubernetes.io/name: oai-infopt-nxdi-compile-qwen3-5-4b-nxdi
+    app.kubernetes.io/component: nxdi-compile
+    app.kubernetes.io/managed-by: oai-cli
+    project: observeai-inference-optimization
+    engagement: shellkode-sow
+    environment: sandbox
+    model: qwen3-5-4b-nxdi
+spec:
+  backoffLimit: 1
+  activeDeadlineSeconds: 43200
+  ttlSecondsAfterFinished: 3600
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: oai-infopt-nxdi-compile-qwen3-5-4b-nxdi
+        app.kubernetes.io/component: nxdi-compile
+        project: observeai-inference-optimization
+        engagement: shellkode-sow
+        environment: sandbox
+        model: qwen3-5-4b-nxdi
+    spec:
+      restartPolicy: Never
+      serviceAccountName: ${DOWNLOAD_SERVICE_ACCOUNT}
+      automountServiceAccountToken: false
+      hostPID: false
+      hostIPC: false
+      hostNetwork: false
+      nodeSelector:
+        ${COMPILE_NODE_SELECTOR_KEY}: ${COMPILE_NODE_SELECTOR_VALUE}
+      tolerations:
+        - key: aws.amazon.com/neuron
+          operator: Exists
+          effect: NoSchedule
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      initContainers:
+        - name: model-sync
+          image: amazon/aws-cli:2.15.0
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              set -euo pipefail
+              echo "Syncing bf16 weights s3://${MODEL_BUCKET}/${SOURCE_FOLDER}/ -> /model/"
+              aws s3 sync "s3://${MODEL_BUCKET}/${SOURCE_FOLDER}/" /model/ \
+                --region "${S3_BUCKET_REGION}" --no-progress
+              test -f /model/config.json && echo "config.json OK" || { echo "ERROR: config.json missing"; exit 1; }
+          env:
+            - name: AWS_DEFAULT_REGION
+              value: "${AWS_REGION}"
+            - name: S3_BUCKET_REGION
+              value: "${S3_BUCKET_REGION}"
+            - name: MODEL_BUCKET
+              value: "${MODEL_BUCKET}"
+            - name: SOURCE_FOLDER
+              value: "${SOURCE_FOLDER}"
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: false
+            runAsNonRoot: true
+            runAsUser: 1000
+            runAsGroup: 1000
+            capabilities:
+              drop: ["ALL"]
+            seccompProfile:
+              type: RuntimeDefault
+          resources:
+            requests:
+              cpu: "4"
+              memory: "16Gi"
+            limits:
+              cpu: "8"
+              memory: "32Gi"
+          volumeMounts:
+            - name: model-weights
+              mountPath: /model
+        # Assemble the Python package layout (/app/{compile.py,server.py,src/,
+        # src/nki_kernels/}) from the flat ConfigMap mounts into a writable
+        # emptyDir. ConfigMap keys cannot contain "/", so we stage each level
+        # separately and copy it into place here.
+        - name: code-assemble
+          image: amazon/aws-cli:2.15.0
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              set -euo pipefail
+              mkdir -p /app/src/nki_kernels
+              cp /staging/code/* /app/
+              cp /staging/src/* /app/src/
+              cp /staging/nki/* /app/src/nki_kernels/
+              echo "Assembled /app:"; find /app -name '*.py' | sort
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: false
+            runAsNonRoot: true
+            runAsUser: 1000
+            runAsGroup: 1000
+            capabilities:
+              drop: ["ALL"]
+            seccompProfile:
+              type: RuntimeDefault
+          resources:
+            requests:
+              cpu: "1"
+              memory: "256Mi"
+            limits:
+              cpu: "2"
+              memory: "512Mi"
+          volumeMounts:
+            - name: app
+              mountPath: /app
+            - name: stage-code
+              mountPath: /staging/code
+            - name: stage-src
+              mountPath: /staging/src
+            - name: stage-nki
+              mountPath: /staging/nki
+      containers:
+        - name: nxdi-compile
+          image: ${NEURON_NXDI_IMAGE}
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              set -euo pipefail
+              echo "[1/3] Checking S3 artifact cache: s3://${MODEL_BUCKET}/${COMPILED_FOLDER}/"
+              if aws s3 ls "s3://${MODEL_BUCKET}/${COMPILED_FOLDER}/" --region "${S3_BUCKET_REGION}" 2>/dev/null | grep -q .; then
+                echo "Compiled artifact already present — skipping recompile."
+                echo "Force recompile: aws s3 rm s3://${MODEL_BUCKET}/${COMPILED_FOLDER}/ --recursive"
+                exit 0
+              fi
+              echo "[2/3] Running NxDI compile (tp=${QWEN35_TP_DEGREE} seq_len=${QWEN35_SEQ_LEN} batch=${QWEN35_MAX_BATCH_SIZE})..."
+              cd /app
+              python3 compile.py
+              echo "[3/3] Uploading artifact to S3..."
+              aws s3 sync /compiled/ "s3://${MODEL_BUCKET}/${COMPILED_FOLDER}/" \
+                --region "${S3_BUCKET_REGION}" --no-progress
+              echo "Compile complete. Artifact at s3://${MODEL_BUCKET}/${COMPILED_FOLDER}/"
+          env:
+            - name: AWS_DEFAULT_REGION
+              value: "${AWS_REGION}"
+            - name: S3_BUCKET_REGION
+              value: "${S3_BUCKET_REGION}"
+            - name: MODEL_BUCKET
+              value: "${MODEL_BUCKET}"
+            - name: COMPILED_FOLDER
+              value: "${COMPILED_FOLDER}"
+            - name: HOME
+              value: "/tmp"
+            - name: NEURONX_CACHE
+              value: "/tmp/neuronx_cache"
+            - name: QWEN35_MODEL_PATH
+              value: "/model"
+            - name: QWEN35_COMPILED_PATH
+              value: "/compiled"
+            - name: QWEN35_SEQ_LEN
+              value: "${QWEN35_SEQ_LEN}"
+            - name: QWEN35_MAX_BATCH_SIZE
+              value: "${QWEN35_MAX_BATCH_SIZE}"
+            - name: QWEN35_TP_DEGREE
+              value: "${QWEN35_TP_DEGREE}"
+            - name: QWEN35_LOGICAL_NC_CONFIG
+              value: "${QWEN35_LOGICAL_NC_CONFIG}"
+            - name: QWEN35_TORCH_DTYPE
+              value: "${QWEN35_TORCH_DTYPE}"
+            - name: QWEN35_TOP_K_ON_DEVICE
+              value: "${QWEN35_TOP_K_ON_DEVICE}"
+            - name: NEURON_RT_NUM_CORES
+              value: "${NEURON_CORES}"
+            - name: NEURON_LOGICAL_NC_CONFIG
+              value: "${QWEN35_LOGICAL_NC_CONFIG}"
+          securityContext:
+            allowPrivilegeEscalation: false
+            # false: neuronx-cc writes compile artifacts to the filesystem.
+            readOnlyRootFilesystem: false
+            runAsNonRoot: true
+            runAsUser: 1000
+            runAsGroup: 1000
+            capabilities:
+              drop: ["ALL"]
+            seccompProfile:
+              type: RuntimeDefault
+          resources:
+            requests:
+              cpu: "4"
+              memory: "24Gi"
+              aws.amazon.com/neuron: "${NEURON_DEVICE_COUNT}"
+            limits:
+              cpu: "10"
+              memory: "96Gi"
+              aws.amazon.com/neuron: "${NEURON_DEVICE_COUNT}"
+          volumeMounts:
+            - name: model-weights
+              mountPath: /model
+            - name: compiled
+              mountPath: /compiled
+            - name: app
+              mountPath: /app
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: model-weights
+          emptyDir:
+            sizeLimit: 60Gi
+        - name: compiled
+          emptyDir:
+            sizeLimit: 60Gi
+        - name: app
+          emptyDir:
+            sizeLimit: 16Mi
+        - name: stage-code
+          configMap:
+            name: oai-infopt-nxdi-code-qwen3-5-4b-nxdi
+            defaultMode: 0444
+        - name: stage-src
+          configMap:
+            name: oai-infopt-nxdi-src-qwen3-5-4b-nxdi
+            defaultMode: 0444
+        - name: stage-nki
+          configMap:
+            name: oai-infopt-nxdi-nki-qwen3-5-4b-nxdi
+            defaultMode: 0444
+        - name: tmp
+          emptyDir:
+            sizeLimit: 100Gi

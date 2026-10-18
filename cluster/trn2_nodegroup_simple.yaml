@@ -1,0 +1,25 @@
+apiVersion: eksctl.io/v1alpha5
+kind: ClusterConfig
+metadata:
+  name: ai-eks-cluster
+  region: us-east-2
+  version: "1.36"
+iam:
+  withOIDC: true
+managedNodeGroups:
+  - name: trn2-48xl-simple
+    instanceType: trn2.48xlarge
+    amiFamily: AmazonLinux2023
+    minSize: 0
+    desiredCapacity: 1
+    maxSize: 1
+    spot: true
+    subnets:
+      - subnet-06aba69e5fc5abfd1
+    volumeSize: 500
+    privateNetworking: true
+    labels:
+      aws.amazon.com/neuron: "true"
+    taints:
+      - key: aws.amazon.com/neuron
+        effect: NoSchedule

@@ -1,0 +1,153 @@
+# ==============================================================================
+# model-download/qwen3.5-4b/job.yaml
+#
+# Kubernetes Job: downloads Qwen/Qwen3.5-4B from HuggingFace → S3.
+# PUBLIC model — HF token NOT required (mounted read-only if present).
+#
+# Runtime values injected via envsubst by download.sh:
+#   ${MODEL_BUCKET}  ${AWS_REGION}  ${DOWNLOAD_SERVICE_ACCOUNT}  ${BENCHMARK_NAMESPACE}
+#
+# Security hardening: non-root 65534, readOnlyRootFilesystem, drop ALL caps,
+# no privilege escalation, automountServiceAccountToken false, seccomp RuntimeDefault,
+# CPU/mem requests+limits, HF token as optional Secret volume (not env).
+# ==============================================================================
+
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: oai-infopt-download-qwen3-5-4b
+  namespace: ${BENCHMARK_NAMESPACE}
+  labels:
+    app.kubernetes.io/name: oai-infopt-download-qwen3-5-4b
+    app.kubernetes.io/component: model-download
+    app.kubernetes.io/managed-by: kubectl
+    project: observeai-inference-optimization
+    engagement: shellkode-sow
+    environment: sandbox
+    model: qwen3-5-4b
+spec:
+  backoffLimit: 2
+  activeDeadlineSeconds: 21600
+  ttlSecondsAfterFinished: 3600
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: oai-infopt-download-qwen3-5-4b
+        app.kubernetes.io/component: model-download
+        project: observeai-inference-optimization
+        engagement: shellkode-sow
+        environment: sandbox
+        model: qwen3-5-4b
+    spec:
+      restartPolicy: Never
+      serviceAccountName: ${DOWNLOAD_SERVICE_ACCOUNT}
+      automountServiceAccountToken: false
+      hostPID: false
+      hostIPC: false
+      hostNetwork: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65534
+        runAsGroup: 65534
+        fsGroup: 65534
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: downloader
+          image: python:3.11-slim@sha256:d1053354624536b044162aaab1e418bd000ea35184fb1ae098ab3166b1072e72
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              set -euo pipefail
+              MODEL_ID="Qwen/Qwen3.5-4B"
+              MODEL_FOLDER="Qwen3.5-4B"
+              LOCAL_DIR="/tmp/${MODEL_FOLDER}"
+              echo "Model  : ${MODEL_ID}"
+              echo "Bucket : s3://${MODEL_BUCKET}/${MODEL_FOLDER}/"
+              echo "Installing dependencies..."
+              pip install --quiet --no-cache-dir --target /tmp/pip-packages \
+                  huggingface_hub==0.24.7 boto3==1.34.0
+              export PYTHONPATH="/tmp/pip-packages:${PYTHONPATH:-}"
+              echo "Downloading from HuggingFace (public model)..."
+              python3 -c "
+              import os
+              from huggingface_hub import snapshot_download
+              token = None
+              try:
+                  with open('/var/secrets/hf/token') as f:
+                      token = f.read().strip() or None
+              except FileNotFoundError:
+                  pass
+              snapshot_download(
+                  repo_id='${MODEL_ID}',
+                  local_dir='${LOCAL_DIR}',
+                  token=token,
+                  ignore_patterns=['*.msgpack','*.h5','flax_*','tf_*','rust_*'],
+              )
+              print('HF download complete.')
+              "
+              echo "Files downloaded:"; ls -lah "${LOCAL_DIR}/"
+              echo "Uploading to s3://${MODEL_BUCKET}/${MODEL_FOLDER}/ ..."
+              python3 << 'PYEOF'
+              import boto3, os
+              from pathlib import Path
+              s3 = boto3.client("s3", region_name=os.environ["AWS_DEFAULT_REGION"])
+              bucket = os.environ["MODEL_BUCKET"]
+              folder = "Qwen3.5-4B"
+              local_dir = Path(f"/tmp/{folder}")
+              files = [f for f in local_dir.rglob("*") if f.is_file() and ".cache" not in f.parts]
+              print(f"Uploading {len(files)} files...")
+              for i, f in enumerate(files, 1):
+                  key = f"{folder}/" + str(f.relative_to(local_dir))
+                  print(f"[{i}/{len(files)}] {f.name} ({f.stat().st_size/1_048_576:.1f} MB)")
+                  s3.upload_file(str(f), bucket, key)
+              print("Upload complete.")
+              PYEOF
+          env:
+            - name: AWS_DEFAULT_REGION
+              value: "${AWS_REGION}"
+            - name: MODEL_BUCKET
+              value: "${MODEL_BUCKET}"
+            - name: HF_HUB_DISABLE_TELEMETRY
+              value: "1"
+            - name: HF_HUB_DISABLE_XET
+              value: "1"
+            - name: TRANSFORMERS_CACHE
+              value: "/tmp/hf-cache"
+            - name: HF_HOME
+              value: "/tmp/hf-home"
+            - name: PIP_NO_CACHE_DIR
+              value: "1"
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            runAsUser: 65534
+            runAsGroup: 65534
+            capabilities:
+              drop: ["ALL"]
+            seccompProfile:
+              type: RuntimeDefault
+          resources:
+            requests:
+              cpu: "2"
+              memory: "8Gi"
+            limits:
+              cpu: "4"
+              memory: "16Gi"
+          volumeMounts:
+            - name: tmp-workspace
+              mountPath: /tmp
+            - name: hf-token-vol
+              mountPath: /var/secrets/hf
+              readOnly: true
+      volumes:
+        - name: tmp-workspace
+          emptyDir:
+            sizeLimit: 30Gi
+        - name: hf-token-vol
+          secret:
+            secretName: hf-token
+            optional: true
+            defaultMode: 0440

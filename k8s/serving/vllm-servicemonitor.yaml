@@ -1,0 +1,38 @@
+# ==============================================================================
+# k8s/serving/vllm-servicemonitor.yaml
+#
+# ServiceMonitor — tells Prometheus to scrape vLLM /metrics on port 8000.
+# Targets all pods in oai-infopt namespace with component=inference-server.
+#
+# Apply:
+#   kubectl apply -f k8s/serving/vllm-servicemonitor.yaml
+# ==============================================================================
+
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: vllm-inference
+  namespace: monitoring          # must be in monitoring ns for Prometheus to discover
+  labels:
+    release: kube-prometheus-stack   # matches Prometheus operator selector
+    app.kubernetes.io/name: vllm-inference
+    project: observeai-inference-optimization
+spec:
+  namespaceSelector:
+    matchNames:
+      - oai-infopt                   # scrape pods in this namespace
+  selector:
+    matchLabels:
+      app.kubernetes.io/component: inference-server
+  endpoints:
+    - port: http
+      path: /metrics
+      interval: 15s
+      scrapeTimeout: 10s
+      relabelings:
+        - sourceLabels: [__meta_kubernetes_pod_label_model]
+          targetLabel: model_name
+        - sourceLabels: [__meta_kubernetes_namespace]
+          targetLabel: namespace
+        - sourceLabels: [__meta_kubernetes_pod_name]
+          targetLabel: pod

@@ -1,0 +1,111 @@
+# ==============================================================================
+# monitoring/values/dcgm-exporter-values.yaml
+#
+# Helm values for nvidia/dcgm-exporter.
+# Applied by setup-monitoring.sh — no variable substitution needed here.
+#
+# Key design decisions:
+#   - nodeSelector targets GPU nodes only (eks.amazonaws.com/instance-gpu-manufacturer: nvidia)
+#   - tolerations allow scheduling on nvidia.com/gpu:NoSchedule tainted nodes
+#   - serviceMonitor with release: kube-prometheus-stack label makes Prometheus
+#     discover and scrape this exporter automatically
+#   - customMetrics extends the default set with NVLink, tensor, PCIe, ECC,
+#     and throttle metrics — useful for LLM inference workload analysis
+# ==============================================================================
+
+resources:
+  requests:
+    memory: "512Mi"
+    cpu: "100m"
+  limits:
+    memory: "1Gi"
+    cpu: "500m"
+
+# ServiceMonitor — auto-discovered by kube-prometheus-stack Prometheus
+serviceMonitor:
+  enabled: true
+  additionalLabels:
+    release: kube-prometheus-stack   # must match Prometheus operator selector
+
+# Only schedule on GPU nodes (EKS Auto Mode label)
+nodeSelector:
+  eks.amazonaws.com/instance-gpu-manufacturer: nvidia
+
+# Allow scheduling on GPU-tainted nodes
+tolerations:
+  - key: "nvidia.com/gpu"
+    operator: "Exists"
+    effect: "NoSchedule"
+
+# Extended metric set — covers all LLM inference observability dimensions:
+#   Utilization, memory, temperature, power, NVLink, tensor activity,
+#   PCIe throughput, ECC errors, throttling, retired pages
+customMetrics: |
+  # Clocks
+  DCGM_FI_DEV_SM_CLOCK,  gauge, SM clock frequency (in MHz).
+  DCGM_FI_DEV_MEM_CLOCK, gauge, Memory clock frequency (in MHz).
+
+  # Temperature
+  DCGM_FI_DEV_MEMORY_TEMP, gauge, Memory temperature (in C).
+  DCGM_FI_DEV_GPU_TEMP,    gauge, GPU temperature (in C).
+
+  # Power
+  DCGM_FI_DEV_POWER_USAGE,              gauge,   Power draw (in W).
+  DCGM_FI_DEV_TOTAL_ENERGY_CONSUMPTION, counter, Total energy consumption since boot (in mJ).
+
+  # PCIe
+  DCGM_FI_PROF_PCIE_TX_BYTES,       counter, Bytes transmitted through PCIe TX (in KB).
+  DCGM_FI_PROF_PCIE_RX_BYTES,       counter, Bytes received through PCIe RX (in KB).
+  DCGM_FI_DEV_PCIE_REPLAY_COUNTER,  counter, Total number of PCIe retries.
+
+  # Utilization
+  DCGM_FI_DEV_GPU_UTIL,      gauge, GPU utilization (in %).
+  DCGM_FI_DEV_MEM_COPY_UTIL, gauge, Memory utilization (in %).
+  DCGM_FI_DEV_ENC_UTIL,      gauge, Encoder utilization (in %).
+  DCGM_FI_DEV_DEC_UTIL,      gauge, Decoder utilization (in %).
+
+  # Errors and throttling violations
+  DCGM_FI_DEV_XID_ERRORS,            gauge,   Last XID error value.
+  DCGM_EXP_XID_ERRORS_COUNT,         gauge,   Count of XID errors.
+  DCGM_FI_DEV_POWER_VIOLATION,       counter, Throttle duration — power (us).
+  DCGM_FI_DEV_THERMAL_VIOLATION,     counter, Throttle duration — thermal (us).
+  DCGM_FI_DEV_SYNC_BOOST_VIOLATION,  counter, Throttle duration — sync-boost (us).
+  DCGM_FI_DEV_BOARD_LIMIT_VIOLATION, counter, Throttle duration — board limit (us).
+  DCGM_FI_DEV_LOW_UTIL_VIOLATION,    counter, Throttle duration — low utilization (us).
+  DCGM_FI_DEV_RELIABILITY_VIOLATION, counter, Throttle duration — reliability (us).
+  DCGM_FI_DEV_CLOCK_THROTTLE_REASONS, gauge,  Clock throttle reasons bitmask.
+
+  # Framebuffer memory
+  DCGM_FI_DEV_FB_FREE, gauge, Framebuffer memory free (in MiB).
+  DCGM_FI_DEV_FB_USED, gauge, Framebuffer memory used (in MiB).
+
+  # Retired pages
+  DCGM_FI_DEV_RETIRED_SBE,     counter, Retired pages — single-bit errors.
+  DCGM_FI_DEV_RETIRED_DBE,     counter, Retired pages — double-bit errors.
+  DCGM_FI_DEV_RETIRED_PENDING, counter, Pages pending retirement.
+
+  # NVLink
+  DCGM_FI_DEV_NVLINK_BANDWIDTH_TOTAL, counter, Total NVLink bandwidth (all lanes).
+  DCGM_FI_DEV_NVLINK_BANDWIDTH_L0,    counter, NVLink bandwidth lane 0.
+  DCGM_FI_PROF_NVLINK_TX_BYTES,       counter, NVLink TX bytes/s (no protocol headers).
+  DCGM_FI_PROF_NVLINK_RX_BYTES,       counter, NVLink RX bytes/s (no protocol headers).
+  DCGM_FI_DEV_GPU_NVLINK_ERRORS,      gauge,   GPU NVLink error type.
+
+  # Profiling — SM, tensor, DRAM, FP pipelines
+  DCGM_FI_PROF_GR_ENGINE_ACTIVE,   gauge, Graphics engine active ratio.
+  DCGM_FI_PROF_SM_ACTIVE,          gauge, SM active ratio (at least 1 warp assigned).
+  DCGM_FI_PROF_SM_OCCUPANCY,       gauge, SM occupancy ratio.
+  DCGM_FI_PROF_PIPE_TENSOR_ACTIVE, gauge, Tensor (HMMA) pipe active ratio.
+  DCGM_FI_PROF_DRAM_ACTIVE,        gauge, Device memory interface active ratio.
+  DCGM_FI_PROF_PIPE_FP64_ACTIVE,   gauge, FP64 pipe active ratio.
+  DCGM_FI_PROF_PIPE_FP32_ACTIVE,   gauge, FP32 pipe active ratio.
+  DCGM_FI_PROF_PIPE_FP16_ACTIVE,   gauge, FP16 pipe active ratio.
+
+  # ECC
+  DCGM_FI_DEV_ECC_SBE_VOL_TOTAL, counter, Single-bit volatile ECC errors.
+  DCGM_FI_DEV_ECC_DBE_VOL_TOTAL, counter, Double-bit volatile ECC errors.
+
+  # Remapped rows
+  DCGM_FI_DEV_UNCORRECTABLE_REMAPPED_ROWS, counter, Remapped rows — uncorrectable.
+  DCGM_FI_DEV_CORRECTABLE_REMAPPED_ROWS,   counter, Remapped rows — correctable.
+  DCGM_FI_DEV_ROW_REMAP_FAILURE,           gauge,   Row remap failure flag.

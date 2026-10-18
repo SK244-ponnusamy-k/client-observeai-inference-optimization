@@ -1,0 +1,126 @@
+# ==============================================================================
+# k8s/serving/neuron-monitor.yaml
+#
+# Neuron hardware telemetry for Trainium/Inferentia nodes — the Neuron analogue
+# of the GPU DCGM exporter. Two objects:
+#
+#   1. DaemonSet  neuron-monitor  — runs ONLY on nodes that expose
+#      aws.amazon.com/neuron, launches `neuron-monitor | neuron-monitor-prometheus`
+#      and serves Prometheus metrics on :8000 (NeuronCore utilisation, device
+#      memory, vCPU, latency, HW ECC errors, etc.).
+#   2. Service    neuron-monitor  — stable endpoint the ServiceMonitor targets.
+#
+# The companion ServiceMonitor is neuron-servicemonitor.yaml.
+#
+# Apply:
+#   kubectl apply -f k8s/serving/neuron-monitor.yaml
+#   kubectl apply -f k8s/serving/neuron-servicemonitor.yaml
+#
+# Image: the AWS Neuron DLC already ships neuron-monitor + the prometheus bridge,
+# so we reuse NEURON_VLLM_IMAGE (pinned in config/config.env) rather than pulling
+# a second image. Override with ${NEURON_MONITOR_IMAGE} if you maintain a slim one.
+# ==============================================================================
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: neuron-monitor
+  namespace: oai-infopt
+  labels:
+    app.kubernetes.io/name: neuron-monitor
+    app.kubernetes.io/component: neuron-exporter
+    app.kubernetes.io/managed-by: oai-cli
+    project: observeai-inference-optimization
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: neuron-monitor
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: neuron-monitor
+        app.kubernetes.io/component: neuron-exporter
+        project: observeai-inference-optimization
+    spec:
+      # Land only on Trainium/Inferentia nodes. These carry the neuron taint, so
+      # tolerate it; the resource request for 1 neuron device also forces the
+      # scheduler onto neuron hardware.
+      tolerations:
+        - key: aws.amazon.com/neuron
+          operator: Exists
+          effect: NoSchedule
+        - key: CriticalAddonsOnly
+          operator: Exists
+      hostNetwork: false
+      hostPID: false
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: false
+        runAsUser: 0          # neuron-monitor reads /dev/neuron* and sysfs
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: neuron-monitor
+          image: ${NEURON_VLLM_IMAGE}
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              set -euo pipefail
+              echo "Starting neuron-monitor -> prometheus bridge on :8000/metrics"
+              # neuron-monitor emits a JSON stream; the prometheus bridge converts
+              # it to a /metrics endpoint. Both ship in the Neuron DLC.
+              neuron-monitor | neuron-monitor-prometheus --port 8000
+          ports:
+            - name: metrics
+              containerPort: 8000
+              protocol: TCP
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+            seccompProfile:
+              type: RuntimeDefault
+          resources:
+            requests:
+              cpu: "250m"
+              memory: "256Mi"
+              aws.amazon.com/neuron: "1"
+            limits:
+              cpu: "500m"
+              memory: "512Mi"
+              aws.amazon.com/neuron: "1"
+          readinessProbe:
+            httpGet:
+              path: /metrics
+              port: 8000
+            initialDelaySeconds: 15
+            periodSeconds: 15
+          volumeMounts:
+            - name: neuron-dev
+              mountPath: /dev
+      volumes:
+        - name: neuron-dev
+          hostPath:
+            path: /dev
+            type: Directory
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: neuron-monitor
+  namespace: oai-infopt
+  labels:
+    app.kubernetes.io/name: neuron-monitor
+    app.kubernetes.io/component: neuron-exporter
+    project: observeai-inference-optimization
+spec:
+  type: ClusterIP
+  clusterIP: None            # headless — one target per Trainium node
+  selector:
+    app.kubernetes.io/name: neuron-monitor
+  ports:
+    - name: metrics
+      port: 8000
+      targetPort: 8000
+      protocol: TCP

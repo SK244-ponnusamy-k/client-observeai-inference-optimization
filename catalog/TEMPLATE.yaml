@@ -1,0 +1,86 @@
+# ==============================================================================
+# catalog/TEMPLATE.yaml
+#
+# COPY THIS FILE to catalog/models/<your-id>.yaml and fill it in.
+# Every field is explained. Delete the sections you do not need.
+#
+#   cp catalog/TEMPLATE.yaml catalog/models/my-model.yaml
+#   oai model validate my-model
+#   oai model generate my-model
+#
+# See catalog/SCHEMA.md for the full field reference.
+# ==============================================================================
+
+# Short lowercase name. Becomes the folder + every k8s resource name.
+# Letters, digits, dashes only; must start with a letter.
+id: my-model
+
+# Friendly name for `oai model list`.
+display_name: My Model
+
+# Accelerator type: "gpu" (NVIDIA) or "neuron" (AWS Trainium/Inferentia).
+hardware: gpu
+
+# ------------------------------------------------------------------------------
+# Where the weights come from
+# ------------------------------------------------------------------------------
+source:
+  hf_id: org/my-model         # REQUIRED — the HuggingFace repo id
+  gated: false                # true if the model needs a license/token
+  size_gb: 15                 # approx on-disk size in GB
+  # ignore_patterns:          # optional — files to skip on download
+  #   - "*.msgpack"
+
+# ------------------------------------------------------------------------------
+# How it is served (all optional — safe defaults applied)
+# ------------------------------------------------------------------------------
+serving:
+  # served_name: my-model     # name clients call; defaults to `id`
+  # tokenizer: org/my-model   # defaults to source.hf_id
+  quantization: bf16          # mxfp4 | fp8 | w4a16 | bf16 | none
+  max_model_len: 8192
+  # gpu_memory_utilization: 0.90   # GPU only
+  # max_num_seqs: 256
+  # max_num_batched_tokens: 8192
+  # extra_args:               # raw vLLM flags appended verbatim
+  #   - "--no-enable-prefix-caching"
+
+# ------------------------------------------------------------------------------
+# Dynamic instance selection — list allowed instances, preferred first.
+# The tool picks the first one actually available and falls back down the list.
+# ------------------------------------------------------------------------------
+instances:
+  tensor_parallel_size: 1     # GPUs (or NeuronCores) per replica
+  candidates:
+    - g6e.2xlarge
+    - g6.2xlarge
+    - g5.2xlarge
+
+# ------------------------------------------------------------------------------
+# Neuron / Trainium only — DELETE this whole block for GPU models.
+# These values are baked into the compiled artifact; changing them = recompile.
+# ------------------------------------------------------------------------------
+# neuron:
+#   source_folder: my-model
+#   neff_folder: my-model-neuron
+#   sequence_length: 16384
+#   batch_size: 8
+#   auto_cast_type: bf16
+#   instance_family: trn2
+
+# ------------------------------------------------------------------------------
+# Benchmarking (optional)
+# ------------------------------------------------------------------------------
+benchmark:
+  auto: false                 # true => `oai deploy` benchmarks automatically
+  profiles:
+    - configs/workload_profiles/realtime_v1.yaml
+    - configs/workload_profiles/batch_v1.yaml
+  instance_hourly_usd: 0.00   # VERIFY $/hr for your region for correct cost math
+
+# ------------------------------------------------------------------------------
+# Extra resource tags (optional)
+# ------------------------------------------------------------------------------
+# tags:
+#   Owner: you@company.com
+#   CostCenter: "1234"

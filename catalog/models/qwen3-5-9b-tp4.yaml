@@ -1,0 +1,45 @@
+# catalog/models/qwen3-5-9b-tp4.yaml
+# Created by 'oai model new'. Edit freely; see catalog/SCHEMA.md for all options.
+
+id: qwen3-5-9b-tp4
+display_name: qwen3-5-9b-tp4
+hardware: gpu
+source:
+  hf_id: Qwen/Qwen3.5-9B
+  gated: false
+  size_gb: 20.0
+  s3_folder: qwen3-5-9b-tp1
+serving:
+  quantization: none
+  max_model_len: 16384
+  extra_args:
+    # Run WITH reasoning (flipped from the previous OFF run). Qwen3.5 has thinking
+    # ON by default in its chat template, so enabling reasoning needs BOTH of:
+    #   1. a server-side default that keeps thinking ON for every request, and
+    #   2. loading the qwen3 reasoning parser so vLLM EXTRACTS the chain-of-thought
+    #      into the response `reasoning` field (otherwise the inference probe
+    #      records reasoning_observed=OFF even though the model thinks).
+    # The benchmark harness uses `vllm bench serve` -> /v1/chat/completions and
+    # sends NO per-request chat_template_kwargs, so the ON switch must live on
+    # the server via --default-chat-template-kwargs (request values still win if
+    # ever provided).
+    #
+    # NOTE on quoting: the generator wraps each extra arg in double quotes in the
+    # rendered deployment.yaml (- "<arg>"). The JSON value needs double quotes on
+    # its key, so they are pre-escaped as \" here to stay valid YAML after render.
+    - '--default-chat-template-kwargs={\"enable_thinking\": true}'
+    - "--reasoning-parser=qwen3"
+instances:
+  candidates:
+  - g6.12xlarge
+  - g5.12xlarge
+  tensor_parallel_size: 4
+benchmark:
+  auto: true
+  instance_hourly_usd: 0.0
+resources:
+  cpu_request: "8"
+  cpu_limit: "16"
+  memory_request: "64Gi"
+  memory_limit: "120Gi"
+

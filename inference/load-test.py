@@ -1,0 +1,1219 @@
+"""
+File    : inference/load-test.py
+Purpose : Model-agnostic vLLM benchmark ORCHESTRATOR.
+
+          This does NOT hand-compute latency/throughput from response chunks.
+          It shells out to `vllm bench serve` (the official, tokenizer-accurate
+          load generator) for TTFT / TPOT / ITL / E2E percentiles + throughput,
+          scrapes vLLM `/metrics` for engine state (KV-cache, queue depth) and
+          an optional DCGM/Prometheus endpoint for GPU utilisation, looks up the
+          instance $/hr, then derives cost and writes one canonical result row
+          per (profile x concurrency) to JSONL + S3.
+
+          Why bench serve instead of a custom async loop:
+            - counts tokens with the model tokenizer (includes reasoning tokens
+              for models like gpt-oss; the old word-split on delta.content
+              silently dropped reasoning_content and collapsed throughput to
+              ~0.6 tok/s)
+            - correct TTFT (first token of ANY field), TPOT, ITL, percentiles
+            - same tool OpenAI's gpt-oss recipe uses -> comparable numbers
+
+Owner   : genai-platform@shellkode
+Created : 2026-09-01 | Reworked: 2026-09-10 (bench-serve orchestrator)
+Deps    : vllm (provides `vllm bench serve`), pyyaml, boto3
+          Run from the vLLM DLC image so the CLI + tokenizers are present.
+
+Usage (in-cluster, called by benchmark-job.yaml):
+    python inference/load-test.py \\
+        --manifest /configs/manifests/manifest.yaml \\
+        --profile  /configs/profiles/profile.yaml \\
+        --endpoint http://oai-infopt-vllm-gpt-oss-20b:8000 \\
+        --output   /results/
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import logging
+import os
+import re
+import subprocess  # noqa: S404 - invoking the trusted `vllm` CLI, args are controlled
+import tempfile
+import threading
+import time
+import urllib.request
+import uuid
+from dataclasses import asdict, dataclass, field
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+import yaml
+
+logger = logging.getLogger(__name__)
+
+# Distinct exit code for "the model endpoint never became ready" (health check
+# timed out). Kept SEPARATE from a generic error (exit 1) and from an SLO miss
+# (exit 0) so the in-cluster marker — and every downstream gate/report — can
+# tell "the model never came up" (e.g. no GPU capacity) apart from "the model
+# ran but the measurement failed" or "the model ran but missed an SLO".
+EXIT_MODEL_NOT_READY = 3
+
+
+# ---------------------------------------------------------------------------
+# Logging — structured JSON per shellkode-code-standards.md
+# ---------------------------------------------------------------------------
+def _configure_logging(level: str = "INFO") -> None:
+    """Configure structured JSON logging with correlation_id support."""
+
+    class JsonFormatter(logging.Formatter):
+        def format(self, record: logging.LogRecord) -> str:
+            payload: dict[str, Any] = {
+                "timestamp": datetime.now(tz=timezone.utc).isoformat(),
+                "level": record.levelname,
+                "service": "oai-infopt-benchmark",
+                "correlation_id": getattr(record, "correlation_id", ""),
+                "message": record.getMessage(),
+            }
+            if record.exc_info:
+                payload["exception"] = self.formatException(record.exc_info)
+            return json.dumps(payload)
+
+    handler = logging.StreamHandler()
+    handler.setFormatter(JsonFormatter())
+    logging.basicConfig(level=getattr(logging, level.upper()), handlers=[handler])
+
+
+# ---------------------------------------------------------------------------
+# Canonical result row (matches observeai-project-standards.md result schema)
+# ---------------------------------------------------------------------------
+@dataclass
+class BenchmarkResult:
+    """Aggregated result row — one per (profile, concurrency)."""
+
+    run_id: str
+    correlation_id: str
+    hf_id: str
+    model_version: str
+    instance_type: str
+    vllm_image: str
+    quantization: str
+    tensor_parallel_size: int
+    max_num_seqs: int
+    max_num_batched_tokens: int
+    max_model_len: int
+    kv_cache_dtype: str
+    profile: str            # realtime | batch
+    concurrency: int
+
+    # Latency (ms) — sourced from `vllm bench serve`
+    ttft_p50_ms: float
+    ttft_p95_ms: float
+    ttft_p99_ms: float
+    tpot_p50_ms: float
+    tpot_p95_ms: float
+    itl_p50_ms: float
+    itl_p95_ms: float
+    e2e_p50_ms: float
+    e2e_p95_ms: float
+    e2e_p99_ms: float
+
+    # Throughput / tokens — sourced from `vllm bench serve` (tokenizer-counted)
+    request_throughput_rps: float
+    output_throughput_tokens_s: float
+    total_token_throughput_s: float
+    total_input_tokens: int
+    total_output_tokens: int
+    completed_interactions_min: float
+
+    # Engine state — sourced from vLLM /metrics
+    kv_cache_utilization_pct: float | None
+    num_requests_waiting: float | None
+    prefix_cache_hit_rate: float | None
+
+    # GPU — sourced from DCGM/Prometheus (optional; None if not wired)
+    gpu_utilization_pct: float | None
+    gpu_mem_used_mib: float | None
+    gpu_power_watts: float | None
+
+    # Cost (derived; None when tokens are ~0 so we never emit $127k garbage)
+    instance_hourly_usd: float
+    runtime_s: float
+    cost_per_1m_tokens: float | None
+    cost_per_1m_output_tokens: float | None
+    cost_per_qa_form: float | None
+    tokens_per_usd: float | None
+    energy_per_1m_tokens_wh: float | None
+
+    # Quality — NOT measured here. Perf harness != quality benchmark.
+    # Accuracy comes from the separate lm-eval-harness stage (MMLU-Pro/GPQA/DROP/IFEval).
+    accuracy_avg_pct: float | None
+
+    # Meta
+    total_requests: int
+    successful_requests: int
+    error_rate_pct: float
+    reasoning_effort: str
+    # OBSERVED at inference time by probing the live server (see _probe_reasoning):
+    # "ON" if the server actually emitted chain-of-thought on a probe request,
+    # "OFF" if it did not, "-" if the probe was inconclusive. This is the truth of
+    # what the run did, independent of any config/deployment default.
+    reasoning_observed: str
+    git_sha: str
+    started_at: str
+    ended_at: str
+    status: str             # passed | failed_slo | error
+    slo_violations: list[str] = field(default_factory=list)
+
+    # Telemetry quality — sampled DURING the run (see _TelemetrySampler).
+    # kv_cache_utilization_pct above is the PEAK; this is the mean under load.
+    kv_cache_utilization_mean_pct: float | None = None
+    telemetry_samples: int = 0        # vLLM /metrics samples taken during the level
+    gpu_telemetry_samples: int = 0    # DCGM samples that matched the vLLM pod (0 => GPU fields are None)
+
+
+# ---------------------------------------------------------------------------
+# YAML loading
+# ---------------------------------------------------------------------------
+def load_yaml(path: str) -> dict[str, Any]:
+    """Load and parse a YAML file. Fails fast on missing file."""
+    p = Path(path)
+    if not p.exists():
+        raise FileNotFoundError(f"YAML not found: {path}")
+    with p.open() as f:
+        return yaml.safe_load(f)
+
+
+# ---------------------------------------------------------------------------
+# Health check
+# ---------------------------------------------------------------------------
+def _wait_for_vllm(endpoint: str, timeout_s: int = 300) -> None:
+    """Poll /health until vLLM is ready or timeout."""
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        try:
+            urllib.request.urlopen(f"{endpoint}/health", timeout=5)  # noqa: S310
+            logger.info("vLLM endpoint is healthy: %s", endpoint)
+            return
+        except Exception:  # noqa: BLE001
+            time.sleep(5)
+    raise TimeoutError(f"vLLM not ready at {endpoint} after {timeout_s}s")
+
+
+# ---------------------------------------------------------------------------
+# Inference-time reasoning probe
+# ---------------------------------------------------------------------------
+def _probe_reasoning(endpoint: str, served_model: str, timeout: int = 30) -> str:
+    """Detect whether the SERVER actually reasons at INFERENCE TIME.
+
+    This is deliberately NOT read from any config/deployment default. It asks the
+    live server one throwaway question and inspects the reply for evidence that
+    the model produced chain-of-thought:
+
+      * a non-empty ``reasoning`` / ``reasoning_content`` field (vLLM surfaces
+        chain-of-thought here when a reasoning parser is active), or
+      * a ``<think>...</think>`` block in the content.
+
+    Whatever governed that reply — a server-side ``--default-chat-template-kwargs``
+    default, a model that thinks by default, or nothing — is captured as the
+    OBSERVED behaviour of this run. `vllm bench serve` discards response bodies,
+    so without this probe the perf row has no reasoning signal at all.
+
+    Returns "ON", "OFF", or "-" (probe failed / inconclusive).
+    """
+    body = {
+        "model": served_model,
+        "messages": [{"role": "user", "content": "In one short sentence, is 17 a prime number?"}],
+        "temperature": 0.0,
+        "max_tokens": 512,
+    }
+    try:
+        data = json.dumps(body).encode("utf-8")
+        req = urllib.request.Request(  # noqa: S310
+            f"{endpoint}/v1/chat/completions", data=data,
+            headers={"Content-Type": "application/json"}, method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310
+            out = json.loads(resp.read())
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Reasoning probe failed (%s); recording reasoning_observed as '-'.",
+                       type(exc).__name__)
+        return "-"
+
+    try:
+        msg = (out.get("choices") or [{}])[0].get("message") or {}
+    except (AttributeError, IndexError, TypeError):
+        return "-"
+
+    reasoning_field = str(msg.get("reasoning") or msg.get("reasoning_content") or "").strip()
+    content = str(msg.get("content") or "")
+    has_think_block = bool(re.search(r"<\s*(think|thinking|reasoning)\s*>", content, re.IGNORECASE))
+
+    observed = "ON" if (reasoning_field or has_think_block) else "OFF"
+    logger.info("Reasoning probe: observed=%s (reasoning_field=%s, think_block=%s)",
+                observed, bool(reasoning_field), has_think_block)
+    return observed
+
+
+# ---------------------------------------------------------------------------
+# Prometheus text scraping (vLLM /metrics and DCGM)
+# ---------------------------------------------------------------------------
+def _fetch_text(url: str, timeout: int = 5) -> str | None:
+    try:
+        with urllib.request.urlopen(url, timeout=timeout) as resp:  # noqa: S310
+            return resp.read().decode("utf-8")
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("Scrape failed for %s: %s", url, exc)
+        return None
+
+
+def _sum_metric(text: str, *metric_names: str) -> float | None:
+    """Sum all samples of a Prometheus metric family (ignores labels & trailing timestamps)."""
+    total: float | None = None
+    for m_name in metric_names:
+        pattern = re.compile(rf"^\s*{re.escape(m_name)}(?:\{{[^}}]*\}})?\s+([0-9eE.+-]+)(?:\s+[0-9]+)?\s*$")
+        for line in text.splitlines():
+            if line.startswith("#"):
+                continue
+            m = pattern.match(line)
+            if m:
+                try:
+                    total = (total or 0.0) + float(m.group(1))
+                except ValueError:
+                    continue
+        if total is not None:
+            break
+    return total
+
+
+def _scrape_vllm_metrics(endpoint: str) -> dict[str, float | None]:
+    """Read vLLM /metrics: KV-cache usage, waiting queue, prefix-cache hit rate."""
+    text = _fetch_text(f"{endpoint}/metrics")
+    if not text:
+        return {"kv_cache_utilization_pct": None, "num_requests_waiting": None,
+                "prefix_cache_hit_rate": None, "generation_tokens_total": None}
+
+    # vLLM V1 (0.10+) exposes vllm:kv_cache_usage_perc; older builds used
+    # vllm:gpu_cache_usage_perc. (vllm:gpu_memory_utilization is NOT KV usage —
+    # it is the static --gpu-memory-utilization setting, so it is not an alias.)
+    kv = _sum_metric(text, "vllm:kv_cache_usage_perc", "vllm_kv_cache_usage_perc",
+                     "vllm:gpu_cache_usage_perc", "vllm_gpu_cache_usage_perc",
+                     "vllm:gpu_cache_usage_percent", "vllm_gpu_cache_usage_percent")
+    waiting = _sum_metric(text, "vllm:num_requests_waiting", "vllm_num_requests_waiting")
+    gen_tokens = _sum_metric(text, "vllm:generation_tokens_total", "vllm_generation_tokens_total")
+    hits = _sum_metric(text, "vllm:prefix_cache_hits_total", "vllm_prefix_cache_hits_total")
+    queries = _sum_metric(text, "vllm:prefix_cache_queries_total", "vllm_prefix_cache_queries_total")
+    hit_rate = (hits / queries) if (hits is not None and queries) else None
+
+    return {
+        # vLLM reports 0-1 ratio; normalise to percent if <= 1.0
+        "kv_cache_utilization_pct": (kv * 100.0) if (kv is not None and kv <= 1.0) else (kv if kv is not None else None),
+        "num_requests_waiting": waiting,
+        "prefix_cache_hit_rate": hit_rate,
+        "generation_tokens_total": gen_tokens,
+    }
+
+
+_LABEL_RE = re.compile(r'([a-zA-Z_][a-zA-Z0-9_]*)="((?:[^"\\]|\\.)*)"')
+
+
+def _metric_samples(text: str, metric_name: str) -> list[tuple[dict[str, str], float]]:
+    """Return every (labels, value) sample of one Prometheus metric family."""
+    pattern = re.compile(rf"^\s*{re.escape(metric_name)}(?:\{{([^}}]*)\}})?\s+([0-9eE.+-]+|NaN)(?:\s+[0-9]+)?\s*$")
+    samples: list[tuple[dict[str, str], float]] = []
+    for line in text.splitlines():
+        if line.startswith("#"):
+            continue
+        m = pattern.match(line)
+        if not m:
+            continue
+        try:
+            value = float(m.group(2))
+        except ValueError:
+            continue
+        samples.append((dict(_LABEL_RE.findall(m.group(1) or "")), value))
+    return samples
+
+
+def _pod_matcher(deployment: str | None, namespace: str | None):
+    """
+    Build a predicate selecting only the DCGM samples of the vLLM pod under test.
+
+    dcgm-exporter (k8s mode) labels each GPU with the pod/namespace/container it is
+    allocated to (`pod`/`namespace`/`container`, or the older `pod_name`/
+    `pod_namespace`/`container_name`). Deployment pods are named
+    <deployment>-<rs-hash>-<5 chars>, so we match that shape exactly — a plain
+    prefix match would also catch a tagged parallel deploy (<deployment>-g7e-...).
+    """
+    pod_re = re.compile(rf"{re.escape(deployment)}-[a-z0-9]{{5,10}}-[a-z0-9]{{5}}") if deployment else None
+
+    def _match(labels: dict[str, str]) -> bool:
+        pod = labels.get("pod") or labels.get("pod_name") or ""
+        ns = labels.get("namespace") or labels.get("pod_namespace") or ""
+        container = labels.get("container") or labels.get("container_name") or ""
+        if pod_re is not None:
+            return bool(pod_re.fullmatch(pod))
+        if namespace:
+            return ns == namespace and container == "vllm"
+        return True
+
+    return _match
+
+
+def _scrape_gpu_metrics(
+    dcgm_url: str | None,
+    deployment: str | None = None,
+    namespace: str | None = None,
+) -> dict[str, float | None]:
+    """
+    Best-effort GPU telemetry from a DCGM-exporter (or Prometheus federate) URL,
+    scoped to the GPUs of the vLLM pod under test.
+
+    The in-cluster dcgm-exporter Service load-balances across ONE exporter pod per
+    GPU node, so a single scrape returns a random node's GPUs. Summing that blindly
+    produced impossible rows (400 % util, 164 GB on a 24 GB L4). We therefore keep
+    only samples whose pod labels match the vLLM deployment; a scrape that lands on
+    another node yields None and is simply skipped by the sampler.
+
+    Aggregation across the pod's GPUs (TP>1): util = mean, mem = sum, power = sum.
+    """
+    urls_to_try = []
+    if dcgm_url:
+        urls_to_try.append(dcgm_url)
+    urls_to_try.extend([
+        os.getenv("DCGM_METRICS_URL", ""),
+        os.getenv("DCGM_EXPORTER_URL", ""),
+        "http://dcgm-exporter.monitoring.svc.cluster.local:9400/metrics",
+        "http://dcgm-exporter.monitoring:9400/metrics",
+    ])
+    text = None
+    for u in urls_to_try:
+        if u:
+            text = _fetch_text(u)
+            if text:
+                break
+    if not text:
+        return {"gpu_utilization_pct": None, "gpu_mem_used_mib": None,
+                "gpu_power_watts": None}
+    match = _pod_matcher(deployment, namespace)
+
+    def _vals(name: str) -> list[float]:
+        return [v for labels, v in _metric_samples(text, name) if match(labels)]
+
+    util = _vals("DCGM_FI_DEV_GPU_UTIL")
+    mem = _vals("DCGM_FI_DEV_FB_USED")
+    power = _vals("DCGM_FI_DEV_POWER_USAGE")
+    return {
+        "gpu_utilization_pct": (sum(util) / len(util)) if util else None,
+        "gpu_mem_used_mib": sum(mem) if mem else None,
+        "gpu_power_watts": sum(power) if power else None,
+    }
+
+
+# ---------------------------------------------------------------------------
+# In-run telemetry sampler
+# ---------------------------------------------------------------------------
+class _TelemetrySampler:
+    """
+    Polls vLLM /metrics and DCGM in a background thread WHILE `vllm bench serve`
+    runs, then reports peak / mean values for the level.
+
+    Why: the harness used to scrape once AFTER the run, when the queue had drained
+    and the KV cache was empty — so every row showed KV 0 % and GPU util was an
+    idle-instant reading. Gauges must be sampled under load.
+    """
+
+    def __init__(
+        self,
+        endpoint: str,
+        dcgm_url: str | None,
+        deployment: str | None,
+        namespace: str | None,
+        interval_s: float = 2.0,
+    ) -> None:
+        self._endpoint = endpoint
+        self._dcgm_url = dcgm_url
+        self._deployment = deployment
+        self._namespace = namespace
+        self._interval_s = interval_s
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._loop, name="telemetry-sampler", daemon=True)
+        self._kv: list[float] = []
+        self._waiting: list[float] = []
+        self._util: list[float] = []
+        self._mem: list[float] = []
+        self._power: list[float] = []
+
+    def __enter__(self) -> _TelemetrySampler:
+        self._thread.start()
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self._stop.set()
+        self._thread.join(timeout=self._interval_s + 10)
+
+    def _loop(self) -> None:
+        while not self._stop.is_set():
+            try:
+                v = _scrape_vllm_metrics(self._endpoint)
+                if v.get("kv_cache_utilization_pct") is not None:
+                    self._kv.append(v["kv_cache_utilization_pct"])
+                if v.get("num_requests_waiting") is not None:
+                    self._waiting.append(v["num_requests_waiting"])
+                g = _scrape_gpu_metrics(self._dcgm_url, self._deployment, self._namespace)
+                if g.get("gpu_utilization_pct") is not None:
+                    self._util.append(g["gpu_utilization_pct"])
+                if g.get("gpu_mem_used_mib") is not None:
+                    self._mem.append(g["gpu_mem_used_mib"])
+                if g.get("gpu_power_watts") is not None:
+                    self._power.append(g["gpu_power_watts"])
+            except Exception as exc:  # noqa: BLE001 - telemetry must never kill a run
+                logger.debug("Telemetry sample failed: %s", exc)
+            self._stop.wait(self._interval_s)
+
+    def summary(self) -> dict[str, float | int | None]:
+        def _mean(xs: list[float]) -> float | None:
+            return round(sum(xs) / len(xs), 2) if xs else None
+
+        return {
+            "kv_cache_utilization_pct": round(max(self._kv), 2) if self._kv else None,
+            "kv_cache_utilization_mean_pct": _mean(self._kv),
+            "num_requests_waiting": max(self._waiting) if self._waiting else None,
+            "gpu_utilization_pct": _mean(self._util),
+            "gpu_mem_used_mib": max(self._mem) if self._mem else None,
+            "gpu_power_watts": _mean(self._power),
+            "telemetry_samples": len(self._kv),
+            "gpu_telemetry_samples": len(self._util),
+        }
+
+
+# ---------------------------------------------------------------------------
+# vLLM bench serve invocation + parsing
+# ---------------------------------------------------------------------------
+def _run_vllm_bench(
+    *,
+    base_url: str,
+    served_model: str,
+    tokenizer: str,
+    concurrency: int,
+    num_prompts: int,
+    dataset_name: str,
+    random_input_len: int,
+    random_output_len: int,
+    seed: int,
+    ignore_eos: bool,
+    extra_args: list[str],
+) -> dict[str, Any]:
+    """
+    Run `vllm bench serve` and return the parsed JSON result dict.
+
+    We rely on vLLM to count tokens with the tokenizer (reasoning-aware) and to
+    compute TTFT/TPOT/ITL/E2E percentiles. No client-side token math here.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        result_file = Path(tmp) / "bench.json"
+        cmd = [
+            "vllm", "bench", "serve",
+            "--backend", "openai-chat",
+            "--base-url", base_url,
+            "--endpoint", "/v1/chat/completions",
+            "--model", served_model,
+            "--tokenizer", tokenizer,
+            "--dataset-name", dataset_name,
+            "--max-concurrency", str(concurrency),
+            "--num-prompts", str(num_prompts),
+            "--seed", str(seed),
+            "--percentile-metrics", "ttft,tpot,itl,e2el",
+            "--metric-percentiles", "95,99",
+            "--save-result",
+            "--result-filename", str(result_file),
+        ]
+        if dataset_name == "random":
+            cmd += ["--random-input-len", str(random_input_len),
+                    "--random-output-len", str(random_output_len)]
+        if ignore_eos:
+            cmd += ["--ignore-eos"]
+        cmd += extra_args
+
+        logger.info("Running: %s", " ".join(cmd))
+        proc = subprocess.run(cmd, capture_output=True, text=True, check=False)  # noqa: S603
+        if proc.returncode != 0:
+            logger.error("vllm bench serve failed (rc=%s): %s", proc.returncode, proc.stderr[-2000:])
+            raise RuntimeError(f"vllm bench serve failed: rc={proc.returncode}")
+
+        if not result_file.exists():
+            raise RuntimeError("vllm bench serve produced no result file")
+        with result_file.open() as f:
+            return json.load(f)
+
+
+def _g(d: dict[str, Any], *keys: str, default: float = 0.0) -> float:
+    """First present key from a bench-serve JSON dict (schema varies by version)."""
+    for k in keys:
+        if k in d and d[k] is not None:
+            try:
+                return float(d[k])
+            except (TypeError, ValueError):
+                continue
+    return default
+
+
+def _engine_generation_delta(
+    before: dict[str, float | None],
+    after: dict[str, float | None],
+) -> int | None:
+    """Tokens the vLLM engine generated during this level, from its own counter.
+
+    vllm:generation_tokens_total is a monotonic cumulative counter that includes
+    EVERY generated token — gpt-oss reasoning_content included. The per-level
+    count is the after-minus-before delta. Returns None if the counter was not
+    scraped at both ends (so the caller falls back to the bench number), and
+    never returns a negative value (guards a counter reset / pod restart).
+    """
+    b = before.get("generation_tokens_total")
+    a = after.get("generation_tokens_total")
+    if a is None or b is None:
+        return None
+    delta = int(a) - int(b)
+    return delta if delta > 0 else None
+
+
+# ---------------------------------------------------------------------------
+# EC2 on-demand $/hr price book — us-east-1 / us-east-2 (identical for these
+# GPU/accelerator families). Keyed by "<family>.<size>". Any instance type in a
+# manifest resolves automatically from serving.instance_type; a manifest may
+# still override by setting cost.instance_hourly_usd explicitly.
+#
+# Sources: AWS EC2 G5/G6/G6e/G7e/Trn pricing (verified 2026-09-18). Values are
+# on-demand, Linux. VERIFY for your region/term before a billed run.
+# ---------------------------------------------------------------------------
+EC2_HOURLY_USD: dict[str, float] = {
+    # G5  — NVIDIA A10G
+    "g5.xlarge": 1.0060,
+    "g5.2xlarge": 1.2120,
+    "g5.4xlarge": 1.6240,
+    "g5.8xlarge": 2.4480,
+    "g5.12xlarge": 5.6720,
+    "g5.16xlarge": 4.0960,
+    "g5.24xlarge": 8.1440,
+    "g5.48xlarge": 16.2880,
+    # G6  — NVIDIA L4
+    "g6.xlarge": 0.8048,
+    "g6.2xlarge": 0.9776,
+    "g6.4xlarge": 1.3232,
+    "g6.8xlarge": 2.0144,
+    "g6.12xlarge": 4.6016,
+    "g6.16xlarge": 3.3968,
+    "g6.24xlarge": 6.6752,
+    "g6.48xlarge": 13.3504,
+    # G6e — NVIDIA L40S
+    "g6e.xlarge": 1.8610,
+    "g6e.2xlarge": 2.2420,
+    "g6e.4xlarge": 3.0042,
+    "g6e.8xlarge": 4.5286,
+    "g6e.12xlarge": 10.6032,
+    "g6e.16xlarge": 7.5772,
+    "g6e.24xlarge": 15.0656,
+    "g6e.48xlarge": 30.1312,
+    # G7e — NVIDIA RTX PRO 6000 Blackwell
+    "g7e.2xlarge": 3.3631,
+    "g7e.4xlarge": 3.9982,
+    "g7e.8xlarge": 5.2682,
+    "g7e.12xlarge": 8.2861,
+    "g7e.24xlarge": 16.5722,
+    "g7e.48xlarge": 33.1443,
+    # G7  — (retained from prior manifest value; not in G-family price sheet above)
+    "g7.2xlarge": 2.52,
+    # Trainium — Capacity Block reservation rate (NOT on-demand). Reported in the
+    # cost comparison labelled "Capacity Block". VERIFY for your region/term.
+    "trn1.32xlarge": 21.50,
+    "trn2.3xlarge": 2.235,   # trn2 Capacity Block — verified
+    "trn2.48xlarge": 12.0,
+}
+
+
+def _resolve_instance_hourly_usd(manifest: dict[str, Any]) -> float:
+    """Resolve the on-demand $/hr for a run.
+
+    Priority:
+      1. Explicit override:  cost.instance_hourly_usd in the manifest.
+      2. Dynamic lookup:     serving.instance_type against EC2_HOURLY_USD.
+      3. Fallback:           0.0 (cost fields emit null, with a warning).
+
+    The lookup is case-insensitive and tolerant of stray whitespace so any
+    instance type / size (xlarge, 2xlarge, 4xlarge, ...) resolves the same way.
+    """
+    override = manifest.get("cost", {}).get("instance_hourly_usd")
+    if override is not None:
+        try:
+            return float(override)
+        except (TypeError, ValueError):
+            logger.warning("cost.instance_hourly_usd=%r is not a number; falling back to lookup", override)
+
+    # Dynamic lookup by instance type. Prefer the ACTUAL deployed instance passed
+    # via OAI_INSTANCE_TYPE (set from `--hw` by run-benchmark.sh) over the
+    # manifest's static serving.instance_type — so one manifest works for every
+    # size and the cost always matches the hardware the run really used.
+    instance_type = (
+        os.getenv("OAI_INSTANCE_TYPE", "").strip()
+        or str(manifest.get("serving", {}).get("instance_type", "")).strip()
+    ).lower()
+    price = EC2_HOURLY_USD.get(instance_type)
+    if price is not None:
+        return price
+
+    logger.warning(
+        "No price for instance_type=%r and no cost.instance_hourly_usd override; "
+        "cost metrics will be null. Add it to EC2_HOURLY_USD or the manifest.",
+        instance_type,
+    )
+    return 0.0
+
+
+# ---------------------------------------------------------------------------
+# Cost derivation (guarded — never divide by ~zero)
+# ---------------------------------------------------------------------------
+def _derive_cost(
+    instance_usd: float,
+    runtime_s: float,
+    total_tokens: int,
+    total_output_tokens: int,
+    successful: int,
+    gpu_power_watts: float | None,
+) -> dict[str, float | None]:
+    """Derive cost/efficiency for both total tokens and output-only tokens."""
+    if (total_tokens < 1 and total_output_tokens < 1) or runtime_s <= 0 or instance_usd <= 0:
+        logger.warning(
+            "Cost not derivable: total_tokens=%s output_tokens=%s runtime=%.2fs usd/hr=%.4f -> emitting null",
+            total_tokens, total_output_tokens, runtime_s, instance_usd,
+        )
+        return {
+            "cost_per_1m_tokens": None,
+            "cost_per_1m_output_tokens": None,
+            "cost_per_qa_form": None,
+            "tokens_per_usd": None,
+            "energy_per_1m_tokens_wh": None,
+        }
+
+    run_cost = (instance_usd / 3600.0) * runtime_s
+    cost_per_1m_total = run_cost / (total_tokens / 1_000_000) if total_tokens > 0 else None
+    cost_per_1m_output = run_cost / (total_output_tokens / 1_000_000) if total_output_tokens > 0 else None
+    cost_per_form = run_cost / max(successful, 1)
+    tokens_per_usd = total_tokens / run_cost if run_cost > 0 else None
+    energy_per_1m = None
+    if gpu_power_watts and gpu_power_watts > 0 and total_tokens > 0:
+        wh = gpu_power_watts * (runtime_s / 3600.0)
+        energy_per_1m = wh / (total_tokens / 1_000_000)
+    return {
+        "cost_per_1m_tokens": round(cost_per_1m_total, 6) if cost_per_1m_total else None,
+        "cost_per_1m_output_tokens": round(cost_per_1m_output, 6) if cost_per_1m_output else None,
+        "cost_per_qa_form": round(cost_per_form, 8),
+        "tokens_per_usd": round(tokens_per_usd, 2) if tokens_per_usd else None,
+        "energy_per_1m_tokens_wh": round(energy_per_1m, 3) if energy_per_1m else None,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Build one result row
+# ---------------------------------------------------------------------------
+def _build_result(
+    *,
+    bench: dict[str, Any],
+    vmetrics_before: dict[str, float | None],
+    vmetrics_after: dict[str, float | None],
+    telemetry: dict[str, float | int | None],
+    concurrency: int,
+    profile_id: str,
+    manifest: dict[str, Any],
+    opt: dict[str, Any],
+    reasoning_effort: str,
+    reasoning_observed: str,
+    correlation_id: str,
+    started_at: str,
+    ended_at: str,
+) -> BenchmarkResult:
+    runtime_s = _g(bench, "duration")
+    total_out = int(_g(bench, "total_output_tokens"))
+    total_in = int(_g(bench, "total_input_tokens"))
+
+    # ── gpt-oss output-token correction ──────────────────────────────────────
+    # The openai-chat backend tallies output tokens from streamed delta.content.
+    # gpt-oss streams its chain-of-thought in a SEPARATE `reasoning_content`
+    # field, which some vLLM bench-serve versions omit from total_output_tokens —
+    # so gpt-oss output tokens (and therefore throughput and cost-per-output-tok)
+    # are undercounted. The vLLM engine's own counter, vllm:generation_tokens_total,
+    # ALWAYS counts every generated token (reasoning included). We take its delta
+    # across this level and, if it is materially higher than what bench reported,
+    # trust the engine. This is a no-op for models without a reasoning channel
+    # (bench and engine agree) and when the engine counter is unavailable.
+    engine_out = _engine_generation_delta(vmetrics_before, vmetrics_after)
+    if engine_out is not None and engine_out > total_out * 1.05 and engine_out > 0:
+        logger.info(
+            "gpt-oss token correction: bench reported %d output tokens; vLLM engine "
+            "counted %d (reasoning included). Using engine count.",
+            total_out, engine_out,
+        )
+        total_out = engine_out
+
+    total_tokens = total_in + total_out
+    completed = int(_g(bench, "completed", "num_prompts"))
+    completed_per_min = completed / max(runtime_s / 60.0, 1e-9)
+    # Recompute output throughput from the (possibly corrected) token count so the
+    # reported tokens/s matches total_output_tokens instead of the undercount.
+    bench_out_tps = _g(bench, "output_throughput")
+    output_tps = (total_out / runtime_s) if (runtime_s > 0 and total_out > 0) else bench_out_tps
+    instance_usd = _resolve_instance_hourly_usd(manifest)
+
+    cost = _derive_cost(instance_usd, runtime_s, total_tokens, total_out, completed,
+                        telemetry.get("gpu_power_watts"))
+
+    git_sha = os.popen("git rev-parse --short HEAD 2>/dev/null").read().strip() or "unknown"  # noqa: S605
+
+    # KV / queue: PEAK observed while the level was running (in-run sampler).
+    # The after-run snapshot is NOT used — by then the queue has drained and KV is ~0.
+    kv = telemetry.get("kv_cache_utilization_pct")
+    waiting = telemetry.get("num_requests_waiting")
+
+    return BenchmarkResult(
+        run_id=manifest["run_id"],
+        correlation_id=correlation_id,
+        hf_id=manifest["model"]["hf_id"],
+        model_version=manifest["model"].get("s3_prefix", manifest["model"].get("s3_uri", "")),
+        instance_type=(os.getenv("OAI_INSTANCE_TYPE", "").strip() or manifest["serving"]["instance_type"]),
+        vllm_image=manifest["serving"]["image"],
+        quantization=opt.get("quantization", "none"),
+        tensor_parallel_size=int(opt.get("tensor_parallel_size", 1)),
+        max_num_seqs=int(opt.get("max_num_seqs", 0)),
+        max_num_batched_tokens=int(opt.get("max_num_batched_tokens", 0)),
+        max_model_len=int(opt.get("max_model_len", 0)),
+        kv_cache_dtype=opt.get("kv_cache_dtype", "auto"),
+        profile=profile_id,
+        concurrency=concurrency,
+        ttft_p50_ms=_g(bench, "median_ttft_ms"),
+        ttft_p95_ms=_g(bench, "p95_ttft_ms", "p99_ttft_ms"),
+        ttft_p99_ms=_g(bench, "p99_ttft_ms"),
+        tpot_p50_ms=_g(bench, "median_tpot_ms"),
+        tpot_p95_ms=_g(bench, "p95_tpot_ms", "p99_tpot_ms"),
+        itl_p50_ms=_g(bench, "median_itl_ms"),
+        itl_p95_ms=_g(bench, "p95_itl_ms", "p99_itl_ms"),
+        e2e_p50_ms=_g(bench, "median_e2el_ms"),
+        e2e_p95_ms=_g(bench, "p95_e2el_ms", "p99_e2el_ms"),
+        e2e_p99_ms=_g(bench, "p99_e2el_ms"),
+        request_throughput_rps=_g(bench, "request_throughput"),
+        output_throughput_tokens_s=round(output_tps, 4),
+        total_token_throughput_s=_g(bench, "total_token_throughput"),
+        total_input_tokens=total_in,
+        total_output_tokens=total_out,
+        completed_interactions_min=round(completed_per_min, 2),
+        kv_cache_utilization_pct=round(kv, 2) if kv is not None else None,
+        num_requests_waiting=waiting,
+        prefix_cache_hit_rate=vmetrics_after.get("prefix_cache_hit_rate"),
+        gpu_utilization_pct=telemetry.get("gpu_utilization_pct"),
+        gpu_mem_used_mib=telemetry.get("gpu_mem_used_mib"),
+        gpu_power_watts=telemetry.get("gpu_power_watts"),
+        instance_hourly_usd=instance_usd,
+        runtime_s=round(runtime_s, 2),
+        cost_per_1m_tokens=cost["cost_per_1m_tokens"],
+        cost_per_1m_output_tokens=cost["cost_per_1m_output_tokens"],
+        cost_per_qa_form=cost["cost_per_qa_form"],
+        tokens_per_usd=cost["tokens_per_usd"],
+        energy_per_1m_tokens_wh=cost["energy_per_1m_tokens_wh"],
+        accuracy_avg_pct=None,  # measured by the separate lm-eval stage, not here
+        total_requests=completed,
+        successful_requests=completed,
+        error_rate_pct=0.0,
+        reasoning_effort=reasoning_effort,
+        reasoning_observed=reasoning_observed,
+        git_sha=git_sha,
+        started_at=started_at,
+        ended_at=ended_at,
+        status="passed",
+        kv_cache_utilization_mean_pct=telemetry.get("kv_cache_utilization_mean_pct"),
+        telemetry_samples=int(telemetry.get("telemetry_samples") or 0),
+        gpu_telemetry_samples=int(telemetry.get("gpu_telemetry_samples") or 0),
+    )
+
+
+def _check_slo(result: BenchmarkResult, slo: dict[str, Any]) -> BenchmarkResult:
+    """Evaluate SLO thresholds; mark violations. Zero-token runs fail as 'error'."""
+    if result.total_output_tokens < 1:
+        result.status = "error"
+        result.slo_violations = ["zero output tokens — measurement invalid"]
+        return result
+    violations: list[str] = []
+    if "ttft_p95_ms" in slo and result.ttft_p95_ms > slo["ttft_p95_ms"]:
+        violations.append(f"TTFT p95 {result.ttft_p95_ms:.1f}ms > SLO {slo['ttft_p95_ms']}ms")
+    if "itl_p95_ms" in slo and result.itl_p95_ms > slo["itl_p95_ms"]:
+        violations.append(f"ITL p95 {result.itl_p95_ms:.1f}ms > SLO {slo['itl_p95_ms']}ms")
+    if "throughput_tokens_s_min" in slo and result.output_throughput_tokens_s < slo["throughput_tokens_s_min"]:
+        violations.append(
+            f"Throughput {result.output_throughput_tokens_s:.1f} tok/s < SLO {slo['throughput_tokens_s_min']}"
+        )
+    result.slo_violations = violations
+    result.status = "failed_slo" if violations else "passed"
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Persistence + Prometheus push
+# ---------------------------------------------------------------------------
+def _save_results(results: list[BenchmarkResult], output_dir: str, run_id: str) -> None:
+    out = Path(output_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    out_file = out / f"{run_id}.jsonl"
+    with out_file.open("w") as f:
+        for r in results:
+            f.write(json.dumps(asdict(r)) + "\n")
+    logger.info("Results written to %s", out_file)
+    _push_metrics_to_prometheus(results)
+
+
+def _reset_results_file(output_dir: str, run_id: str) -> None:
+    """Truncate/clear the results JSONL before the sweep begins.
+
+    Guarantees incremental appends start from an empty file even if the output
+    directory was reused within the same process/pod.
+    """
+    out = Path(output_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    (out / f"{run_id}.jsonl").write_text("", encoding="utf-8")
+
+
+def _append_result_to_disk(result: BenchmarkResult, output_dir: str, run_id: str) -> str:
+    """Append a single result row to the on-disk JSONL and return the file path.
+
+    Written incrementally (one row per concurrency level) so a crash at a later,
+    higher-concurrency level never discards the levels already completed.
+    """
+    out = Path(output_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    out_file = out / f"{run_id}.jsonl"
+    with out_file.open("a") as f:
+        f.write(json.dumps(asdict(result)) + "\n")
+    return str(out_file)
+
+
+def _upload_file_to_s3(local_path: str) -> None:
+    """Best-effort upload of the results JSONL to S3 after each concurrency level.
+
+    Controlled by env vars set by run-benchmark.sh / the Job:
+      RESULTS_BUCKET      — target bucket (required; skipped if unset)
+      RESULTS_S3_PREFIX   — key prefix, e.g. results/<ts>/<tag>/<profile>/
+      AWS_DEFAULT_REGION  — region for the S3 client
+    Overwrites the same key each level so S3 always holds the latest cumulative
+    JSONL (every completed level so far). Never raises — upload failures must not
+    abort the benchmark.
+    """
+    bucket = os.getenv("RESULTS_BUCKET", "")
+    if not bucket:
+        logger.debug("RESULTS_BUCKET not set — skipping per-level S3 upload")
+        return
+    prefix = os.getenv("RESULTS_S3_PREFIX", "results/")
+    if prefix and not prefix.endswith("/"):
+        prefix += "/"
+    region = os.getenv("AWS_DEFAULT_REGION", "us-east-2")
+    key = f"{prefix}{os.path.basename(local_path)}"
+    try:
+        import boto3
+        s3 = boto3.client("s3", region_name=region)
+        s3.upload_file(local_path, bucket, key)
+        logger.info("Uploaded incremental results to s3://%s/%s", bucket, key)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Per-level S3 upload skipped (will retry next level): %s", exc)
+
+
+def _push_metrics_to_prometheus(results: list[BenchmarkResult]) -> None:
+    """Push derived metrics to Prometheus Pushgateway (best effort)."""
+    pg_url = os.getenv("PROMETHEUS_PUSHGATEWAY", "http://prometheus-pushgateway.monitoring:9091")
+    for r in results:
+        model_name = r.hf_id.split("/")[-1]
+        labels = f'model_name="{model_name}",profile="{r.profile}",concurrency="{r.concurrency}",namespace="oai-infopt"'
+        lines = [
+            "# TYPE llm_benchmark_ttft_p95_ms gauge",
+            f"llm_benchmark_ttft_p95_ms{{{labels}}} {r.ttft_p95_ms:.1f}",
+            "# TYPE llm_benchmark_output_throughput_tokens_s gauge",
+            f"llm_benchmark_output_throughput_tokens_s{{{labels}}} {r.output_throughput_tokens_s:.1f}",
+        ]
+        if r.cost_per_1m_tokens is not None:
+            lines += ["# TYPE llm_benchmark_cost_per_1m_tokens gauge",
+                      f"llm_benchmark_cost_per_1m_tokens{{{labels}}} {r.cost_per_1m_tokens:.6f}"]
+        payload = ("\n".join(lines) + "\n").encode("utf-8")
+        job = f"llm_benchmark/model/{model_name}/profile/{r.profile}/concurrency/{r.concurrency}"
+        try:
+            req = urllib.request.Request(f"{pg_url}/metrics/job/{job}", data=payload, method="PUT")  # noqa: S310
+            with urllib.request.urlopen(req, timeout=3):  # noqa: S310
+                logger.debug("Pushed metrics for concurrency=%d", r.concurrency)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("Pushgateway push skipped: %s", exc)
+
+
+def _print_summary(results: list[BenchmarkResult]) -> None:
+    sep = "=" * 78
+    print(f"\n{sep}\n  BENCHMARK RESULTS - {results[0].run_id}\n{sep}")
+    print(f"  {'Profile':<10}{'Conc':>5}{'TTFT p95':>10}{'ITL p95':>9}{'Tok/s':>9}{'Cost/1M$':>11}  Status")
+    for r in results:
+        cost = f"{r.cost_per_1m_tokens:.4f}" if r.cost_per_1m_tokens is not None else "n/a"
+        flag = "PASS" if r.status == "passed" else f"FAIL[{r.status}]"
+        print(f"  {r.profile:<10}{r.concurrency:>5}{r.ttft_p95_ms:>9.1f}m{r.itl_p95_ms:>8.1f}m"
+              f"{r.output_throughput_tokens_s:>9.1f}{cost:>11}  {flag}")
+        for v in r.slo_violations:
+            print(f"      - {v}")
+    print(sep + "\n")
+
+
+def _normalize_dataset_to_sharegpt(file_path: str) -> None:
+    """Ensure dataset file is formatted as valid ShareGPT JSON array for vllm bench serve."""
+    p = Path(file_path)
+    if not p.exists():
+        return
+    try:
+        content = p.read_text(encoding="utf-8").strip()
+        if not content:
+            return
+        items = []
+        if content.startswith("["):
+            data = json.loads(content)
+        else:
+            data = [json.loads(line) for line in content.splitlines() if line.strip()]
+
+        for entry in data:
+            if isinstance(entry, dict):
+                if "conversations" in entry:
+                    convs = entry["conversations"]
+                elif "messages" in entry:
+                    convs = []
+                    for msg in entry["messages"]:
+                        role = "human" if msg.get("role") in ("user", "system") else "gpt"
+                        convs.append({"from": role, "value": msg.get("content", "")})
+                elif "question" in entry:
+                    sys_prompt = entry.get("system_prompt", "")
+                    q = entry.get("question", "")
+                    prompt_text = (sys_prompt + "\n\n" + q).strip() if sys_prompt else q
+                    ans = str(entry.get("answer", "Yes"))
+                    convs = [
+                        {"from": "human", "value": prompt_text},
+                        {"from": "gpt", "value": ans}
+                    ]
+                else:
+                    continue
+
+                # vLLM bench serve ShareGPT filter requires at least 4 tokens for prompt and completion
+                if len(convs) >= 2:
+                    for turn in convs:
+                        if turn.get("from") == "gpt" and len(turn.get("value", "").split()) < 4:
+                            val = turn.get("value", "Yes")
+                            turn["value"] = f"{val}. Based on the evaluation of the conversation transcript, all criteria have been verified."
+                    items.append({"conversations": convs})
+
+        if items:
+            p.write_text(json.dumps(items, indent=2), encoding="utf-8")
+            logger.info("Dataset normalized into ShareGPT format (%d prompts)", len(items))
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Dataset normalization skipped: %s", exc)
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+def _run(args: argparse.Namespace) -> None:
+    correlation_id = str(uuid.uuid4())
+    old_factory = logging.getLogRecordFactory()
+
+    def record_factory(*fa: Any, **kw: Any) -> logging.LogRecord:
+        record = old_factory(*fa, **kw)
+        record.correlation_id = correlation_id  # type: ignore[attr-defined]
+        return record
+
+    logging.setLogRecordFactory(record_factory)
+    logger.info("Starting benchmark run (correlation_id=%s)", correlation_id)
+
+    manifest = load_yaml(args.manifest)
+    profile = load_yaml(args.profile)
+
+    run_id = manifest["run_id"]
+    profile_id = profile["profile_id"]
+    slo = profile.get("slo", {})
+    concurrency_levels: list[int] = profile["concurrency_levels"]
+    out_cfg = profile.get("output", {})
+    in_cfg = profile.get("input", {})
+    max_new = int(out_cfg.get("max_new_tokens", 512))
+    seed = int(out_cfg.get("seed", 42))
+    reasoning_effort = str(out_cfg.get("reasoning_effort", "medium"))
+    dataset_name = str(in_cfg.get("dataset_name", "random"))
+    random_input_len = int(in_cfg.get("random_input_len", 1024))
+    ignore_eos = bool(in_cfg.get("ignore_eos", dataset_name == "random"))
+    extra_args: list[str] = list(profile.get("bench_extra_args", []))
+
+    dataset_target = getattr(args, "dataset", None) or in_cfg.get("dataset_s3_key")
+    if dataset_target:
+        local_ds = "/tmp/custom_dataset.jsonl"
+        default_bucket = os.getenv("RESULTS_BUCKET", "shellkode-ai-results")
+        region = os.getenv("AWS_DEFAULT_REGION", "us-east-2")
+
+        if dataset_target.startswith("s3://"):
+            s3_path = dataset_target[5:]
+            bucket_name, key_name = s3_path.split("/", 1)
+        elif "/" in dataset_target or dataset_target.endswith(".jsonl") or dataset_target.endswith(".json"):
+            bucket_name = default_bucket
+            key_name = dataset_target.lstrip("/")
+        else:
+            bucket_name = default_bucket
+            key_name = f"datasets/{dataset_target}"
+
+        logger.info("Downloading custom dataset from S3: s3://%s/%s -> %s", bucket_name, key_name, local_ds)
+        import boto3
+        s3 = boto3.client("s3", region_name=region)
+        s3.download_file(bucket_name, key_name, local_ds)
+
+        # Normalize dataset to ShareGPT format so vllm bench serve accepts any dataset format
+        _normalize_dataset_to_sharegpt(local_ds)
+
+        dataset_name = "sharegpt"
+        ignore_eos = False
+        if "--dataset-path" not in extra_args:
+            extra_args.extend(["--dataset-path", local_ds])
+
+    opt = manifest["optimization_variants"][0]
+    hf_id = manifest["model"]["hf_id"]
+    served_model = manifest["model"].get("served_name") or hf_id.split("/")[-1]
+    tokenizer = manifest["model"].get("tokenizer", hf_id)
+    endpoint = args.endpoint.rstrip("/")
+    dcgm_url = (
+        os.getenv("DCGM_METRICS_URL")
+        or os.getenv("DCGM_EXPORTER_URL")
+        or "http://dcgm-exporter.monitoring.svc.cluster.local:9400/metrics"
+    )
+    # Scope GPU telemetry to the vLLM pod under test (set by run-benchmark.sh).
+    # Unset -> fall back to namespace + container=vllm; neither -> unscoped (legacy).
+    vllm_deployment = os.getenv("OAI_VLLM_DEPLOYMENT", "").strip() or None
+    vllm_namespace = os.getenv("OAI_VLLM_NAMESPACE", "").strip() or None
+    if not vllm_deployment and not vllm_namespace:
+        logger.warning("OAI_VLLM_DEPLOYMENT/OAI_VLLM_NAMESPACE unset - GPU telemetry is NOT pod-scoped "
+                       "and may mix GPUs from other nodes.")
+
+    try:
+        _wait_for_vllm(endpoint, timeout_s=args.wait_timeout)
+    except TimeoutError as exc:
+        # The endpoint never became ready within the wait budget. This is NOT a
+        # benchmark result and NOT a generic measurement error — the model never
+        # served (commonly: no GPU capacity, OOM at startup, or a still-pending
+        # pod). Exit with the dedicated code so the marker records the real
+        # reason and downstream stages don't misreport it as a load-test failure.
+        logger.error(
+            "vLLM endpoint never became ready: %s. Skipping benchmark (model-not-ready). "
+            "This is an infrastructure/capacity issue, not a benchmark failure.",
+            exc,
+        )
+        raise SystemExit(EXIT_MODEL_NOT_READY) from exc
+
+    # Probe ONCE per run: observe whether the server actually reasons at inference
+    # time. Applied to every level's result row so the report reflects what this
+    # run did, not a config default. Cheap (one request) and done before the load.
+    reasoning_observed = _probe_reasoning(endpoint, served_model)
+
+    # Start from a clean JSONL so incremental appends don't inherit stale rows
+    # from a prior run that reused the same output directory.
+    _reset_results_file(args.output, run_id)
+
+    all_results: list[BenchmarkResult] = []
+    for conc in concurrency_levels:
+        num_prompts = max(conc * int(profile.get("num_prompts_factor", 5)),
+                          int(profile.get("min_prompts", 100)))
+        logger.info("Concurrency=%d, profile=%s, num_prompts=%d", conc, profile_id, num_prompts)
+        started_at = datetime.now(tz=timezone.utc).isoformat()
+
+        vmetrics_before = _scrape_vllm_metrics(endpoint)
+        try:
+            with _TelemetrySampler(endpoint, dcgm_url, vllm_deployment, vllm_namespace) as sampler:
+                bench = _run_vllm_bench(
+                    base_url=endpoint,
+                    served_model=served_model,
+                    tokenizer=tokenizer,
+                    concurrency=conc,
+                    num_prompts=num_prompts,
+                    dataset_name=dataset_name,
+                    random_input_len=random_input_len,
+                    random_output_len=max_new,
+                    seed=seed,
+                    ignore_eos=ignore_eos,
+                    extra_args=extra_args,
+                )
+        except Exception as exc:  # noqa: BLE001
+            logger.error("Benchmark at concurrency=%d failed: %s", conc, exc)
+            continue
+        vmetrics_after = _scrape_vllm_metrics(endpoint)
+        telemetry = sampler.summary()
+        if telemetry["gpu_telemetry_samples"] == 0:
+            logger.warning("Concurrency=%d: no DCGM samples matched the vLLM pod - GPU fields left null.", conc)
+        ended_at = datetime.now(tz=timezone.utc).isoformat()
+
+        result = _build_result(
+            bench=bench, vmetrics_before=vmetrics_before, vmetrics_after=vmetrics_after,
+            telemetry=telemetry, concurrency=conc, profile_id=profile_id, manifest=manifest, opt=opt,
+            reasoning_effort=reasoning_effort, reasoning_observed=reasoning_observed,
+            correlation_id=correlation_id,
+            started_at=started_at, ended_at=ended_at,
+        )
+        result = _check_slo(result, slo)
+        all_results.append(result)
+        _push_metrics_to_prometheus([result])
+        logger.info("Concurrency %d: ttft_p95=%.1fms out=%.1f tok/s status=%s",
+                    conc, result.ttft_p95_ms, result.output_throughput_tokens_s, result.status)
+
+        # Persist + upload after EVERY concurrency level so a failure at a later,
+        # higher-concurrency level (e.g. 500) never loses the levels already done.
+        try:
+            level_file = _append_result_to_disk(result, args.output, run_id)
+            _upload_file_to_s3(level_file)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Incremental persist/upload at concurrency=%d skipped: %s", conc, exc)
+
+    if not all_results:
+        raise SystemExit("No successful benchmark runs — check vLLM endpoint and logs.")
+
+    _save_results(all_results, args.output, run_id)
+    _print_summary(all_results)
+
+    # Exit non-zero ONLY on a real error (status == "error" = zero output tokens,
+    # i.e. a broken/invalid measurement). An SLO miss (status == "failed_slo") is
+    # a VALID result — the benchmark ran and the numbers are correct, the model
+    # just didn't meet a threshold — so it must NOT fail the job/pod. Otherwise a
+    # normal low-concurrency throughput miss shows the pod as "Error" even though
+    # results are complete and uploaded to S3.
+    errored = [r for r in all_results if r.status == "error"]
+    if errored:
+        logger.error(
+            "%d level(s) produced no output tokens — measurement invalid (exiting non-zero).",
+            len(errored),
+        )
+        raise SystemExit(1)
+
+    slo_missed = [r for r in all_results if r.status == "failed_slo"]
+    if slo_missed:
+        logger.info(
+            "%d level(s) did not meet an SLO threshold. Results are VALID and uploaded; "
+            "this is not an error — exiting 0.",
+            len(slo_missed),
+        )
+
+
+def main() -> None:
+    _configure_logging(os.getenv("LOG_LEVEL", "INFO"))
+    parser = argparse.ArgumentParser(description="oai-infopt vLLM benchmark orchestrator (bench serve)")
+    parser.add_argument("--manifest", required=True, help="Run manifest YAML")
+    parser.add_argument("--profile", required=True, help="Workload profile YAML")
+    parser.add_argument("--endpoint", default=os.getenv("VLLM_ENDPOINT", "http://localhost:8080"),
+                        help="vLLM base URL")
+    parser.add_argument("--output", default=os.getenv("RESULTS_DIR", "results/"),
+                        help="Directory to write result JSONL")
+    parser.add_argument("--wait-timeout", type=int, default=300,
+                        help="Seconds to wait for vLLM /health")
+    parser.add_argument("--dataset", default=None,
+                        help="Optional custom dataset override (S3 key, S3 URI, or file path)")
+    args = parser.parse_args()
+    _run(args)
+
+
+if __name__ == "__main__":
+    main()

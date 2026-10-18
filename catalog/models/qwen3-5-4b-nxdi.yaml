@@ -1,0 +1,74 @@
+# ==============================================================================
+# catalog/models/qwen3-5-4b-nxdi.yaml
+#
+# Qwen/Qwen3.5-4B on AWS Trainium2 via NeuronX Distributed Inference (NxDI).
+#
+# Architecture: DENSE hybrid DeltaNet + GQA text decoder (qwen3_5_text).
+#   - 32 layers: 24 Gated DeltaNet (linear attention) + 8 standard GQA
+#   - Dense SwiGLU MLP (no MoE), NOT a vision-language model
+#
+# vLLM-Neuron does NOT support this architecture out of the box, so this is a
+# CUSTOM serving path (hardware: neuron, serving.engine: nxdi): the reference
+# contrib modeling code (vllm/models/qwen3-5-4b-nxdi/src/) runs behind an
+# OpenAI-compatible FastAPI shim on :8000. The generic `oai` neuron template
+# does NOT apply to this model — deploy via vllm/models/qwen3-5-4b-nxdi/deploy.sh.
+#
+# Reference contrib validated on trn2.48xlarge, TP=4, BF16, seq_len=160, batch=1.
+# This entry targets trn2.3xlarge as the cost-optimized bring-up instance.
+# ==============================================================================
+
+id: qwen3-5-4b-nxdi
+display_name: Qwen3.5-4B (Trainium / NxDI, DeltaNet+GQA)
+hardware: neuron
+
+source:
+  hf_id: Qwen/Qwen3.5-4B
+  gated: false
+  size_gb: 9
+  s3_folder: Qwen3.5-4B          # shared with the GPU path — download once
+
+serving:
+  engine: nxdi                   # custom NxDI shim (NOT vllm serve)
+  served_name: Qwen3.5-4B
+  tokenizer: Qwen/Qwen3.5-4B
+  quantization: bf16
+  max_model_len: 8192            # seq_len baked at compile time; 160 is reference-validated
+  max_num_seqs: 1                # batch_size=1 (reference baseline)
+  tensor_parallel_size: 4
+
+resources:
+  cpu_request: "16"
+  cpu_limit: "32"
+  memory_request: "64Gi"
+  memory_limit: "128Gi"
+
+instances:
+  neuron_cores: 4                # = tensor-parallel degree; must match compile time
+  logical_neuron_config: 2       # LNC=2 on trn2
+  candidates:
+    - trn2.3xlarge               # cost-optimized bring-up target
+    - trn2.48xlarge              # reference-validated fallback
+  node_group: trn2-neuron
+
+neuron:
+  engine: nxdi
+  source_folder: Qwen3.5-4B
+  compiled_folder: qwen3-5-4b-nxdi-traced
+  sequence_length: 8192
+  batch_size: 1
+  auto_cast_type: bf16
+  instance_family: trn2
+  logical_neuron_config: 2
+  # Custom NxDI path: no optimum-cli compile. Compile runs model.compile() via
+  # vllm/models/qwen3-5-4b-nxdi/compile.py inside the NxDI DLC.
+
+benchmark:
+  auto: false
+  profiles:
+    - configs/workload_profiles/realtime_v1.yaml
+    - configs/workload_profiles/batch_v1.yaml
+  instance_hourly_usd: 2.235     # trn2.3xlarge — VERIFY for your region before run
+
+tags:
+  Owner: TBD
+  CostCenter: TBD

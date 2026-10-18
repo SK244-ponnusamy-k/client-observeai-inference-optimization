@@ -1,0 +1,641 @@
+#!/bin/bash
+# ==============================================================================
+# inference/run-benchmark.sh
+#
+# One command to run a benchmark Job inside the cluster and upload results to S3.
+#
+# The Job runs the orchestrator (inference/load-test.py), which shells out to
+# `vllm bench serve`. That CLI ships in the vLLM DLC image, so the Job runs from
+# ${VLLM_IMAGE} (CPU-only) — NOT python:3.11-slim. boto3 is pip-installed to /tmp
+# for the S3 upload (the DLC already has vllm + tokenizers + pyyaml).
+#
+# Usage:
+#   bash inference/run-benchmark.sh                                    # gpt-oss-20b, g6e, realtime
+#   bash inference/run-benchmark.sh --model gpt-oss-20b --profile batch
+#   bash inference/run-benchmark.sh --model gpt-oss-20b --hw g5        # pick the matrix cell
+#   bash inference/run-benchmark.sh --model gpt-oss-20b --profile realtime --hw g6
+#   bash inference/run-benchmark.sh --manifest configs/manifests/gpt-oss-20b-g6e-mxfp4.yaml
+#
+# NOTE: run once per profile. Deploy the model on the SAME --hw first:
+#   bash vllm/models/gpt-oss-20b/deploy.sh --hw g6e.2xlarge
+# ==============================================================================
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+FRAMEWORK_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+source "${FRAMEWORK_ROOT}/config/config.env"
+
+# The benchmark Job needs the vLLM CLI → run from the pinned DLC image.
+: "${VLLM_IMAGE:?ERROR: VLLM_IMAGE is not set. Ensure config/config.env exports it with a pinned digest.}"
+: "${RESULTS_BUCKET:?ERROR: RESULTS_BUCKET is not set in config/config.env.}"
+
+GREEN='\033[0;32m'; YELLOW='\033[1;33m'; RED='\033[0;31m'; NC='\033[0m'
+log_info()  { echo -e "${GREEN}[INFO]  $(date +'%H:%M:%S')${NC} $1"; }
+log_warn()  { echo -e "${YELLOW}[WARN]  $(date +'%H:%M:%S')${NC} $1"; }
+log_error() { echo -e "${RED}[ERROR] $(date +'%H:%M:%S')${NC} $1"; }
+
+# Defaults
+MODEL="gpt-oss-20b"
+PROFILE="both"           # realtime | batch | both — 'both' submits two sequential Jobs
+HW="g6e"                 # matrix cell suffix: g5 | g6 | g6e
+MANIFEST_OVERRIDE=""     # optional explicit manifest path
+DATASET_OVERRIDE=""      # optional explicit dataset path / S3 key
+IMAGE_OVERRIDE=""        # optional explicit benchmark runner image
+SVC_OVERRIDE=""          # optional explicit vLLM service name (for --tag parallel deploys)
+TAG=""                   # optional deploy tag — isolates the S3 results subfolder
+INSTANCE_TYPE=""         # optional FULL instance type (e.g. g7e.24xlarge) for dynamic cost/label
+RUN_TIMESTAMP=""         # optional shared YYYYMMDD-HHMMSS run group from deploy orchestration
+DETACH="false"           # submit all Jobs and return without tailing logs
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --model)    MODEL="$2";    shift 2 ;;
+        --profile)  PROFILE="$2";  shift 2 ;;
+        --hw)       HW="$2";       shift 2 ;;
+        --manifest) MANIFEST_OVERRIDE="$2"; shift 2 ;;
+        --dataset)  DATASET_OVERRIDE="$2";  shift 2 ;;
+        --image)    IMAGE_OVERRIDE="$2";    shift 2 ;;
+        --svc)      SVC_OVERRIDE="$2";      shift 2 ;;
+        --tag)      TAG="$2";               shift 2 ;;
+        --instance) INSTANCE_TYPE="$2";     shift 2 ;;
+        --run-timestamp) RUN_TIMESTAMP="$2"; shift 2 ;;
+        --detach)   DETACH="true";          shift ;;
+        *) log_error "Unknown: $1"; exit 1 ;;
+    esac
+done
+
+# Full instance type the model was deployed on (e.g. g7e.24xlarge). Passed into
+# the benchmark pod as OAI_INSTANCE_TYPE so load-test.py records the REAL instance
+# and resolves its cost from the EC2 price book dynamically — no per-instance
+# manifest edits. Falls back to the manifest's serving.instance_type when unset.
+: "${INSTANCE_TYPE:=}"
+if [[ -n "${RUN_TIMESTAMP}" && ! "${RUN_TIMESTAMP}" =~ ^[0-9]{8}-[0-9]{6}$ ]]; then
+    log_error "--run-timestamp must use YYYYMMDD-HHMMSS (got '${RUN_TIMESTAMP}')."
+    exit 1
+fi
+
+BENCHMARK_RUNNER_IMAGE="${IMAGE_OVERRIDE:-${BENCHMARK_IMAGE:-$VLLM_IMAGE}}"
+
+# Resolve service name + default quantization (→ manifest cell) from model name.
+case "${MODEL}" in
+    gpt-oss-20b)
+        SVC="oai-infopt-vllm-gpt-oss-20b"; QUANT="mxfp4" ;;
+    qwen3.5-4b|qwen3-5-4b)
+        SVC="oai-infopt-vllm-qwen3-5-4b"; QUANT="bf16" ;;
+    gemma-4-31b|gemma-4-31b-it|gemma)
+        SVC="oai-infopt-vllm-gemma-4-31b"; QUANT="none" ;;  # dense TP=4; uses gemma-4-31b-gpu.yaml
+    qwen-0.5b|qwen-0-5b|qwen)
+        SVC="oai-infopt-vllm-qwen-0-5b"; QUANT="" ;;   # smoke uses its own baseline manifest
+    *)
+        # Generic fallback for catalog-onboarded models (oai model generate).
+        # The service name always follows the convention oai-infopt-vllm-<id>, and
+        # the quantization is carried in the manifest filename, so an explicit
+        # --manifest (which oai benchmark always passes) makes this fully generic.
+        SVC="oai-infopt-vllm-${MODEL}"
+        QUANT="${QUANT:-}"
+        if [[ -z "${MANIFEST_OVERRIDE}" ]]; then
+            log_warn "Unknown model '${MODEL}' — relying on --manifest / <model>-<hw>-<quant> convention."
+        fi
+        ;;
+esac
+
+# --svc overrides the resolved service name (used by tagged parallel deploys,
+# e.g. --svc oai-infopt-vllm-gpt-oss-20b-g7e). Default keeps the base name.
+if [[ -n "${SVC_OVERRIDE}" ]]; then
+    SVC="${SVC_OVERRIDE}"
+fi
+
+# Resolve the manifest, in priority order:
+#   1. explicit --manifest override (e.g. a Neuron manifest you select by hand)
+#   2. single dynamic GPU manifest <model-id>-gpu.yaml (standard path — one file
+#      for ALL G instances; instance_type + cost resolve dynamically from --instance)
+#   3. legacy per-hardware matrix cell <model>-<hw>-<quant>.yaml (back-compat)
+#   4. legacy single-manifest baselines (qwen-0.5b smoke)
+# MODEL may use dotted naming (qwen3.5-4b); the gpu manifest uses the k8s-safe
+# dashed id (qwen3-5-4b), so normalize dots to dashes for the -gpu.yaml lookup.
+MODEL_ID_DASHED="${MODEL//./-}"
+GPU_MANIFEST="configs/manifests/${MODEL_ID_DASHED}-gpu.yaml"
+if [[ -n "${MANIFEST_OVERRIDE}" ]]; then
+    MANIFEST="${MANIFEST_OVERRIDE}"
+elif [[ -f "${FRAMEWORK_ROOT}/${GPU_MANIFEST}" ]]; then
+    MANIFEST="${GPU_MANIFEST}"
+elif [[ "${MODEL}" == qwen-0.5b || "${MODEL}" == qwen-0-5b || "${MODEL}" == qwen ]]; then
+    MANIFEST="configs/manifests/qwen-2.5-0.5b-baseline.yaml"
+else
+    MANIFEST="configs/manifests/${MODEL}-${HW}-${QUANT}.yaml"
+fi
+
+# Resolve which profile(s) to run. 'both' runs realtime + batch in ONE job so the
+# container is created once (image pulled once) and both run back-to-back inside it.
+case "${PROFILE}" in
+    both)     PROFILE_LIST=("realtime" "batch") ;;
+    realtime) PROFILE_LIST=("realtime") ;;
+    batch)    PROFILE_LIST=("batch") ;;
+    *) log_error "Invalid --profile '${PROFILE}'. Use: realtime | batch | both"; exit 1 ;;
+esac
+
+# Fail fast on missing config files (better than a confusing ConfigMap error).
+[[ -f "${FRAMEWORK_ROOT}/${MANIFEST}" ]] || { log_error "Manifest not found: ${MANIFEST}"; exit 1; }
+for P in "${PROFILE_LIST[@]}"; do
+    [[ -f "${FRAMEWORK_ROOT}/configs/workload_profiles/${P}_v1.yaml" ]] || \
+        { log_error "Profile not found: configs/workload_profiles/${P}_v1.yaml"; exit 1; }
+done
+
+ENDPOINT="http://${SVC}:8000"
+TIMESTAMP="${RUN_TIMESTAMP:-$(date +%Y%m%d-%H%M%S)}"
+
+# Optional tag isolates parallel runs of the SAME model on different instances.
+# It is folded into the Job name (unique k8s object) and the S3 result key
+# (so two concurrent runs don't overwrite each other's results).
+TAG_SEG=""
+if [[ -n "${TAG}" ]]; then
+    TAG_SEG="-${TAG}"
+fi
+# Base name shared by all per-profile Jobs. Each profile becomes its OWN Job
+# object: <base>-realtime and <base>-batch. They are separate k8s Jobs so a
+# batch failure never discards the completed realtime results (and vice-versa).
+JOB_NAME_BASE="oai-infopt-bench-${MODEL//\./-}${TAG_SEG}-${TIMESTAMP}"
+
+# Kubernetes copies a Job's metadata.name into the auto-injected pod label
+# `batch.kubernetes.io/job-name`, whose VALUE is capped at 63 bytes. A long
+# model id + tag + timestamp + profile suffix can push the Job name past 63,
+# which makes the pod template invalid ("spec.template.labels ... must be no
+# more than 63 bytes"). Keep every Job name <=63 with a stable checksum suffix
+# so realtime/batch stay distinct. Mirrors run-quality.sh's k8s_name().
+k8s_name() {
+    local raw="$1"
+    if [[ ${#raw} -le 63 ]]; then
+        printf '%s' "${raw}"
+        return
+    fi
+    local digest prefix
+    digest=$(printf '%s' "${raw}" | cksum | awk '{print $1}' | cut -c1-8)
+    prefix="${raw:0:54}"
+    prefix="${prefix%-}"
+    printf '%s-%s' "${prefix}" "${digest}"
+}
+# S3 result prefix segment: results/<ts>/<tag>/<profile>/ when tagged, else results/<ts>/<profile>/
+S3_TAG_SEG=""
+if [[ -n "${TAG}" ]]; then
+    S3_TAG_SEG="${TAG}/"
+fi
+# Completion markers share a stable prefix. Batch waits for realtime.done; a
+# deploy-triggered quality Job waits for the final selected profile marker.
+S3_MARKER_PREFIX="results/${TIMESTAMP}/${S3_TAG_SEG}_markers/${MODEL_ID_DASHED}"
+REALTIME_MARKER_KEY="${S3_MARKER_PREFIX}/realtime.done"
+BATCH_MARKER_KEY="${S3_MARKER_PREFIX}/batch.done"
+
+# Per-profile hard caps. Batch (high-concurrency sweep, up to 10k prompts) is the
+# long pole, so it gets a bigger deadline than the latency-bound realtime run.
+REALTIME_DEADLINE=10800   # 3 h  (raised from 1.5h: reasoning-ON on large/slow
+                          #       models — e.g. gemma-4-31b TP=4 on L4 — emits long
+                          #       <think> chains and exceeded the old cap, so the
+                          #       realtime job was killed and never wrote its marker,
+                          #       timing out the batch gate. The batch gate waits
+                          #       REALTIME_DEADLINE+600, so this also extends the wait.)
+BATCH_DEADLINE=21600      # 6 h  (raised from 4h to keep proportion for the long
+                          #       high-concurrency sweep under reasoning-ON.)
+
+echo ""
+echo "======================================================"
+echo "  BENCHMARK JOB(S)"
+echo "  Model    : ${MODEL}"
+echo "  Hardware : ${HW}"
+echo "  Manifest : ${MANIFEST}"
+echo "  Profile  : ${PROFILE}"
+echo "  Endpoint : ${ENDPOINT}"
+echo "  Image    : ${BENCHMARK_RUNNER_IMAGE}"
+echo "  Job base : ${JOB_NAME_BASE}"
+echo "  Profiles : ${PROFILE_LIST[*]}  (one SEPARATE Job each, run sequentially)"
+echo "  Tag      : ${TAG:-<none>}"
+echo "  Results  : s3://${RESULTS_BUCKET}/results/${TIMESTAMP}/${S3_TAG_SEG}<profile>/"
+echo "======================================================"
+echo ""
+
+cd "${FRAMEWORK_ROOT}"
+
+# Handle custom dataset S3 sync (upload local dataset if missing from S3, else skip upload)
+if [[ -n "${DATASET_OVERRIDE:-}" ]]; then
+    DS_BASENAME=$(basename "${DATASET_OVERRIDE}")
+    S3_KEY="datasets/${DS_BASENAME}"
+
+    if aws s3 ls "s3://${RESULTS_BUCKET}/${S3_KEY}" --region "${AWS_REGION}" >/dev/null 2>&1; then
+        log_info "Dataset found in S3: s3://${RESULTS_BUCKET}/${S3_KEY} (Skipping upload)."
+    else
+        LOCAL_FILE=""
+        if [[ -f "${DATASET_OVERRIDE}" ]]; then
+            LOCAL_FILE="${DATASET_OVERRIDE}"
+        elif [[ -f "${FRAMEWORK_ROOT}/configs/workload_profiles/datasets/${DS_BASENAME}" ]]; then
+            LOCAL_FILE="${FRAMEWORK_ROOT}/configs/workload_profiles/datasets/${DS_BASENAME}"
+        fi
+
+        if [[ -n "${LOCAL_FILE}" && -f "${LOCAL_FILE}" ]]; then
+            log_info "Dataset not found in S3. Uploading '${LOCAL_FILE}' -> s3://${RESULTS_BUCKET}/${S3_KEY}..."
+            aws s3 cp "${LOCAL_FILE}" "s3://${RESULTS_BUCKET}/${S3_KEY}" --region "${AWS_REGION}"
+            log_info "Dataset upload complete."
+        else
+            log_warn "Dataset '${DATASET_OVERRIDE}' not found locally or in S3. Pod will attempt download."
+        fi
+    fi
+    DATASET_OVERRIDE="${S3_KEY}"
+fi
+
+# ==============================================================================
+# Step 1 — Create / update ConfigMaps (script + manifest + profile isolated per Job)
+# ==============================================================================
+log_info "Creating ConfigMaps..."
+
+SCRIPT_CM="${JOB_NAME_BASE}-script"
+MANIFEST_CM="${JOB_NAME_BASE}-manifest"
+
+kubectl create configmap "${SCRIPT_CM}" \
+    --from-file=load-test.py="${FRAMEWORK_ROOT}/inference/load-test.py" \
+    -n "${BENCHMARK_NAMESPACE}" --dry-run=client -o yaml | kubectl apply -f - >/dev/null
+
+kubectl create configmap "${MANIFEST_CM}" \
+    --from-file=manifest.yaml="${FRAMEWORK_ROOT}/${MANIFEST}" \
+    -n "${BENCHMARK_NAMESPACE}" --dry-run=client -o yaml | kubectl apply -f - >/dev/null
+
+# One ConfigMap per profile, each holding its own profile.yaml. Mounted at
+# /configs/profiles/profile.yaml inside that profile's own Job container.
+for P in "${PROFILE_LIST[@]}"; do
+    kubectl create configmap "${JOB_NAME_BASE}-profile-${P}" \
+        --from-file=profile.yaml="${FRAMEWORK_ROOT}/configs/workload_profiles/${P}_v1.yaml" \
+        -n "${BENCHMARK_NAMESPACE}" --dry-run=client -o yaml | kubectl apply -f - >/dev/null
+done
+
+if [[ -n "${DATASET_OVERRIDE:-}" ]]; then
+    log_info "ConfigMaps ready. (Using custom dataset from S3: s3://${RESULTS_BUCKET}/${DATASET_OVERRIDE})"
+else
+    log_info "ConfigMaps ready. (Inputs come from vllm bench serve's built-in 'random' dataset)."
+fi
+
+DATASET_JOB_ARG=""
+if [[ -n "${DATASET_OVERRIDE:-}" ]]; then
+    DATASET_JOB_ARG="--dataset ${DATASET_OVERRIDE}"
+fi
+
+# ==============================================================================
+# Step 2 — Submit ONE Job per profile (each its own k8s object, run sequentially)
+#
+# submit_profile_job <profile> — renders and applies a single-profile Job.
+#   * realtime : runs immediately; on success writes an S3 "done" marker.
+#   * batch    : an init container polls S3 for the realtime marker and blocks
+#                until it appears, so batch never loads the GPU while realtime is
+#                still measuring latency. If realtime is NOT in this run, the gate
+#                is skipped so batch starts right away.
+# Every Job runs from the vLLM DLC image, CPU-only, off the GPU node.
+# ==============================================================================
+submit_profile_job() {
+    local P="$1"
+    # Cap the Job name at 63 bytes: Kubernetes copies metadata.name into the
+    # auto pod label batch.kubernetes.io/job-name (value limit 63). k8s_name()
+    # keeps realtime/batch distinct via a checksum suffix when truncation is needed.
+    local JOB_NAME; JOB_NAME=$(k8s_name "${JOB_NAME_BASE}-${P}")
+    # Short, always-valid value for our own app.kubernetes.io/name label; the
+    # model / profile labels already make pods filterable.
+    local JOB_LABEL="oai-infopt-bench-runner"
+    local DEADLINE_S; local GATE_ON_REALTIME="false"
+    if [[ "${P}" == "batch" ]]; then
+        DEADLINE_S="${BATCH_DEADLINE}"
+        # Only gate batch on realtime when realtime is actually part of this run.
+        for _p in "${PROFILE_LIST[@]}"; do [[ "${_p}" == "realtime" ]] && GATE_ON_REALTIME="true"; done
+        if [[ "${GATE_ON_REALTIME}" == "true" ]]; then
+            # activeDeadlineSeconds includes init-container time. Preserve the
+            # full batch budget after up to REALTIME_DEADLINE+600s of waiting.
+            DEADLINE_S=$((BATCH_DEADLINE + REALTIME_DEADLINE + 600))
+        fi
+    else
+        DEADLINE_S="${REALTIME_DEADLINE}"
+    fi
+
+    # --- init container: S3 marker gate (batch only, when realtime is in the run) ---
+    local INIT_CONTAINER=""
+    if [[ "${GATE_ON_REALTIME}" == "true" ]]; then
+        INIT_CONTAINER=$(cat <<INITEOF
+      initContainers:
+        - name: wait-for-realtime
+          image: ${BENCHMARK_RUNNER_IMAGE}
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              set -uo pipefail
+              export HOME=/tmp
+              export PYTHONPATH="/tmp/pip-packages:\${PYTHONPATH:-}"
+              python3 -c "import boto3" 2>/dev/null || \\
+                pip install --quiet --no-cache-dir --target=/tmp/pip-packages boto3==1.34.0 || true
+              echo "Gate: waiting for realtime completion marker s3://${RESULTS_BUCKET}/${REALTIME_MARKER_KEY}"
+              python3 -c "
+              import boto3, sys, time
+              from botocore.exceptions import ClientError
+              s3 = boto3.client('s3', region_name='${AWS_REGION}')
+              deadline = time.time() + ${REALTIME_DEADLINE} + 600
+              while time.time() < deadline:
+                  try:
+                      obj = s3.get_object(Bucket='${RESULTS_BUCKET}', Key='${REALTIME_MARKER_KEY}')
+                      exit_code = obj['Body'].read().decode().strip()
+                      if exit_code != '0':
+                          reason = ('model never became ready (infra/capacity)'
+                                    if exit_code == '3' else 'stage failed')
+                          print('Realtime ' + reason + ' (exit=' + exit_code + '); batch will NOT start.')
+                          # Propagate the SAME code so the downstream quality gate
+                          # can also tell model-not-ready (3) from a real failure.
+                          s3.put_object(
+                              Bucket='${RESULTS_BUCKET}', Key='${BATCH_MARKER_KEY}',
+                              Body=exit_code.encode(),
+                          )
+                          print('Published batch marker (exit=' + exit_code + ') for downstream quality gate.')
+                          sys.exit(1)
+                      print('Realtime marker found (success) — starting batch.'); sys.exit(0)
+                  except ClientError as exc:
+                      code = str(exc.response.get('Error', {}).get('Code', ''))
+                      if code not in ('404', 'NoSuchKey', 'NotFound'):
+                          raise
+                      print('...realtime not done yet; sleeping 20s'); time.sleep(20)
+              print('Gate timed out waiting for realtime; batch will NOT start.')
+              s3.put_object(
+                  Bucket='${RESULTS_BUCKET}', Key='${BATCH_MARKER_KEY}', Body=b'124'
+              )
+              sys.exit(1)
+              "
+          env:
+            - name: AWS_DEFAULT_REGION
+              value: "${AWS_REGION}"
+            - name: RESULTS_BUCKET
+              value: "${RESULTS_BUCKET}"
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            runAsUser: 65534
+            runAsGroup: 65534
+            capabilities:
+              drop: ["ALL"]
+            seccompProfile:
+              type: RuntimeDefault
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "256Mi"
+            limits:
+              cpu: "500m"
+              memory: "512Mi"
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+INITEOF
+)
+    fi
+
+    # --- main container: run load-test for THIS profile, upload, mark done ------
+    # Every profile writes its completion marker after its final upload attempt.
+    # Markers mean "stage finished" (the result JSONL retains passed/failed_slo/error).
+    # This allows the next in-cluster stage to start without depending on this shell.
+    local PROFILE_MARKER_KEY="${REALTIME_MARKER_KEY}"
+    [[ "${P}" == "batch" ]] && PROFILE_MARKER_KEY="${BATCH_MARKER_KEY}"
+    local MARK_STEP
+    MARK_STEP=$(cat <<MARKEOF
+              echo "=== Writing ${P} completion marker ==="
+              MARKER_STATUS="\${TEST_EXIT}" python3 -c "
+              import boto3, os
+              status = os.environ['MARKER_STATUS']
+              s3 = boto3.client('s3', region_name='${AWS_REGION}')
+              s3.put_object(Bucket='${RESULTS_BUCKET}', Key='${PROFILE_MARKER_KEY}', Body=status.encode())
+              print('Marker written: s3://${RESULTS_BUCKET}/${PROFILE_MARKER_KEY} (exit=' + status + ')')
+              " || echo "WARN: failed to write ${P} completion marker"
+MARKEOF
+)
+
+    log_info "Submitting ${P} Job: ${JOB_NAME} (deadline ${DEADLINE_S}s, gate=${GATE_ON_REALTIME})..."
+
+    cat <<EOF | kubectl apply -f -
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: ${JOB_NAME}
+  namespace: ${BENCHMARK_NAMESPACE}
+  labels:
+    app.kubernetes.io/component: benchmark-runner
+    project: observeai-inference-optimization
+    model: "${MODEL}"
+    profile: "${P}"
+spec:
+  backoffLimit: 0
+  activeDeadlineSeconds: ${DEADLINE_S}
+  ttlSecondsAfterFinished: 86400
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: ${JOB_LABEL}
+        app.kubernetes.io/component: benchmark-runner
+        project: observeai-inference-optimization
+        model: "${MODEL}"
+        profile: "${P}"
+      annotations:
+        # Prevent Karpenter from consolidating/evicting the node mid-benchmark.
+        # A single eviction is terminal here (backoffLimit: 0), so the whole
+        # sweep is lost. This pins the node for the lifetime of the run.
+        karpenter.sh/do-not-disrupt: "true"
+    spec:
+      restartPolicy: Never
+      serviceAccountName: oai-infopt-benchmark-sa
+      automountServiceAccountToken: false
+      hostPID: false
+      hostIPC: false
+      hostNetwork: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65534
+        runAsGroup: 65534
+        fsGroup: 65534
+        seccompProfile:
+          type: RuntimeDefault
+      # Do NOT co-locate the runner on the GPU inference node (latency contamination).
+      # On trn2-only clusters, use preferred (soft) anti-affinity so the runner
+      # can still schedule on the trn2 node if no CPU nodes have capacity.
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    app.kubernetes.io/component: inference-server
+                topologyKey: kubernetes.io/hostname
+      tolerations:
+        - key: aws.amazon.com/neuron
+          operator: Exists
+          effect: NoSchedule
+${INIT_CONTAINER}
+      containers:
+        - name: benchmark
+          image: ${BENCHMARK_RUNNER_IMAGE}
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              set -uo pipefail
+              export HOME=/tmp
+              export PYTHONPATH="/tmp/pip-packages:\${PYTHONPATH:-}"
+              # Install required runner packages if not already present in the image
+              python3 -c "import boto3, vllm, yaml" 2>/dev/null || \\
+                pip install --quiet --no-cache-dir --target=/tmp/pip-packages boto3==1.34.0 pyyaml vllm || true
+
+              TEST_EXIT=0
+              echo "=== PROFILE: ${P} ==="
+              # Per-level S3 upload target — load-test.py uploads the cumulative
+              # JSONL after EVERY concurrency level, so a failure at a high level
+              # still leaves the earlier levels in S3.
+              export RESULTS_S3_PREFIX="results/${TIMESTAMP}/${S3_TAG_SEG}${P}/"
+              python3 /app/load-test.py \\
+                --manifest /configs/manifests/manifest.yaml \\
+                --profile  /configs/profiles/profile.yaml \\
+                --endpoint "${ENDPOINT}" \\
+                --output   /results/${P} \\
+                --wait-timeout 2400 ${DATASET_JOB_ARG} || TEST_EXIT=\$?
+              echo "=== Uploading ${P} results to S3 ==="
+              python3 -c "
+              import boto3, os, glob
+              s3 = boto3.client('s3', region_name='${AWS_REGION}')
+              for f in glob.glob('/results/${P}/*.jsonl'):
+                  key = 'results/${TIMESTAMP}/${S3_TAG_SEG}${P}/' + os.path.basename(f)
+                  s3.upload_file(f, '${RESULTS_BUCKET}', key)
+                  print('Uploaded: s3://${RESULTS_BUCKET}/' + key)
+              " || true
+${MARK_STEP}
+              exit \${TEST_EXIT}
+          env:
+            - name: AWS_DEFAULT_REGION
+              value: "${AWS_REGION}"
+            - name: RESULTS_BUCKET
+              value: "${RESULTS_BUCKET}"
+            - name: DCGM_METRICS_URL
+              value: "http://dcgm-exporter.monitoring.svc.cluster.local:9400/metrics"
+            # Scope DCGM GPU telemetry to the vLLM pod under test. The DCGM Service
+            # load-balances across GPU nodes; without this, rows mix other nodes' GPUs.
+            # Deployment name == Service name (oai-infopt-vllm-<id>[-<tag>]).
+            - name: OAI_VLLM_DEPLOYMENT
+              value: "${SVC}"
+            - name: OAI_VLLM_NAMESPACE
+              value: "${BENCHMARK_NAMESPACE}"
+            # Full deployed instance type (e.g. g7e.24xlarge). load-test.py records
+            # this and looks up its $/hr from the EC2 price book — dynamic cost,
+            # no per-instance manifest edits. Empty → falls back to the manifest.
+            - name: OAI_INSTANCE_TYPE
+              value: "${INSTANCE_TYPE}"
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            runAsUser: 65534
+            runAsGroup: 65534
+            capabilities:
+              drop: ["ALL"]
+            seccompProfile:
+              type: RuntimeDefault
+          resources:
+            requests:
+              cpu: "2"
+              memory: "4Gi"
+            limits:
+              cpu: "4"
+              memory: "8Gi"
+          volumeMounts:
+            - name: app-code
+              mountPath: /app
+              readOnly: true
+            - name: manifest
+              mountPath: /configs/manifests
+              readOnly: true
+            - name: profile-${P}
+              mountPath: /configs/profiles
+              readOnly: true
+            - name: results
+              mountPath: /results
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: app-code
+          configMap:
+            name: ${SCRIPT_CM}
+        - name: manifest
+          configMap:
+            name: ${MANIFEST_CM}
+        - name: profile-${P}
+          configMap:
+            name: ${JOB_NAME_BASE}-profile-${P}
+        - name: results
+          emptyDir:
+            sizeLimit: 1Gi
+        - name: tmp
+          emptyDir:
+            sizeLimit: 4Gi
+EOF
+    log_info "${P} Job submitted: ${JOB_NAME}"
+}
+
+# Submit realtime FIRST so its marker-writing Job exists before batch's gate
+# starts polling. Order within PROFILE_LIST already puts realtime before batch.
+SUBMITTED_JOBS=()
+for P in "${PROFILE_LIST[@]}"; do
+    submit_profile_job "${P}"
+    SUBMITTED_JOBS+=("$(k8s_name "${JOB_NAME_BASE}-${P}")")
+done
+
+# ==============================================================================
+# Step 3 — Detach. All Jobs are now running server-side; the terminal is free.
+# The batch Job self-gates on realtime via the S3 marker, so ordering holds even
+# if this script exits right now (Ctrl+C or closing the shell is safe).
+# ==============================================================================
+echo ""
+echo "======================================================"
+echo "  BENCHMARK JOB(S) SUBMITTED — running in-cluster"
+echo "  Profiles : ${PROFILE_LIST[*]}  (separate Jobs, batch gated on realtime)"
+for J in "${SUBMITTED_JOBS[@]}"; do
+    echo "    • ${J}"
+done
+echo "  Results  : s3://${RESULTS_BUCKET}/results/${TIMESTAMP}/"
+echo "======================================================"
+echo ""
+echo "  These Jobs run on the cluster independently of this terminal."
+echo "  Closing the shell or pressing Ctrl+C does NOT stop them."
+echo ""
+echo "  Follow logs:"
+for J in "${SUBMITTED_JOBS[@]}"; do
+    echo "    kubectl logs -n ${BENCHMARK_NAMESPACE} -l job-name=${J} -f --tail=50"
+done
+echo ""
+echo "  Job status:"
+echo "    kubectl get jobs -n ${BENCHMARK_NAMESPACE} -l model=${MODEL} -w"
+echo ""
+echo "  Results (as they upload, per concurrency level):"
+echo "    aws s3 ls s3://${RESULTS_BUCKET}/results/${TIMESTAMP}/ --recursive --region ${AWS_REGION}"
+echo "    aws s3 cp s3://${RESULTS_BUCKET}/results/${TIMESTAMP}/ results/ --recursive --region ${AWS_REGION}"
+echo ""
+echo "  Grafana  : kubectl port-forward svc/kube-prometheus-stack-grafana 3000:80 -n monitoring"
+echo ""
+
+if [[ "${DETACH}" == "true" ]]; then
+    log_info "Detached. All performance Jobs continue in-cluster."
+    exit 0
+fi
+
+# Optional best-effort log tail of the FIRST (realtime) Job so an attended run
+# still sees live output. Detaching here (Ctrl+C) leaves all Jobs running.
+FIRST_JOB="${SUBMITTED_JOBS[0]}"
+log_info "Tailing ${FIRST_JOB} (Ctrl+C detaches — Jobs keep running in cluster)..."
+for i in $(seq 1 30); do
+    POD=$(kubectl get pods -l "job-name=${FIRST_JOB}" \
+        -n "${BENCHMARK_NAMESPACE}" \
+        -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || echo "")
+    [[ -n "${POD}" ]] && break
+    echo -n "."
+    sleep 5
+done
+echo ""
+if [[ -n "${POD:-}" ]]; then
+    kubectl logs "${POD}" -n "${BENCHMARK_NAMESPACE}" -f 2>/dev/null || true
+fi
+
+exit 0

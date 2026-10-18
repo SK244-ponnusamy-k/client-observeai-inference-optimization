@@ -1,0 +1,26 @@
+# ==============================================================================
+# vllm/service/service-public.yaml  — REMOVED / SECURITY HOLD
+# ==============================================================================
+#
+# A public NLB (LoadBalancer type with internet-facing scheme) with no
+# authentication was previously defined here.
+#
+# This configuration is PROHIBITED per shellkode-security.md:
+#   - An unauthenticated, internet-facing NLB on port 8000 exposes the vLLM
+#     OpenAI-compatible API to anyone with the DNS name.
+#   - No API key, no JWT, no IP allowlist — full GPU access for zero cost to
+#     an attacker.
+#   - Escalated as a findings pattern across multiple projects.
+#
+# APPROVED alternative for external access:
+#   vllm/service/service-ingress.yaml — HTTPS ALB Ingress with:
+#     * TLS termination (ACM certificate)
+#     * HTTP→HTTPS redirect
+#     * Restrict to internal CIDR or add an API Gateway / Cognito authorizer
+#       in front of the ALB for token-based auth before reaching vLLM
+#
+# For local/in-cluster access (benchmarking, development):
+#   vllm/service/service-private.yaml — ClusterIP + kubectl port-forward
+#
+# DO NOT recreate a public unauthenticated LoadBalancer Service.
+# ==============================================================================
