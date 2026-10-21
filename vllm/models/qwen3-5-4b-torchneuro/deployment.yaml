@@ -1,0 +1,269 @@
+# ==============================================================================
+# vllm/models/qwen3-5-4b-torchneuro/deployment.yaml
+#
+# TorchNeuron-native serve stage for Qwen/Qwen3.5-4B on AWS Trainium2.
+#
+# The TorchNeuron approach (public beta Oct 20 2026):
+#   TorchNeuron registers Trainium as a standard PyTorch device via PrivateUse1,
+#   so the model loads with a single device pointer change:
+#
+#     model = AutoModelForCausalLM.from_pretrained(..., device_map="neuron")
+#
+#   vLLM Neuron (a TorchNeuron plugin) then serves the model with a plain
+#   `vllm serve` command — no custom modeling code, no ConfigMaps, no FastAPI shim.
+#   This is structurally identical to the gpt-oss-20b-neuron path.
+#
+# Init flow:
+#   1. model-sync  : sync bf16 weights S3 → /model (aws-cli init container)
+#
+# Main container: NEURON_VLLM_IMAGE running `vllm serve /model --device neuron`
+#   - TorchNeuron detects the "neuron" device via torch.accelerator
+#   - NEFF artifacts are loaded from NEURONX_CACHE (pre-populated by compile job)
+#   - torch.compiler.set_default_backend("neuron") is set automatically by vLLM Neuron
+#
+# nodeSelector: eks.amazonaws.com/instance-family (Karpenter).
+# For the managed node-group fallback see deployment-managed-ng.yaml.
+#
+# Runtime values injected via envsubst by deploy.sh:
+#   ${BENCHMARK_NAMESPACE} ${NEURON_VLLM_IMAGE} ${MODEL_BUCKET}
+#   ${MODEL_FOLDER} ${MODEL_HF_ID} ${SERVED_NAME} ${NEURON_CORES}
+#   ${AWS_REGION} ${S3_BUCKET_REGION}
+# ==============================================================================
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: oai-infopt-vllm-qwen3-5-4b-torchneuro
+  namespace: ${BENCHMARK_NAMESPACE}
+  labels:
+    app.kubernetes.io/name: oai-infopt-vllm-qwen3-5-4b-torchneuro
+    app.kubernetes.io/component: inference-server
+    app.kubernetes.io/managed-by: oai-cli
+    app.kubernetes.io/version: "qwen3-5-4b-torchneuro"
+    project: observeai-inference-optimization
+    engagement: shellkode-sow
+    environment: sandbox
+    model: qwen3-5-4b-torchneuro
+    source: neuron
+  annotations:
+    checkov.io/skip1: "CKV_K8S_43=Image digest pinned in NEURON_VLLM_IMAGE via config/config.env"
+    checkov.io/skip2: "CKV_K8S_14=Image tag pinned in NEURON_VLLM_IMAGE; static analysis cannot resolve envsubst"
+    checkov.io/skip3: "CKV_K8S_15=imagePullPolicy IfNotPresent acceptable with pinned image"
+    checkov.io/skip4: "CKV_K8S_40=runAsUser 1000 pending vLLM-Neuron UID compatibility test"
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: oai-infopt-vllm-qwen3-5-4b-torchneuro
+  template:
+    metadata:
+      labels:
+        app: oai-infopt-vllm-qwen3-5-4b-torchneuro
+        app.kubernetes.io/name: oai-infopt-vllm-qwen3-5-4b-torchneuro
+        app.kubernetes.io/component: inference-server
+        project: observeai-inference-optimization
+        engagement: shellkode-sow
+        environment: sandbox
+        model: qwen3-5-4b-torchneuro
+        source: neuron
+    spec:
+      serviceAccountName: oai-infopt-serving-sa
+      automountServiceAccountToken: false
+      hostPID: false
+      hostIPC: false
+      hostNetwork: false
+
+      # Karpenter selects a trn2 node by instance family.
+      nodeSelector:
+        eks.amazonaws.com/instance-family: trn2
+
+      tolerations:
+        - key: aws.amazon.com/neuron
+          operator: Exists
+          effect: NoSchedule
+        - key: CriticalAddonsOnly
+          operator: Exists
+
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    app.kubernetes.io/component: benchmark-runner
+                topologyKey: kubernetes.io/hostname
+
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+
+      terminationGracePeriodSeconds: 180
+
+      initContainers:
+        - name: model-sync
+          image: amazon/aws-cli:2.15.0
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              set -euo pipefail
+              echo "Syncing weights from s3://${MODEL_BUCKET}/${MODEL_FOLDER}/ -> /model/"
+              aws s3 sync "s3://${MODEL_BUCKET}/${MODEL_FOLDER}/" /model/ \
+                --region "${AWS_DEFAULT_REGION}" --no-progress
+              echo "Sync complete. Files:"; ls -lh /model/
+              test -f /model/config.json && echo "config.json OK" || \
+                { echo "ERROR: config.json missing"; exit 1; }
+          env:
+            - name: AWS_DEFAULT_REGION
+              value: "${AWS_REGION}"
+            - name: MODEL_BUCKET
+              value: "${MODEL_BUCKET}"
+            - name: MODEL_FOLDER
+              value: "${MODEL_FOLDER}"
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: false
+            runAsNonRoot: true
+            runAsUser: 1000
+            runAsGroup: 1000
+            capabilities:
+              drop: ["ALL"]
+            seccompProfile:
+              type: RuntimeDefault
+          resources:
+            requests:
+              cpu: "4"
+              memory: "8Gi"
+            limits:
+              cpu: "8"
+              memory: "16Gi"
+          volumeMounts:
+            - name: model-weights
+              mountPath: /model
+
+      containers:
+        - name: vllm-neuron
+          image: ${NEURON_VLLM_IMAGE}
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              set -euo pipefail
+              echo "=== TorchNeuron vLLM Neuron serve ==="
+              echo "    model=/model  LNC=${NEURON_LOGICAL_NC_CONFIG}  TP/cores=${NEURON_CORES}"
+              echo ""
+              echo "TorchNeuron registers Trainium as a standard PyTorch device."
+              echo "vLLM Neuron detects it via torch.accelerator — no device-specific code."
+              echo ""
+              # NEURON_SKIP_EFA_AFFINITY=1: skip EFA NUMA binding on single-node;
+              # safe for trn2.3xlarge. Remove when running multi-node EFA.
+              NEURON_SKIP_EFA_AFFINITY=1 vllm serve /model \
+                --served-model-name "${SERVED_NAME}" \
+                --device neuron \
+                --max-model-len 8192 \
+                --max-num-batched-tokens 8192 \
+                --max-num-seqs 8 \
+                --tensor-parallel-size "${NEURON_CORES}" \
+                --block-size 8 \
+                --enable-prefix-caching \
+                --additional-config '{"neuron_config": {"num_batched_tokens_buckets": [2048,4096,8192], "num_seqs_buckets": [1,2,4,8]}}' \
+                --port 8000
+          ports:
+            - name: http
+              containerPort: 8000
+              protocol: TCP
+          env:
+            - name: HOME
+              value: "/tmp"
+            - name: USER
+              value: "vllm"
+            - name: MODEL_BUCKET
+              value: "${MODEL_BUCKET}"
+            - name: MODEL_FOLDER
+              value: "${MODEL_FOLDER}"
+            - name: SERVED_NAME
+              value: "${SERVED_NAME}"
+            - name: NEURON_CORES
+              value: "${NEURON_CORES}"
+            # LNC=2: fuse 2 physical NeuronCores into 1 logical core on trn2.
+            # Must match the value used at compile time exactly.
+            - name: NEURON_LOGICAL_NC_CONFIG
+              value: "2"
+            - name: NEURON_RT_NUM_CORES
+              value: "${NEURON_CORES}"
+            # Point vLLM Neuron at the pre-compiled NEFF cache synced from S3
+            # by the compile job. On a cache hit vLLM skips recompilation entirely.
+            - name: NEURONX_CACHE
+              value: "/tmp/neuronx_cache"
+            - name: NEURON_COMPILE_CACHE_URL
+              value: "/tmp/neuronx_cache"
+            - name: AWS_DEFAULT_REGION
+              value: "${AWS_REGION}"
+            # TorchNeuron sets the default PyTorch compile backend to "neuron"
+            # globally. vLLM Neuron calls torch.compiler.set_default_backend("neuron")
+            # before any torch.compile() call, so no per-call backend arg is needed.
+            - name: VLLM_NEURON_COMPILATION_TIMEOUT
+              value: "900"
+            - name: VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS
+              value: "900"
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: false
+            runAsNonRoot: true
+            runAsUser: 1000
+            runAsGroup: 1000
+            capabilities:
+              drop: ["ALL"]
+            seccompProfile:
+              type: RuntimeDefault
+          resources:
+            requests:
+              cpu: "16"
+              memory: "64Gi"
+              aws.amazon.com/neuron: "1"
+            limits:
+              cpu: "32"
+              memory: "128Gi"
+              aws.amazon.com/neuron: "1"
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 600
+            periodSeconds: 15
+            failureThreshold: 480
+            timeoutSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 720
+            periodSeconds: 30
+            failureThreshold: 10
+            timeoutSeconds: 5
+          volumeMounts:
+            - name: model-weights
+              mountPath: /model
+            - name: dshm
+              mountPath: /dev/shm
+            - name: tmp
+              mountPath: /tmp
+
+      volumes:
+        - name: model-weights
+          emptyDir:
+            sizeLimit: 60Gi
+        - name: dshm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 16Gi
+        - name: tmp
+          emptyDir:
+            sizeLimit: 100Gi

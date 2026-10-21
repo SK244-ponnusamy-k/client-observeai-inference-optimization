@@ -1,0 +1,97 @@
+#!/bin/bash
+# ==============================================================================
+# vllm/models/qwen3-5-4b-torchneuro/stop.sh
+#
+# Stops qwen3-5-4b-torchneuro. Deletes the Deployment, Service, and compile Job,
+# then frees the Trainium node so billing stops.
+#
+# Leaves intact: S3 weights (Qwen3.5-4B/), compiled NEFF cache
+#   (qwen3-5-4b-torchneuro-neff/), and monitoring resources.
+#
+#   bash stop.sh [--managed-ng]
+#
+#   --managed-ng  Scale the managed node group to 0 explicitly
+#                 (auto-detected when TRN2_NODEGROUP_NAME is set and the NG exists)
+# ==============================================================================
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+FRAMEWORK_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
+source "${FRAMEWORK_ROOT}/config/config.env"
+source "${SCRIPT_DIR}/model.env"
+
+GREEN='\033[0;32m'; YELLOW='\033[1;33m'; NC='\033[0m'
+log_info()  { echo -e "${GREEN}[INFO]  $(date +'%H:%M:%S')${NC} $1"; }
+log_warn()  { echo -e "${YELLOW}[WARN]  $(date +'%H:%M:%S')${NC} $1"; }
+
+USE_MANAGED_NG="false"
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --managed-ng) USE_MANAGED_NG="true"; shift ;;
+        *) shift ;;
+    esac
+done
+
+echo ""
+echo "=============================================================="
+echo "  FULL STOP (TorchNeuron) - ${MODEL_ID}"
+echo "=============================================================="
+echo ""
+
+if [[ "${OAI_ASSUME_YES:-false}" != "true" ]]; then
+    read -r -p "Proceed? [y/N]: " CONFIRM
+    [[ "${CONFIRM}" =~ ^[yY]$ ]] || { log_info "Cancelled."; exit 0; }
+fi
+
+log_info "Deleting deployment: ${DEPLOYMENT_NAME}..."
+kubectl delete deployment "${DEPLOYMENT_NAME}" \
+    -n "${BENCHMARK_NAMESPACE}" --ignore-not-found=true
+
+log_info "Deleting service: ${SERVICE_NAME}..."
+kubectl delete svc "${SERVICE_NAME}" \
+    -n "${BENCHMARK_NAMESPACE}" --ignore-not-found=true
+
+log_info "Cleaning up compile job (if any)..."
+kubectl delete job "oai-infopt-neuron-compile-${MODEL_ID}" \
+    -n "${BENCHMARK_NAMESPACE}" --ignore-not-found=true
+
+# ── Free the Trainium node ────────────────────────────────────────────────────
+# Auto-detect managed node group: if the named NG exists and is ACTIVE, treat it
+# as a managed NG deployment and scale to 0, regardless of the --managed-ng flag.
+if [[ -n "${TRN2_NODEGROUP_NAME:-}" ]]; then
+    NG_STATUS=$(aws eks describe-nodegroup \
+        --cluster-name "${CLUSTER_NAME}" \
+        --nodegroup-name "${TRN2_NODEGROUP_NAME}" \
+        --region "${AWS_REGION}" \
+        --query 'nodegroup.status' --output text 2>/dev/null || true)
+    [[ -n "${NG_STATUS}" && "${NG_STATUS}" != "None" ]] && USE_MANAGED_NG="true"
+fi
+
+if [[ "${USE_MANAGED_NG}" == "true" && -n "${TRN2_NODEGROUP_NAME:-}" ]]; then
+    log_info "Scaling managed node group ${TRN2_NODEGROUP_NAME} to 0 (stops billing)..."
+    aws eks update-nodegroup-config \
+        --cluster-name "${CLUSTER_NAME}" \
+        --nodegroup-name "${TRN2_NODEGROUP_NAME}" \
+        --scaling-config minSize=0,maxSize=1,desiredSize=0 \
+        --region "${AWS_REGION}" >/dev/null || \
+        log_warn "Could not scale node group — do it manually if needed."
+else
+    log_info "Locating Trainium node (Karpenter) for this deployment..."
+    TRN_NODE=$(kubectl get pod -l "app=${DEPLOYMENT_NAME}" \
+        -n "${BENCHMARK_NAMESPACE}" \
+        -o jsonpath='{.items[0].spec.nodeName}' 2>/dev/null || true)
+    if [[ -n "${TRN_NODE}" ]]; then
+        log_info "Deleting node ${TRN_NODE} (Karpenter NodeClaim will be reclaimed)..."
+        kubectl delete node "${TRN_NODE}" --ignore-not-found=true || \
+            log_warn "Node delete failed — check manually."
+    else
+        log_warn "No node found for this deployment — it may already be gone."
+    fi
+fi
+
+echo ""
+log_info "Stopped."
+log_info "S3 weights   : s3://${MODEL_BUCKET}/${MODEL_FOLDER}/"
+log_info "NEFF cache   : s3://${MODEL_BUCKET}/${NEFF_FOLDER}/"
+log_info "Both are preserved. Re-deploy fast (no recompile) with: bash deploy.sh --managed-ng"

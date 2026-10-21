@@ -1,0 +1,183 @@
+# ==============================================================================
+# vllm/models/qwen3-5-4b-torchneuro/compile-job.yaml
+#
+# Compiles Qwen/Qwen3.5-4B (bf16) → Neuron NEFF artifacts via TorchNeuron and
+# vLLM Neuron's ahead-of-time compilation path. The NEFF cache is stored in S3
+# so the serving Deployment reuses it on every subsequent start without recompiling.
+#
+# TorchNeuron approach (announced Oct 20 2026, public beta):
+#   pip install torch-neuronx  →  model.to('neuron')  →  vllm serve --compile
+#
+# Compile parameters are LOCKED into the NEFF — any change to cores/seq/batch
+# requires a full recompile (delete S3 folder, re-run this job).
+#
+# Runtime values injected via envsubst by deploy.sh:
+#   ${BENCHMARK_NAMESPACE} ${DOWNLOAD_SERVICE_ACCOUNT}
+#   ${MODEL_BUCKET} ${AWS_REGION} ${S3_BUCKET_REGION} ${NEURON_COMPILE_IMAGE}
+# ==============================================================================
+
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: oai-infopt-neuron-compile-qwen3-5-4b-torchneuro
+  namespace: ${BENCHMARK_NAMESPACE}
+  labels:
+    app.kubernetes.io/name: oai-infopt-neuron-compile-qwen3-5-4b-torchneuro
+    app.kubernetes.io/component: neuron-compile
+    app.kubernetes.io/managed-by: oai-cli
+    project: observeai-inference-optimization
+    engagement: shellkode-sow
+    environment: sandbox
+    model: qwen3-5-4b-torchneuro
+spec:
+  backoffLimit: 1
+  activeDeadlineSeconds: 43200
+  ttlSecondsAfterFinished: 3600
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: oai-infopt-neuron-compile-qwen3-5-4b-torchneuro
+        app.kubernetes.io/component: neuron-compile
+        project: observeai-inference-optimization
+        engagement: shellkode-sow
+        environment: sandbox
+        model: qwen3-5-4b-torchneuro
+    spec:
+      restartPolicy: Never
+      serviceAccountName: ${DOWNLOAD_SERVICE_ACCOUNT}
+      automountServiceAccountToken: false
+      hostPID: false
+      hostIPC: false
+      hostNetwork: false
+      nodeSelector:
+        eks.amazonaws.com/nodegroup: trn2-neuron
+      tolerations:
+        - key: aws.amazon.com/neuron
+          operator: Exists
+          effect: NoSchedule
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: neuron-compile
+          image: ${NEURON_COMPILE_IMAGE}
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              set -euo pipefail
+
+              SRC_S3="s3://${MODEL_BUCKET}/Qwen3.5-4B/"
+              NEFF_S3="s3://${MODEL_BUCKET}/qwen3-5-4b-torchneuro-neff/"
+              WORK_DIR="/tmp/model"
+              NEFF_DIR="/tmp/neuronx_cache"
+
+              # ── LNC=2, TP=4: 4 logical cores (each fuses 2 physical NeuronCores on trn2)
+              export NEURON_LOGICAL_NC_CONFIG="2"
+              NEURON_CORES="4"
+              SEQ_LEN="8192"
+              BATCH_SIZE="8"
+
+              echo "=== TorchNeuron compile: Qwen/Qwen3.5-4B ==="
+              echo "    source : ${SRC_S3}"
+              echo "    neff   : ${NEFF_S3}"
+              echo "    LNC=${NEURON_LOGICAL_NC_CONFIG}  TP/cores=${NEURON_CORES}  seq_len=${SEQ_LEN}  batch=${BATCH_SIZE}"
+
+              # ── [1/4] Check S3 NEFF cache (idempotent) ───────────────────────────────
+              echo ""
+              echo "[1/4] Checking S3 NEFF cache..."
+              if aws s3 ls "${NEFF_S3}" --region "${AWS_DEFAULT_REGION}" 2>/dev/null | grep -q .; then
+                echo "NEFF cache already present at ${NEFF_S3} — skipping recompile."
+                echo "To force recompile: aws s3 rm ${NEFF_S3} --recursive"
+                exit 0
+              fi
+
+              # ── [2/4] Sync bf16 weights from S3 ──────────────────────────────────────
+              echo ""
+              echo "[2/4] Syncing bf16 weights from ${SRC_S3}..."
+              mkdir -p "${WORK_DIR}" "${NEFF_DIR}"
+              aws s3 sync "${SRC_S3}" "${WORK_DIR}/" \
+                --region "${AWS_DEFAULT_REGION}" --no-progress
+              test -f "${WORK_DIR}/config.json" && echo "config.json OK" || \
+                { echo "ERROR: config.json missing — weights sync failed"; exit 1; }
+
+              # ── [3/4] Install TorchNeuron and compile ────────────────────────────────
+              # TorchNeuron (public beta Oct 20 2026) registers Trainium as a native
+              # PyTorch device via PrivateUse1. Installing torch-neuronx makes the
+              # "neuron" device available so `vllm serve --device neuron` works.
+              #
+              # The simplest approach from the TorchNeuron announcement:
+              #   model = AutoModelForCausalLM.from_pretrained(..., device_map="neuron")
+              #   # Trainium is auto-detected — no device-specific code beyond this line
+              #
+              # For vLLM Neuron the equivalent compile step uses optimum-neuron's
+              # neuron export which calls torch.compile(model, backend="neuron") under
+              # the hood, producing NEFF artifacts cached at NEURONX_CACHE.
+              echo ""
+              echo "[3/4] Installing torch-neuronx (TorchNeuron public beta) and compiling..."
+              pip install --quiet --extra-index-url https://pip.repos.neuron.amazonaws.com \
+                torch-neuronx neuronx-cc optimum-neuron
+
+              export PATH="/tmp/.local/bin:${PATH}"
+              export NEURONX_CACHE="${NEFF_DIR}"
+              export NEURON_RT_NUM_CORES="${NEURON_CORES}"
+
+              # optimum-cli export neuron uses torch.compile(backend="neuron") internally
+              # and writes NEFF artifacts to the output directory.
+              optimum-cli export neuron \
+                --model "${WORK_DIR}" \
+                --sequence_length "${SEQ_LEN}" \
+                --batch_size "${BATCH_SIZE}" \
+                --num_cores "${NEURON_CORES}" \
+                --auto_cast_type bf16 \
+                --task text-generation \
+                "${NEFF_DIR}/export"
+
+              # ── [4/4] Upload NEFF artifacts to S3 ────────────────────────────────────
+              echo ""
+              echo "[4/4] Uploading NEFF artifacts to ${NEFF_S3}..."
+              aws s3 sync "${NEFF_DIR}/" "${NEFF_S3}" \
+                --region "${AWS_DEFAULT_REGION}" --no-progress
+              echo "Compile complete. NEFF artifacts at ${NEFF_S3}"
+          env:
+            - name: AWS_DEFAULT_REGION
+              value: "${AWS_REGION}"
+            - name: MODEL_BUCKET
+              value: "${MODEL_BUCKET}"
+            - name: NEURONX_CACHE
+              value: "/tmp/neuronx_cache"
+            - name: HOME
+              value: "/tmp"
+          securityContext:
+            allowPrivilegeEscalation: false
+            # false: neuronx-cc + pip install write to the filesystem during compile.
+            readOnlyRootFilesystem: false
+            runAsNonRoot: true
+            runAsUser: 1000
+            runAsGroup: 1000
+            capabilities:
+              drop: ["ALL"]
+            seccompProfile:
+              type: RuntimeDefault
+          # trn2.3xlarge allocatable: ~11.9 vCPU / ~124 Gi. Keep requests modest
+          # so the pod fits; limits cover burst during sync + compile.
+          resources:
+            requests:
+              cpu: "4"
+              memory: "24Gi"
+              aws.amazon.com/neuron: "1"
+            limits:
+              cpu: "10"
+              memory: "96Gi"
+              aws.amazon.com/neuron: "1"
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir:
+            sizeLimit: 150Gi

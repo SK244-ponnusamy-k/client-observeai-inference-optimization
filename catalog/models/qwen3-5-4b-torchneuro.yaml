@@ -1,0 +1,77 @@
+# ==============================================================================
+# catalog/models/qwen3-5-4b-torchneuro.yaml
+#
+# Qwen/Qwen3.5-4B on AWS Trainium2 via TorchNeuron — the native PyTorch backend
+# for Trainium announced October 20 2026.
+#
+# TorchNeuron registers Trainium as a standard PyTorch device (PrivateUse1) so
+# the model loads with device_map="neuron" and vLLM Neuron serves it with a
+# plain `vllm serve --device neuron`. No custom modeling code, no FastAPI shim,
+# no ConfigMaps — the simplest possible Neuron serving path.
+#
+# This supersedes the qwen3-5-4b-nxdi entry (custom NxDI + FastAPI shim path).
+# Both entries are kept in the catalog during transition; remove nxdi once this
+# path is validated end-to-end on hardware.
+#
+# Deploy: bash vllm/models/qwen3-5-4b-torchneuro/deploy.sh [--compile] [--managed-ng]
+# ==============================================================================
+
+id: qwen3-5-4b-torchneuro
+display_name: Qwen3.5-4B (Trainium / TorchNeuron, native PyTorch)
+hardware: neuron
+
+source:
+  hf_id: Qwen/Qwen3.5-4B
+  gated: false
+  size_gb: 9
+  # S3 folder shared with the GPU and NxDI paths — download once.
+  s3_folder: Qwen3.5-4B
+
+serving:
+  engine: vllm-neuron              # standard vllm serve --device neuron
+  served_name: Qwen3.5-4B
+  tokenizer: Qwen/Qwen3.5-4B
+  quantization: bf16
+  max_model_len: 8192
+  max_num_seqs: 8
+  tensor_parallel_size: 4
+
+resources:
+  cpu_request: "16"
+  cpu_limit: "32"
+  memory_request: "64Gi"
+  memory_limit: "128Gi"
+
+instances:
+  neuron_cores: 4                  # = tensor-parallel degree; must match compile time
+  logical_neuron_config: 2         # LNC=2 on trn2: fuse 2 physical NeuronCores → 1 logical
+  candidates:
+    - trn2.3xlarge                 # 1 chip, cost-optimized target
+    - trn2.48xlarge                # fallback for larger context / higher throughput
+  node_group: trn2-neuron
+
+neuron:
+  engine: vllm-neuron              # native TorchNeuron path (not custom NxDI)
+  source_folder: Qwen3.5-4B
+  neff_folder: qwen3-5-4b-torchneuro-neff
+  sequence_length: 8192
+  batch_size: 8
+  auto_cast_type: bf16
+  instance_family: trn2
+  logical_neuron_config: 2
+  # Bucket lists baked into NEFF at compile time — changing requires recompile.
+  num_seqs_buckets: "1,2,4,8"
+  num_batched_tokens_buckets: "2048,4096,8192"
+  # TorchNeuron compile: optimum-cli export neuron (calls torch.compile backend=neuron)
+  # install: pip install torch-neuronx --extra-index-url https://pip.repos.neuron.amazonaws.com
+
+benchmark:
+  auto: false
+  profiles:
+    - configs/workload_profiles/realtime_v1.yaml
+    - configs/workload_profiles/batch_v1.yaml
+  instance_hourly_usd: 2.235       # trn2.3xlarge — verify for your region before run
+
+tags:
+  Owner: TBD
+  CostCenter: TBD
