@@ -5,29 +5,29 @@
 # Served by the OpenAI-compatible shim on :8000, so the load-test harness reads
 # this file unchanged. Edit catalog/models/qwen3-5-9b-nxdi.yaml or tweak here.
 # ==============================================================================
-run_id: qwen3-5-9b-nxdi-2026-10-18-001
-description: "Qwen/Qwen3.5-9B bf16 (DeltaNet+GQA), trn2.3xlarge, NxDI shim"
+run_id: qwen3-5-9b-nxdi-2026-10-21-001
+description: "Qwen/Qwen3.5-9B bf16 (DeltaNet+GQA), trn2.48xlarge, NxDI shim"
 
 model:
   hf_id: Qwen/Qwen3.5-9B
   served_name: Qwen3.5-9B
   tokenizer: Qwen/Qwen3.5-9B
-  s3_prefix: Qwen3.5-9B/
+  s3_prefix: qwen3-5-9b-tp1/
   source: neuron
 
 serving:
   engine: nxdi
   image: public.ecr.aws/neuron/pytorch-inference-neuronx:2.9.0-neuronx-py312-sdk2.31.1-ubuntu24.04
   nodepool: neuron-inf
-  instance_type: trn2.3xlarge
+  instance_type: trn2.48xlarge
 
 optimization_variants:
-  - label: bf16-trn2-nxdi
+  - label: bf16-trn2-48xl-nxdi
     quantization: bf16
-    tensor_parallel_size: 4
-    max_num_seqs: 1
-    max_num_batched_tokens: 8192
-    max_model_len: 8192           # UNVALIDATED above the reference baseline of 160
+    tensor_parallel_size: 4      # TP=4 — reference-validated (TP=16 hung on-device, NRT_TIMEOUT)
+    max_num_seqs: 4              # prefill batch baked at compile; 16 overflows HBM (NCC_EVRF009)
+    max_num_batched_tokens: 2048
+    max_model_len: 2048          # DeltaNet CTE kernel hung at 4096 (32 chunks); 2048=16 chunks
     kv_cache_dtype: auto
 
 benchmark:
@@ -36,7 +36,7 @@ benchmark:
     - configs/workload_profiles/batch_v1.yaml
 
 cost:
-  instance_hourly_usd: 2.235      # VERIFY before run
+  instance_hourly_usd: 12.0      # trn2.48xlarge Capacity Block rate — VERIFY before run
 
 tags:
   Project: observeai-inference-optimization
@@ -45,4 +45,4 @@ tags:
   ManagedBy: oai-cli
   Owner: TBD
   CostCenter: TBD
-  RunId: qwen3-5-9b-nxdi-2026-10-18-001
+  RunId: qwen3-5-9b-nxdi-2026-10-21-001

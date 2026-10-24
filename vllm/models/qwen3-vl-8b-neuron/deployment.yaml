@@ -139,13 +139,13 @@ spec:
                 --served-model-name "${SERVED_NAME}" \
                 --max-model-len 8192 \
                 --max-num-batched-tokens 8192 \
-                --max-num-seqs 4 \
+                --max-num-seqs 16 \
                 --tensor-parallel-size "${NEURON_CORES}" \
                 --block-size 8 \
                 --enable-prefix-caching \
                 --no-disable-hybrid-kv-cache-manager \
                 --hf-overrides '{"quantization_config": {}}' \
-                --additional-config '{"neuron_config": {"num_batched_tokens_buckets": [8192], "num_seqs_buckets": [4]}}' \
+                --additional-config '{"neuron_config": {"num_batched_tokens_buckets": [8192], "num_seqs_buckets": [4, 8, 16]}}' \
                 --port 8000
           ports:
             - name: http
@@ -189,13 +189,13 @@ spec:
               type: RuntimeDefault
           resources:
             requests:
-              cpu: "4"
-              memory: "32Gi"
-              aws.amazon.com/neuron: "1"
+              cpu: "48"
+              memory: "256Gi"
+              aws.amazon.com/neuron: "4"
             limits:
-              cpu: "8"
-              memory: "64Gi"
-              aws.amazon.com/neuron: "1"
+              cpu: "96"
+              memory: "512Gi"
+              aws.amazon.com/neuron: "4"
           readinessProbe:
             httpGet:
               path: /health

@@ -524,6 +524,16 @@ ${MARK_STEP}
             # no per-instance manifest edits. Empty → falls back to the manifest.
             - name: OAI_INSTANCE_TYPE
               value: "${INSTANCE_TYPE}"
+            # Benchmark backend/endpoint. Defaults to openai-chat + /v1/chat/
+            # completions. Overridable via OAI_BENCH_BACKEND / OAI_BENCH_ENDPOINT
+            # (set in the environment that runs this script) for models whose
+            # chat template injects control tokens that decode to empty content
+            # (e.g. Qwen3.5 NxDI thinking model) — those benchmark against the
+            # raw /v1/completions endpoint so output tokens are real.
+            - name: OAI_BENCH_BACKEND
+              value: "${OAI_BENCH_BACKEND:-openai-chat}"
+            - name: OAI_BENCH_ENDPOINT
+              value: "${OAI_BENCH_ENDPOINT:-/v1/chat/completions}"
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true

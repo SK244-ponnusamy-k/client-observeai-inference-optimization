@@ -27,6 +27,8 @@ otherwise the cached artifact is loaded.
 
 from __future__ import annotations
 
+import asyncio
+from dataclasses import dataclass
 import json
 import logging
 import os
@@ -43,6 +45,14 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+@dataclass
+class _BatchItem:
+    prompt: str
+    max_new_tokens: int
+    correlation_id: str
+    future: asyncio.Future
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Structured JSON logging (correlation id per request)
@@ -139,9 +149,8 @@ class Qwen35Engine:
     """Owns the compiled NxDI model + tokenizer and runs generation.
 
     The compiled Neuron graph is single-tenant: concurrent generate() calls on
-    one engine are not safe, so calls are serialized with a lock. Concurrency is
-    achieved by `max_batch_size`/batching at the model level, not by parallel
-    Python calls.
+    one engine are not safe. Concurrency is achieved via dynamic micro-batching
+    up to `max_batch_size` in a non-blocking background worker.
     """
 
     def __init__(self, settings: Settings) -> None:
@@ -151,6 +160,8 @@ class Qwen35Engine:
         self._gen_model: Any = None
         self._tokenizer: Any = None
         self._ready = False
+        self._queue: Optional[asyncio.Queue[_BatchItem]] = None
+        self._worker_task: Optional[asyncio.Task] = None
 
     @property
     def ready(self) -> bool:
@@ -242,7 +253,8 @@ class Qwen35Engine:
 
         # model_path is a LOCAL dir synced from our own S3 bucket (not a Hub
         # repo), so there is no remote download/revision to pin here.
-        tokenizer = AutoTokenizer.from_pretrained(s.model_path, padding_side="right")  # nosec B615
+        # Left-padding is required for causal LM batch generation.
+        tokenizer = AutoTokenizer.from_pretrained(s.model_path, padding_side="left")  # nosec B615
         if tokenizer.pad_token is None:
             tokenizer.pad_token = tokenizer.eos_token
 
@@ -252,12 +264,57 @@ class Qwen35Engine:
         self._ready = True
         _log(logging.INFO, "Model ready", served_model_name=s.served_model_name)
 
-    def generate(self, prompt: str, max_new_tokens: int, correlation_id: str) -> Dict[str, int | str]:
-        """Run a single generation. Returns text + token usage.
+    def start_worker(self) -> None:
+        """Initialize the async request queue and start the batch worker loop."""
+        self._queue = asyncio.Queue()
+        self._worker_task = asyncio.create_task(self._batch_loop())
 
-        Raises:
-            RuntimeError: if called before the model is loaded.
-        """
+    async def stop_worker(self) -> None:
+        """Cancel the background batch worker loop cleanly."""
+        if self._worker_task is not None:
+            self._worker_task.cancel()
+            try:
+                await self._worker_task
+            except asyncio.CancelledError:
+                pass
+            self._worker_task = None
+
+    async def _batch_loop(self) -> None:
+        """Worker loop that dynamically batches requests up to max_batch_size."""
+        while True:
+            try:
+                assert self._queue is not None
+                item = await self._queue.get()
+            except asyncio.CancelledError:
+                break
+
+            items = [item]
+            max_batch = self._settings.max_batch_size
+            # 10ms micro-batch window: collect concurrent requests without adding latency
+            batch_window_s = 0.010
+            t_start = time.time()
+            while len(items) < max_batch:
+                time_left = max(0.001, batch_window_s - (time.time() - t_start))
+                try:
+                    next_item = await asyncio.wait_for(self._queue.get(), timeout=time_left)
+                    items.append(next_item)
+                except (asyncio.TimeoutError, asyncio.CancelledError):
+                    break
+
+            try:
+                # Offload blocking inference to thread pool to keep event loop responsive
+                results = await asyncio.to_thread(self._process_batch, items)
+                for itm, res in zip(items, results):
+                    if not itm.future.done():
+                        itm.future.set_result(res)
+            except Exception as exc:  # pragma: no cover
+                _log(logging.ERROR, "batch processing failed", error=str(exc))
+                for itm in items:
+                    if not itm.future.done():
+                        itm.future.set_exception(exc)
+
+    def _process_batch(self, items: List[_BatchItem]) -> List[Dict[str, int | str]]:
+        """Synchronously execute a batched generation on the compiled model."""
         if not self._ready:
             raise RuntimeError("Model not loaded")
 
@@ -265,8 +322,12 @@ class Qwen35Engine:
 
         s = self._settings
         tokenizer = self._tokenizer
-        inputs = tokenizer(prompt, return_tensors="pt")
-        prompt_tokens = int(inputs.input_ids.shape[-1])
+        prompts = [it.prompt for it in items]
+        max_new_tokens = max(it.max_new_tokens for it in items)
+
+        inputs = tokenizer(prompts, padding=True, return_tensors="pt")
+        prompt_lengths = [int(mask.sum().item()) for mask in inputs.attention_mask]
+        padded_prompt_len = int(inputs.input_ids.shape[-1])
 
         gen_config = GenerationConfig(
             do_sample=s.top_k_on_device > 1,
@@ -285,20 +346,52 @@ class Qwen35Engine:
             )
         latency_ms = round((time.time() - t0) * 1000.0, 1)
 
-        full = outputs[0]
-        completion_ids = full[prompt_tokens:]
-        text = tokenizer.decode(completion_ids, skip_special_tokens=True)
-        completion_tokens = int(completion_ids.shape[-1])
+        results: List[Dict[str, int | str]] = []
+        for i, itm in enumerate(items):
+            full = outputs[i]
+            completion_ids = full[padded_prompt_len:]
+            text = tokenizer.decode(completion_ids, skip_special_tokens=True)
+            completion_tokens = int(completion_ids.shape[-1])
 
-        _log(logging.INFO, "generation complete", correlation_id=correlation_id,
-             prompt_tokens=prompt_tokens, completion_tokens=completion_tokens,
-             latency_ms=latency_ms)
+            _log(logging.INFO, "generation complete", correlation_id=itm.correlation_id,
+                 prompt_tokens=prompt_lengths[i], completion_tokens=completion_tokens,
+                 batch_size=len(items), latency_ms=latency_ms)
 
-        return {
-            "text": text,
-            "prompt_tokens": prompt_tokens,
-            "completion_tokens": completion_tokens,
-        }
+            results.append({
+                "text": text,
+                "prompt_tokens": prompt_lengths[i],
+                "completion_tokens": completion_tokens,
+            })
+        return results
+
+    async def generate_async(
+        self, prompt: str, max_new_tokens: int, correlation_id: str
+    ) -> Dict[str, int | str]:
+        """Enqueue request into the dynamic batch queue and await result."""
+        if not self._ready or self._queue is None:
+            raise RuntimeError("Model not loaded or queue not ready")
+
+        loop = asyncio.get_running_loop()
+        future: asyncio.Future = loop.create_future()
+        await self._queue.put(
+            _BatchItem(
+                prompt=prompt,
+                max_new_tokens=max_new_tokens,
+                correlation_id=correlation_id,
+                future=future,
+            )
+        )
+        return await future
+
+    def generate(self, prompt: str, max_new_tokens: int, correlation_id: str) -> Dict[str, int | str]:
+        """Synchronous fallback for direct generation."""
+        item = _BatchItem(
+            prompt=prompt,
+            max_new_tokens=max_new_tokens,
+            correlation_id=correlation_id,
+            future=asyncio.Future(),
+        )
+        return self._process_batch([item])[0]
 
     def apply_chat_template(self, messages: List[Dict[str, str]]) -> str:
         """Render chat messages to a prompt string via the model's chat template."""
@@ -346,7 +439,9 @@ async def lifespan(app: FastAPI):  # noqa: D401
     _log(logging.INFO, "Starting Qwen3.5 NxDI shim", served_model_name=_SETTINGS.served_model_name,
          port=_SETTINGS.port)
     _ENGINE.load()
+    _ENGINE.start_worker()
     yield
+    await _ENGINE.stop_worker()
 
 
 app = FastAPI(title="Qwen3.5 NxDI OpenAI-compatible shim", lifespan=lifespan)
@@ -393,7 +488,7 @@ async def completions(req: CompletionRequest, request: Request) -> Dict[str, Any
     if req.stream:
         raise HTTPException(status_code=400, detail="streaming is not supported by this shim")
     try:
-        result = _ENGINE.generate(req.prompt, _max_tokens(req.max_tokens), corr)
+        result = await _ENGINE.generate_async(req.prompt, _max_tokens(req.max_tokens), corr)
     except RuntimeError as exc:
         _log(logging.ERROR, "generation failed", correlation_id=corr, error=str(exc))
         raise HTTPException(status_code=503, detail=str(exc)) from exc
@@ -422,7 +517,7 @@ async def chat_completions(req: ChatCompletionRequest, request: Request) -> Dict
     messages = [{"role": m.role, "content": m.content} for m in req.messages]
     prompt = _ENGINE.apply_chat_template(messages)
     try:
-        result = _ENGINE.generate(prompt, _max_tokens(req.max_tokens), corr)
+        result = await _ENGINE.generate_async(prompt, _max_tokens(req.max_tokens), corr)
     except RuntimeError as exc:
         _log(logging.ERROR, "chat generation failed", correlation_id=corr, error=str(exc))
         raise HTTPException(status_code=503, detail=str(exc)) from exc

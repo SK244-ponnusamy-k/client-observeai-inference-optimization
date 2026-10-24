@@ -22,24 +22,24 @@ serving:
   tokenizer: openai/gpt-oss-20b
   quantization: bf16
   max_model_len: 8192           # sized to real transcripts (XL prompts 2k-7k tok + verdict/CoT budget)
-  max_num_seqs: 32              # primary recompile pass; 64 is the follow-up pass. Must match top num_seqs bucket.
+  max_num_seqs: 64              # primary recompile pass on trn2.48xlarge; top bucket. Pass 2 uses 128.
   # MUST be < max_model_len so vLLM-Neuron enables SEGMENTED prefill, which
   # --enable-prefix-caching (APC) requires. Equal values -> single-shot prefill
   # -> APC refuses to start. Supported segmented sizes: 512/1024/2048/4096/8192.
   max_num_batched_tokens: 4096  # == the single prefill bucket / KV segment size
+  tensor_parallel_size: 16      # TP=16 — trn2.48xlarge has 16 logical cores (LNC=2)
 
 resources:
-  cpu_request: "8"
-  cpu_limit: "12"
-  memory_request: "64Gi"
-  memory_limit: "128Gi"
+  cpu_request: "48"
+  cpu_limit: "96"
+  memory_request: "256Gi"
+  memory_limit: "512Gi"
 
 instances:
   logical_neuron_config: 2      # LNC=2 explicit (NEURON_LOGICAL_NC_CONFIG): 2 physical NeuronCores fused per logical core
-  neuron_cores: 4               # TP=4 -> 4 logical cores; must equal compile-time --num_cores and tensor_parallel_size
+  neuron_cores: 16              # TP=16 -> 16 logical cores; must equal compile-time --num_cores and tensor_parallel_size
   candidates:
-    - trn2.3xlarge
-    - trn2.48xlarge
+    - trn2.48xlarge             # primary — validated for gpt-oss MoE at TP=16
     - trn1.32xlarge
   node_group: trn2-neuron            # managed node group in ai-eks-cluster-trn2, ap-southeast-4
 
@@ -52,14 +52,14 @@ neuron:
   source_folder: gpt-oss-20b        # bf16 weights (serve-time compile input)
   neff_folder: gpt-oss-20b-neuron   # (unused for serve_time) local NxDI cache at serve time
   sequence_length: 8192             # == max_model_len; sized to real transcripts
-  batch_size: 32                    # == max_num_seqs (top bucket). Pass 2 uses 64.
+  batch_size: 64                    # == max_num_seqs (top bucket). Pass 2 uses 128.
   auto_cast_type: bf16
   logical_neuron_config: 2          # LNC=2 (NEURON_LOGICAL_NC_CONFIG) — serve-time value
-  num_cores: 4                      # TP=4; must equal serving tensor_parallel_size
-  num_seqs_buckets: [1, 2, 4, 8, 16, 32]       # compiled batch buckets
+  num_cores: 16                     # TP=16; must equal serving tensor_parallel_size
+  num_seqs_buckets: [1, 2, 4, 8, 16, 32, 64]   # compiled batch buckets (trn2.48xlarge)
   # The segmented-prefill kernel requires EXACTLY ONE prefill bucket, equal to
   # the KV segment size (== max_num_batched_tokens). Multiple values are rejected.
-  num_batched_tokens_buckets: [4096]           # single prefill bucket == max_num_batched_tokens
+  num_batched_tokens_buckets: [4096]            # single prefill bucket == max_num_batched_tokens
   instance_family: trn2             # gpt-oss needs trn2/trn3 (sink attention unsupported on trn1)
 
 benchmark:
@@ -67,5 +67,4 @@ benchmark:
   profiles:
     - configs/workload_profiles/realtime_v1.yaml
     - configs/workload_profiles/batch_v1.yaml
-  instance_hourly_usd: 2.235        # trn2.3xlarge Capacity Block rate — verified (labelled "Capacity Block" in cost report)
-  # instance_hourly_usd: 12.00       # trn2.48xlarge Capacity Block — uncomment if using 48xlarge
+  instance_hourly_usd: 12.0         # trn2.48xlarge Capacity Block rate — verified

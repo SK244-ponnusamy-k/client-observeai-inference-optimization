@@ -91,6 +91,15 @@ from neuronx_distributed_inference.models.layer_boundary_marker import (
 
 logger = logging.getLogger(__name__)
 
+
+def _text_only():
+    """True when QWEN35_TEXT_ONLY=1: trace/serve a text-only graph (no mrope/
+    vision inputs) so the stock NxDI text generation path is used. The VL
+    machinery (24-arg forward) is incompatible with the installed SDK 2.31.1
+    generation dispatch, so gate it off in text-only mode."""
+    return os.environ.get("QWEN35_TEXT_ONLY") == "1"
+
+
 try:
     _flash_fwd_call = nki_jit()(attention_isa_kernel)
 except TypeError:
@@ -1667,6 +1676,18 @@ class NeuronQwen35Model(NeuronBaseModel):
         else:
             position_ids = position_ids.view(-1, seq_length).long()
 
+        # DECODE guard: the token-generation KV-cache scatter uses position_ids
+        # directly as the sequence-axis index into a buffer of size n_positions
+        # (= seq_len, 2048). The stock NxDI batched-decode position bookkeeping
+        # (amax(position_ids)+1 over a left-padded batch) can climb past the
+        # compiled bound across sustained/batched requests, producing an
+        # on-device scalar-DGE out-of-bounds scatter (status=1006) on
+        # token_generation_model. Clamp the decode position to the last valid
+        # slot so the scatter/gather stays in bounds. Prefill is left untouched
+        # (it legitimately spans 0..seq_len-1). Static op → compiles cleanly.
+        if not is_for_context_encoding:
+            position_ids = position_ids.clamp(max=self.n_positions - 1)
+
         hidden_states = inputs_embeds
 
         # Get KV cache for TKG
@@ -2057,6 +2078,9 @@ class Qwen35ModelWrapper(ModelWrapper):
 
     def input_generator(self):
         """Generate inputs including mrope_position_ids, vision_embeddings, and vision_mask."""
+        if _text_only():
+            # Text-only: no VL inputs (14 empties + 3 VL tensors) appended.
+            return super().input_generator()
         base_inputs = super().input_generator()
         extended_inputs = []
 
@@ -2105,6 +2129,9 @@ class Qwen35ModelWrapper(ModelWrapper):
 
     def pad_inputs(self, *args, pad_type="first_fit"):
         """Override to pad mrope_position_ids and vision inputs to bucket size."""
+        if _text_only():
+            # Text-only: no VL tensors to pad; use the stock padding.
+            return super().pad_inputs(*args, pad_type=pad_type)
         orig_mrope = args[21] if len(args) >= 22 else None
         orig_vis_emb = args[22] if len(args) >= 23 else None
         orig_vis_mask = args[23] if len(args) >= 24 else None
@@ -2308,6 +2335,9 @@ class NeuronQwen35ForCausalLM(NeuronBaseForCausalLM):
 
     def get_required_kwargs(self):
         """Return extra kwargs for HF generation loop."""
+        if _text_only():
+            # Text-only: no llava_args; the stock text generation path is used.
+            return []
         return ["llava_args"]
 
     def _get_model_outputs(
@@ -2328,6 +2358,24 @@ class NeuronQwen35ForCausalLM(NeuronBaseForCausalLM):
         tf_args=None,
     ):
         """Override to pass all 24 positional args explicitly."""
+        if _text_only():
+            # Text-only: defer to the stock NxDI dispatch (no VL tensors).
+            return super()._get_model_outputs(
+                input_ids,
+                attention_mask,
+                position_ids,
+                seq_ids,
+                sampling_params,
+                prev_hidden,
+                adapter_ids,
+                medusa_args,
+                llava_args,
+                slot_mapping=slot_mapping,
+                block_table=block_table,
+                full_context_lens=full_context_lens,
+                computed_context_lens=computed_context_lens,
+                tf_args=tf_args,
+            )
         is_prefill = self._is_prefill(position_ids)
 
         seq_len = input_ids.shape[1]

@@ -49,6 +49,9 @@ spec:
         - key: eks.amazonaws.com/instance-family
           operator: In
           values: ["trn2"]
+        - key: eks.amazonaws.com/instance-size
+          operator: In
+          values: ["48xlarge"]
         - key: kubernetes.io/arch
           operator: In
           values: ["amd64"]

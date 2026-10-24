@@ -1,0 +1,72 @@
+# ==============================================================================
+# cluster/trn2-capacity-block.yaml
+#
+# EKS Auto Mode NodeClass and Karpenter NodePool targeting the EC2 Capacity Block:
+#   Reservation ID: cr-0f88717a869c849b3
+#   Instance Type : trn2.48xlarge
+#   AZ            : us-east-2b (subnet-095b8302fffbc8f3f)
+# ==============================================================================
+
+apiVersion: eks.amazonaws.com/v1
+kind: NodeClass
+metadata:
+  name: neuron-cb
+  labels:
+    app.kubernetes.io/component: nodeclass
+    app.kubernetes.io/managed-by: karpenter
+    project: observeai-inference-optimization
+spec:
+  role: eksctl-ai-eks-cluster-cluster-AutoModeNodeRole-7N7BQHCXgFYp
+  capacityReservationSelectorTerms:
+    - id: "cr-0f88717a869c849b3"
+  subnetSelectorTerms:
+    - id: "subnet-095b8302fffbc8f3f"  # us-east-2b
+  securityGroupSelectorTerms:
+    - id: "sg-0647ccff6cd429607"
+  ephemeralStorage:
+    size: 500Gi
+---
+apiVersion: karpenter.sh/v1
+kind: NodePool
+metadata:
+  name: neuron-inf
+  labels:
+    app.kubernetes.io/component: nodepool
+    app.kubernetes.io/managed-by: karpenter
+    app.kubernetes.io/name: neuron-inf
+    project: observeai-inference-optimization
+spec:
+  template:
+    metadata:
+      labels:
+        workload: neuron
+        workload-type: ai-ml
+        project: observeai-inference-optimization
+        environment: sandbox
+        engagement: shellkode-sow
+    spec:
+      nodeClassRef:
+        group: eks.amazonaws.com
+        kind: NodeClass
+        name: neuron-cb
+      requirements:
+        - key: eks.amazonaws.com/instance-family
+          operator: In
+          values: ["trn2"]
+        - key: node.kubernetes.io/instance-type
+          operator: In
+          values: ["trn2.48xlarge"]
+        - key: topology.kubernetes.io/zone
+          operator: In
+          values: ["us-east-2b"]
+        - key: karpenter.sh/capacity-type
+          operator: In
+          values: ["reserved", "on-demand"]
+      taints:
+        - key: aws.amazon.com/neuron
+          effect: NoSchedule
+  limits:
+    cpu: "256"
+  disruption:
+    consolidationPolicy: WhenEmptyOrUnderutilized
+    consolidateAfter: 10m

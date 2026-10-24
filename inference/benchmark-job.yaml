@@ -72,7 +72,7 @@ data:
   MANIFEST_PATH: "/configs/manifests/manifest.yaml"
   RESULTS_DIR: "/results"
   LOG_LEVEL: "INFO"
-  WAIT_TIMEOUT: "600"
+  WAIT_TIMEOUT: "3600"
   AWS_DEFAULT_REGION: "${AWS_REGION}"
   RESULTS_BUCKET: "${RESULTS_BUCKET}"
   # Optional: DCGM-exporter / Prometheus-federate URL exposing DCGM_FI_DEV_* for
@@ -105,12 +105,7 @@ metadata:
 spec:
   backoffLimit: 1
   ttlSecondsAfterFinished: 3600
-  activeDeadlineSeconds: 10800   # 3 h hard cap (concurrency sweep can be long)
-
-  template:
-    metadata:
-      labels:
-        app.kubernetes.io/name: oai-infopt-benchmark-realtime
+  activeDeadlineSeconds: 21600   # 6 h hard cap — required for full 1-500 concurrency sweep on Neuron
         app.kubernetes.io/component: benchmark-runner
         profile: realtime
         project: observeai-inference-optimization
@@ -280,12 +275,7 @@ metadata:
 spec:
   backoffLimit: 1
   ttlSecondsAfterFinished: 3600
-  activeDeadlineSeconds: 10800   # 3 h hard cap (concurrency sweep can be long)
-
-  template:
-    metadata:
-      labels:
-        app.kubernetes.io/name: oai-infopt-benchmark-batch
+  activeDeadlineSeconds: 21600   # 6 h hard cap — required for full 1-500 concurrency sweep on Neuron
         app.kubernetes.io/component: benchmark-runner
         profile: batch
         project: observeai-inference-optimization

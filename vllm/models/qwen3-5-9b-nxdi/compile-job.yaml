@@ -198,6 +198,20 @@ spec:
               value: "${QWEN35_TORCH_DTYPE}"
             - name: QWEN35_TOP_K_ON_DEVICE
               value: "${QWEN35_TOP_K_ON_DEVICE}"
+            # TEXT-ONLY trace gate. When "1", modeling_qwen35's input_generator
+            # drops the 3 VL tensors + empty placeholders so the traced graph
+            # has the stock 7-input signature the SDK generation path fills.
+            # MUST match the serving deployment or the traced graph differs.
+            - name: QWEN35_TEXT_ONLY
+              value: "${QWEN35_TEXT_ONLY}"
+            # DeltaNet CTE kernel selection. The fused single-kernel path
+            # (USE_NKI_FUSED default) runs a 32-chunk sequential loop at
+            # seq_len=4096 and HUNG on-device (NRT_TIMEOUT, ALLGATHER-adjacent).
+            # USE_NKI_CHUNKED=1 selects the smaller per-chunk kernel launches,
+            # and seq_len is dropped to 2048 (16 chunks) to further cut per-call
+            # work. Must match the serving deployment or the traced graph differs.
+            - name: USE_NKI_CHUNKED
+              value: "1"
             - name: NEURON_RT_NUM_CORES
               value: "${NEURON_CORES}"
             - name: NEURON_LOGICAL_NC_CONFIG
@@ -216,11 +230,15 @@ spec:
           resources:
             requests:
               cpu: "4"
-              memory: "24Gi"
+              # neuronx-cc holds large IRs in HOST RAM while compiling the
+              # 8192-token prefill graph at TP=16. 96Gi OOMKilled mid-compile
+              # (NCC prefill lowering), so request/limit are raised. trn2.48xlarge
+              # has ~768Gi host RAM, so 240Gi limit is safe and leaves ample margin.
+              memory: "48Gi"
               aws.amazon.com/neuron: "${NEURON_DEVICE_COUNT}"
             limits:
               cpu: "10"
-              memory: "96Gi"
+              memory: "240Gi"
               aws.amazon.com/neuron: "${NEURON_DEVICE_COUNT}"
           volumeMounts:
             - name: model-weights
@@ -234,13 +252,20 @@ spec:
       volumes:
         - name: model-weights
           emptyDir:
-            sizeLimit: 60Gi
+            sizeLimit: 120Gi
         - name: compiled
+          # Holds NEFFs + the sharded checkpoint written by save_sharded_checkpoint.
+          # 60Gi overflowed and the kubelet EVICTED the pod (exit 137) AFTER a
+          # successful 65-min compile, losing everything. Raised with headroom.
           emptyDir:
-            sizeLimit: 60Gi
+            sizeLimit: 200Gi
         - name: app
+          # /app holds the code AND accumulates __pycache__ / neuronx-cc temp
+          # files written relative to workingDir during the long compile. 16Mi
+          # overflowed and the kubelet EVICTED the pod (exit 137) right after a
+          # successful 65-min compile. Raised to 2Gi for headroom.
           emptyDir:
-            sizeLimit: 16Mi
+            sizeLimit: 2Gi
         - name: stage-code
           configMap:
             name: oai-infopt-nxdi-code-qwen3-5-9b-nxdi
@@ -254,5 +279,6 @@ spec:
             name: oai-infopt-nxdi-nki-qwen3-5-9b-nxdi
             defaultMode: 0444
         - name: tmp
+          # neuronx-cc writes large intermediates + NEFF cache here; give headroom.
           emptyDir:
-            sizeLimit: 100Gi
+            sizeLimit: 200Gi

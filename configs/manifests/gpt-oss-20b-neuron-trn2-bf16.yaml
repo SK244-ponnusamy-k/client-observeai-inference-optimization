@@ -5,8 +5,8 @@
 # Edit catalog/models/gpt-oss-20b-neuron.yaml and re-generate, or tweak this file directly for
 # a one-off run. Every field is read by inference/load-test.py.
 # ==============================================================================
-run_id: gpt-oss-20b-neuron-2026-10-12-001
-description: "openai/gpt-oss-20b bf16, trn2.3xlarge"
+run_id: gpt-oss-20b-neuron-2026-10-21-001
+description: "openai/gpt-oss-20b bf16, trn2.48xlarge"
 
 model:
   hf_id: openai/gpt-oss-20b
@@ -18,13 +18,13 @@ model:
 serving:
   image: public.ecr.aws/neuron/pytorch-inference-vllm-neuronx:0.21.0.1.0.0-neuronx-py313-sdk2.31.0-ubuntu24.04
   nodepool: neuron-inf
-  instance_type: trn2.3xlarge
+  instance_type: trn2.48xlarge
 
 optimization_variants:
-  - label: bf16-trn2
+  - label: bf16-trn2-48xl
     quantization: bf16
-    tensor_parallel_size: 4       # TP=4 (LNC=2 -> 4 logical cores); must equal compile-time --num_cores
-    max_num_seqs: 32              # top num_seqs bucket (recompile pass 1; pass 2 = 64)
+    tensor_parallel_size: 16      # TP=16 — trn2.48xlarge (16 logical cores at LNC=2)
+    max_num_seqs: 64              # top bucket on trn2.48xlarge
     max_num_batched_tokens: 4096  # < max_model_len so segmented prefill (required by APC) is enabled
     max_model_len: 8192           # sized to real transcripts
     kv_cache_dtype: auto
@@ -35,7 +35,7 @@ benchmark:
     - configs/workload_profiles/batch_v1.yaml
 
 cost:
-  instance_hourly_usd: 2.235    # trn2.3xlarge Capacity Block rate — VERIFY before run (labelled "Capacity Block" in cost report)
+  instance_hourly_usd: 12.0     # trn2.48xlarge Capacity Block rate — VERIFY before run
 
 tags:
   Project: observeai-inference-optimization
@@ -44,4 +44,4 @@ tags:
   ManagedBy: oai-cli
   Owner: TBD
   CostCenter: TBD
-  RunId: gpt-oss-20b-neuron-2026-10-12-001
+  RunId: gpt-oss-20b-neuron-2026-10-21-001

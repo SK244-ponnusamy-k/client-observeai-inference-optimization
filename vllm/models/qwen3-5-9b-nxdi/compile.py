@@ -82,7 +82,34 @@ def main() -> int:
         tp_degree, seq_len, max_batch_size, lnc, dtype_key,
     )
 
-    neuron_config = NeuronConfig(
+    # Sequence bucketing: compiling the full seq_len (8192) prefill as ONE
+    # monolithic graph makes neuronx-cc re-materialize the fused DeltaNet NKI
+    # kernel across all 24 DeltaNet layers at once, which OOMs the host even at
+    # 240Gi. Bucketing compiles several smaller context-length graphs instead
+    # (each fits in far less RAM); the runtime dispatches each request to the
+    # smallest bucket that fits. Buckets are powers of two up to seq_len, and
+    # are overridable via QWEN35_CONTEXT_BUCKETS (comma-separated) if needed.
+    def _default_buckets(max_len: int) -> list[int]:
+        candidates = [512, 1024, 2048, 4096, 8192, 16384, 32768]
+        buckets = [b for b in candidates if b < max_len]
+        buckets.append(max_len)
+        return buckets
+
+    buckets_env = _env("QWEN35_CONTEXT_BUCKETS", "").strip()
+    if buckets_env:
+        context_buckets = sorted({int(x) for x in buckets_env.split(",") if x.strip()})
+        if context_buckets[-1] != seq_len:
+            context_buckets.append(seq_len)
+            context_buckets = sorted(set(context_buckets))
+    else:
+        context_buckets = _default_buckets(seq_len)
+    logger.info("Sequence bucketing ENABLED. context buckets=%s", context_buckets)
+
+    # Build kwargs, then keep ONLY the ones this installed NeuronConfig accepts.
+    # Bucketing kwarg names vary across NxDI versions (context_encoding_buckets,
+    # token_generation_buckets, or a generic `buckets`), so probe the signature
+    # instead of hardcoding — a wrong kwarg would TypeError at construction.
+    base_kwargs = dict(
         tp_degree=tp_degree,
         batch_size=max_batch_size,
         ctx_batch_size=max_batch_size,
@@ -91,11 +118,44 @@ def main() -> int:
         seq_len=seq_len,
         torch_dtype=torch_dtype,
         logical_nc_config=lnc,
-        enable_bucketing=False,
         flash_decoding_enabled=False,
         on_device_sampling_config=OnDeviceSamplingConfig(top_k=top_k),
         save_sharded_checkpoint=True,
     )
+    bucket_kwargs = dict(
+        enable_bucketing=True,
+        context_encoding_buckets=context_buckets,
+        token_generation_buckets=[seq_len],
+        buckets=context_buckets,
+    )
+
+    import inspect
+
+    try:
+        accepted = set(inspect.signature(NeuronConfig.__init__).parameters)
+    except (TypeError, ValueError):
+        accepted = set()
+
+    applied_bucket_kwargs = {k: v for k, v in bucket_kwargs.items() if k in accepted}
+    if "enable_bucketing" in applied_bucket_kwargs and len(applied_bucket_kwargs) == 1:
+        # enable_bucketing accepted but no bucket-list kwarg recognized — the
+        # flag alone may not reduce the monolithic prefill, so fall back to a
+        # smaller seq_len to keep compiler memory bounded.
+        logger.warning(
+            "NeuronConfig exposes enable_bucketing but no bucket-list kwarg; "
+            "falling back to seq_len=4096 to bound compiler memory."
+        )
+        base_kwargs["seq_len"] = min(seq_len, 4096)
+        applied_bucket_kwargs = {}
+    elif not applied_bucket_kwargs:
+        logger.warning(
+            "This NeuronConfig does not accept bucketing kwargs; falling back to "
+            "seq_len=4096 to bound compiler memory (was %d).", seq_len,
+        )
+        base_kwargs["seq_len"] = min(seq_len, 4096)
+
+    logger.info("NeuronConfig bucket kwargs applied: %s", sorted(applied_bucket_kwargs))
+    neuron_config = NeuronConfig(**base_kwargs, **applied_bucket_kwargs)
 
     with open(config_json, encoding="utf-8") as handle:
         hf_config = json.load(handle)

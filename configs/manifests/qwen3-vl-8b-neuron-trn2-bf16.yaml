@@ -5,8 +5,8 @@
 # Edit catalog/models/qwen3-vl-8b-neuron.yaml and re-generate, or tweak this file directly for
 # a one-off run. Every field is read by inference/load-test.py.
 # ==============================================================================
-run_id: qwen3-vl-8b-neuron-2026-10-15-001
-description: "Qwen/Qwen3-VL-8B-Instruct bf16, trn2.3xlarge"
+run_id: qwen3-vl-8b-neuron-2026-10-21-001
+description: "Qwen/Qwen3-VL-8B-Instruct bf16, trn2.48xlarge"
 
 model:
   hf_id: Qwen/Qwen3-VL-8B-Instruct
@@ -18,13 +18,13 @@ model:
 serving:
   image: public.ecr.aws/neuron/pytorch-inference-vllm-neuronx:0.24.0.1.1.0-neuronx-py313-sdk2.32.0-ubuntu24.04
   nodepool: neuron-inf
-  instance_type: trn2.3xlarge
+  instance_type: trn2.48xlarge
 
 optimization_variants:
-  - label: bf16-trn2
+  - label: bf16-trn2-48xl
     quantization: bf16
-    tensor_parallel_size: 4
-    max_num_seqs: 4
+    tensor_parallel_size: 16     # TP=16 — trn2.48xlarge (AWS recommended, restored)
+    max_num_seqs: 16
     max_num_batched_tokens: 8192
     max_model_len: 8192
     kv_cache_dtype: auto
@@ -35,7 +35,7 @@ benchmark:
     - configs/workload_profiles/batch_v1.yaml
 
 cost:
-  instance_hourly_usd: 2.235    # VERIFY before run
+  instance_hourly_usd: 12.0    # trn2.48xlarge Capacity Block rate — VERIFY before run
 
 tags:
   Project: observeai-inference-optimization
@@ -44,4 +44,4 @@ tags:
   ManagedBy: oai-cli
   Owner: TBD
   CostCenter: TBD
-  RunId: qwen3-vl-8b-neuron-2026-10-15-001
+  RunId: qwen3-vl-8b-neuron-2026-10-21-001

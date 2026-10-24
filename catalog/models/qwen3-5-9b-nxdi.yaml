@@ -33,40 +33,45 @@ serving:
   served_name: Qwen3.5-9B
   tokenizer: Qwen/Qwen3.5-9B
   quantization: bf16
-  max_model_len: 8192            # seq_len baked at compile time; 160 is reference-validated
-  max_num_seqs: 1                # batch_size=1 (reference baseline)
-  tensor_parallel_size: 4
+  max_model_len: 2048            # seq_len baked at compile; DeltaNet CTE kernel
+                                 # hung on-device at 4096 (32 chunks), 2048=16 chunks
+  max_num_seqs: 4                # prefill batch baked at compile time; batch=16 overflows
+                                 # Trainium2 HBM (NCC_EVRF009, needs ~54GB/core vs 24GB), 4 fits
+  tensor_parallel_size: 4        # TP=4 — reference-validated. TP=16 hung on-device
+                                 # (DeltaNet NKI ALLGATHER collective -> NRT_TIMEOUT)
+                                 # NOTE: baked at compile time; RECOMPILE required when changing
 
 resources:
-  cpu_request: "16"
-  cpu_limit: "32"
-  memory_request: "64Gi"
-  memory_limit: "128Gi"
+  cpu_request: "48"
+  cpu_limit: "96"
+  memory_request: "256Gi"
+  memory_limit: "512Gi"
 
 instances:
-  neuron_cores: 4                # = tensor-parallel degree; must match compile time
+  neuron_cores: 4                # = tensor-parallel degree; must match compile time (TP=4)
   logical_neuron_config: 2       # LNC=2 on trn2
   candidates:
-    - trn2.3xlarge               # cost-optimized bring-up target
-    - trn2.48xlarge              # reference-validated fallback
+    - trn2.48xlarge              # primary — reference-validated for TP=4
   node_group: trn2-neuron
 
 neuron:
   engine: nxdi
   source_folder: Qwen3.5-9B
   compiled_folder: qwen3-5-9b-nxdi-traced
-  sequence_length: 8192
-  batch_size: 1
+  sequence_length: 2048          # DeltaNet CTE kernel hung at 4096; 2048 = 16 chunks
+  batch_size: 4                  # prefill batch baked at compile; 16 overflows HBM (NCC_EVRF009)
   auto_cast_type: bf16
   instance_family: trn2
   logical_neuron_config: 2
+  # IMPORTANT: TP degree (QWEN35_TP_DEGREE=4) is baked at compile time.
+  # A full recompile on trn2.48xlarge is required before serving.
 
 benchmark:
   auto: false
   profiles:
     - configs/workload_profiles/realtime_v1.yaml
     - configs/workload_profiles/batch_v1.yaml
-  instance_hourly_usd: 2.235     # trn2.3xlarge — VERIFY for your region before run
+  instance_hourly_usd: 12.0      # trn2.48xlarge Capacity Block rate
 
 tags:
   Owner: TBD
