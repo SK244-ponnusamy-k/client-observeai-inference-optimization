@@ -229,16 +229,18 @@ spec:
               type: RuntimeDefault
           resources:
             requests:
-              cpu: "4"
+              cpu: "8"
               # neuronx-cc holds large IRs in HOST RAM while compiling the
-              # 8192-token prefill graph at TP=16. 96Gi OOMKilled mid-compile
-              # (NCC prefill lowering), so request/limit are raised. trn2.48xlarge
-              # has ~768Gi host RAM, so 240Gi limit is safe and leaves ample margin.
-              memory: "48Gi"
+              # prefill graph. The 8K-context / batch-8 build is a far larger
+              # module than the 2048/batch-4 one (token-product 8x bigger), so
+              # 240Gi may OOM during NCC prefill lowering. trn2.48xlarge has
+              # ~768Gi-2TB host RAM, so raise the limit well above 240Gi to give
+              # the 8192 compile headroom. Tune down later if it proves excessive.
+              memory: "96Gi"
               aws.amazon.com/neuron: "${NEURON_DEVICE_COUNT}"
             limits:
-              cpu: "10"
-              memory: "240Gi"
+              cpu: "16"
+              memory: "560Gi"
               aws.amazon.com/neuron: "${NEURON_DEVICE_COUNT}"
           volumeMounts:
             - name: model-weights
