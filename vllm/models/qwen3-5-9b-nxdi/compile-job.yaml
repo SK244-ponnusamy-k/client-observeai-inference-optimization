@@ -16,6 +16,8 @@
 #   ${COMPILED_FOLDER} ${QWEN35_SEQ_LEN} ${QWEN35_MAX_BATCH_SIZE}
 #   ${QWEN35_TP_DEGREE} ${QWEN35_LOGICAL_NC_CONFIG} ${QWEN35_TORCH_DTYPE}
 #   ${QWEN35_TOP_K_ON_DEVICE} ${NEURON_CORES} ${NEURON_DEVICE_COUNT}
+#   ${QWEN35_MAX_CONTEXT_LEN} ${QWEN35_CONTEXT_BUCKETS} ${QWEN35_TKG_BUCKETS}
+#   ${QWEN35_CTX_BATCH_SIZE} ${QWEN35_CONTINUOUS_BATCHING}
 #   ${COMPILE_NODE_SELECTOR_KEY} ${COMPILE_NODE_SELECTOR_VALUE}
 # ==============================================================================
 
@@ -162,7 +164,7 @@ spec:
                 echo "Force recompile: aws s3 rm s3://${MODEL_BUCKET}/${COMPILED_FOLDER}/ --recursive"
                 exit 0
               fi
-              echo "[2/3] Running NxDI compile (tp=${QWEN35_TP_DEGREE} seq_len=${QWEN35_SEQ_LEN} batch=${QWEN35_MAX_BATCH_SIZE})..."
+              echo "[2/3] Running NxDI compile (tp=${QWEN35_TP_DEGREE} seq_len=${QWEN35_SEQ_LEN} max_ctx=${QWEN35_MAX_CONTEXT_LEN} ctx_buckets=${QWEN35_CONTEXT_BUCKETS} decode_batch=${QWEN35_MAX_BATCH_SIZE} ctx_batch=${QWEN35_CTX_BATCH_SIZE})..."
               cd /app
               python3 compile.py
               echo "[3/3] Uploading artifact to S3..."
@@ -180,8 +182,11 @@ spec:
               value: "${COMPILED_FOLDER}"
             - name: HOME
               value: "/tmp"
+            # Cache the NEFF UNDER /compiled so the final `aws s3 sync /compiled/`
+            # uploads it too. Then serving pods load the NEFF instead of
+            # recompiling on-device (~40 min/pod).
             - name: NEURONX_CACHE
-              value: "/tmp/neuronx_cache"
+              value: "/compiled/neuronx_cache"
             - name: QWEN35_MODEL_PATH
               value: "/model"
             - name: QWEN35_COMPILED_PATH
@@ -198,6 +203,19 @@ spec:
               value: "${QWEN35_TORCH_DTYPE}"
             - name: QWEN35_TOP_K_ON_DEVICE
               value: "${QWEN35_TOP_K_ON_DEVICE}"
+            # 10k / continuous-batching shape params (see model.env).
+            - name: QWEN35_MAX_CONTEXT_LEN
+              value: "${QWEN35_MAX_CONTEXT_LEN}"
+            - name: QWEN35_CONTEXT_BUCKETS
+              value: "${QWEN35_CONTEXT_BUCKETS}"
+            - name: QWEN35_TKG_BUCKETS
+              value: "${QWEN35_TKG_BUCKETS}"
+            - name: QWEN35_CTX_BATCH_SIZE
+              value: "${QWEN35_CTX_BATCH_SIZE}"
+            - name: QWEN35_CONTINUOUS_BATCHING
+              value: "${QWEN35_CONTINUOUS_BATCHING}"
+            - name: QWEN35_DISABLE_ARGMAX_KERNEL
+              value: "${QWEN35_DISABLE_ARGMAX_KERNEL}"
             # TEXT-ONLY trace gate. When "1", modeling_qwen35's input_generator
             # drops the 3 VL tensors + empty placeholders so the traced graph
             # has the stock 7-input signature the SDK generation path fills.
@@ -230,17 +248,16 @@ spec:
           resources:
             requests:
               cpu: "8"
-              # neuronx-cc holds large IRs in HOST RAM while compiling the
-              # prefill graph. The 8K-context / batch-8 build is a far larger
-              # module than the 2048/batch-4 one (token-product 8x bigger), so
-              # 240Gi may OOM during NCC prefill lowering. trn2.48xlarge has
-              # ~768Gi-2TB host RAM, so raise the limit well above 240Gi to give
-              # the 8192 compile headroom. Tune down later if it proves excessive.
+              # Running build (1 prefill graph, 4x2048) compiled inside 240Gi.
+              # This build has 4 prefill buckets (1024..8192, largest = same
+              # 8192 token-slots) + 1 decode graph; NxD may compile buckets
+              # concurrently, so allow ~2.5x. trn2.48xlarge has ~2 TiB RAM and
+              # nothing else runs during compile. Expect ~2-3 h wall clock.
               memory: "96Gi"
               aws.amazon.com/neuron: "${NEURON_DEVICE_COUNT}"
             limits:
-              cpu: "16"
-              memory: "560Gi"
+              cpu: "32"
+              memory: "640Gi"
               aws.amazon.com/neuron: "${NEURON_DEVICE_COUNT}"
           volumeMounts:
             - name: model-weights

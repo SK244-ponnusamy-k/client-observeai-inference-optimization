@@ -106,7 +106,35 @@
   ```
   Prefill left untouched (legitimately spans 0..seq_len-1). Static op → compiles cleanly. For workloads under 2048 tokens the clamp is a no-op during normal operation and acts as a hard safety bound. **Requires recompile** (the indexing is baked into the traced graph).
 
+## 13. ~34 s "TTFT" on the 2048 build (and the 10k / 1-500 concurrency rebuild)
+
+- **Symptom:** TTFT ~34 s under concurrency on the running TP=4 / 2048 / batch-4 build.
+- **Causes (all serving/shape, not raw prefill speed):**
+  1. *Fake streaming* — the shim sent the whole completion as one SSE chunk, so the benchmark's TTFT was really end-to-end latency (512 tokens x ~20 ms).
+  2. *Static batch of 4, one replica* — later requests queued behind whole batches; only 1 of 16 chips (4 of 64 logical cores) was used.
+  3. *No bucketing* — every prefill padded to the full compiled length.
+  4. *Left padding* — NxDI expects right padding; mixed-length batches corrupted KV for every row but the longest.
+- **Issue 7 correction:** bucketing was never unavailable. `NeuronConfig.__init__` takes `**kwargs`, so the `inspect.signature` probe in compile.py always failed and silently forced `seq_len=min(seq_len, 4096)` with bucketing off. compile.py now passes the kwargs and verifies them on the constructed object.
+- **Resolution (10k build, `qwen3-5-9b-nxdi-textonly-10k-cb8-traced`):**
+  - `SEQ_LEN=10240`, `MAX_CONTEXT_LEN=8192`, prefill buckets `1024,2048,4096,8192`, decode bucket `10240`.
+  - Prefill batch 1 + continuous batching, decode batch 8. The largest prefill graph is 1x8192 = the same token-slot count as the validated 4x2048 graph (16x4096 is what overflowed HBM).
+  - DeltaNet state writes go to the `seq_ids` slot when prefill batch < allocated batch (`_write_state_rows`, masked `torch.where`, see #14); the old `rows + buffer*0` broadcast would have overwritten every slot. The static-batch path is unchanged.
+  - TP=4, LNC=2, `USE_NKI_CHUNKED=1`, `QWEN35_TEXT_ONLY=1`: unchanged from the running build.
+  - Serving: real per-token SSE, right padding, per-request max_tokens/EOS, HTTP 400 for prompts > 8192, `/metrics`, and `router.py` running 16 TP4 replicas (one per chip) = 128 decode slots.
+- **If compile hits NCC_EVRF009 (HBM):** set `QWEN35_MAX_BATCH_SIZE=4` and recompile; nothing else changes.
+
 ---
+
+## 14. 10k CB build: every decode fails with `vector DGE` out-of-bound (status=1006)
+
+- **Symptom:** `qwen3-5-9b-nxdi-textonly-10k-cb8-traced` loads and prefill runs, but `token_generation_model` fails with `scatter/gather (indirect memory copy via vector DGE) out-of-bound access`, then `status=1006`; the worker logs `batch processing failed`.
+- **What it is not:** #12 was the KV scatter (`scalar DGE`, GPSIMD) and is clamped. Traced through NxDI 0.10 (`model_wrapper._forward_with_pad`, `kv_cache_manager`, `hf_adapter`): host-side `seq_ids` (sorted 0..7), `position_ids` (≤ 10239) and the KV scatter all stay in range.
+- **Most likely cause:** the decode graph's only device-derived gather index is `input_ids`, the token sampled by the previous step. An id outside `[0, vocab)` (for example argmax over NaN prefill logits) makes the embedding gather go out of bounds. Upstream contrib Qwen3.5 also avoids `index_put` for DeltaNet state writes and marks continuous batching as unvalidated.
+- **No-recompile mitigation (server.py):** `_StepTracker` checks every sampled id. An invalid id is swapped in place for the pad id before the next decode, the row ends with `finish_reason="error"`, and `invalid sampled token id` is logged with the id. The device no longer crashes, and the log confirms or rules out this cause.
+- **Recompile fix (modeling_qwen35.py, next compile):** `_write_state_rows` now uses a masked `torch.where` (no `index_put`, int32 compare). Decode clamps `input_ids` into the vocab before `embed_tokens`. DeltaNet clamps `seq_ids` before the state `index_select`.
+- **Confirmed (QWEN35_DEBUG_IO=1, DP=1):** CTE in/out is correct (`[760,6511,314,9338,369]` -> `11751` " Paris"). TKG input is correct too (`input_ids=[11751]`, `pos=[5]`, `seq_ids=[0]`, mask sum 5). TKG `out[0]` (int32 token) = `1001471217` = `0x3BB13CF1`, which is the bit pattern of small floats (~0.005 / ~0.03), not NaN. So the logits are finite, and the token output of the greedy sampler is corrupt.
+- **Fix (v2 build):** greedy on-device sampling runs `nxd_argmax`, which uses the NKI argmax kernel unless `disable_argmax_kernel=True`. That kernel worked at batch 4 / 2048 and is the prime suspect at batch 8 / 10240 / CB. `QWEN35_DISABLE_ARGMAX_KERNEL=1` (compile.py -> NeuronConfig) switches to torch argmax plus a TP all-gather. Compiled to the new folder `qwen3-5-9b-nxdi-textonly-10k-cb8-v2-traced`. Verify with the same DEBUG_IO run before benchmarking.
+- **Fallback:** comment BUILD A and uncomment BUILD B in `model.env`, then redeploy without `--compile`.
 
 ## Key operational notes
 

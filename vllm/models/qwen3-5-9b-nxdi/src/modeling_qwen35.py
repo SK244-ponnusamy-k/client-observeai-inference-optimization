@@ -230,6 +230,32 @@ def l2norm(x, dim=-1, eps=1e-6):
     return F.normalize(x, p=2, dim=dim, eps=eps)
 
 
+def _write_state_rows(buffer, rows, seq_ids):
+    """Scatter `rows` [b, ...] into `buffer` [alloc_bs, ...] at batch slots `seq_ids` [b].
+
+    Used when the prefill (CTE) graph runs with ctx_batch_size < max_batch_size
+    (continuous batching): the old `rows + buffer * 0` trick BROADCASTS a single
+    row across every slot and wipes the other sequences' DeltaNet state. The
+    result is a full-size tensor that reads the buffer, so input_output_aliasing
+    is preserved.
+
+    Implemented as a dense masked select (torch.where over the slot axis), the
+    same approach as upstream NxDI contrib Qwen3.5 (`_qwen36_update_state_rows_by_seq_ids`).
+    No index_put / scatter, so no indirect (DGE) DMA and no int64 index lowering;
+    an out-of-range seq_id simply matches no slot instead of writing out of bounds.
+    """
+    alloc_bs = buffer.shape[0]
+    rows = rows.to(buffer.dtype)
+    ids = seq_ids.reshape(-1).to(torch.int32)
+    slot_axis = torch.arange(alloc_bs, dtype=torch.int32, device=buffer.device)
+    bcast = (alloc_bs,) + (1,) * (buffer.ndim - 1)
+    out = buffer * 1
+    for r in range(rows.shape[0]):  # static at trace time (ctx_batch_size rows)
+        mask = (slot_axis == ids[r]).view(bcast)
+        out = torch.where(mask, rows[r : r + 1].expand_as(buffer), out)
+    return out
+
+
 # ============================================================
 # Gated DeltaNet Module (Linear Recurrent Attention)
 # ============================================================
@@ -756,6 +782,10 @@ class NeuronGatedDeltaNet(nn.Module):
         mixed = torch.cat([query, key, value], dim=-1)
         mixed = mixed.transpose(1, 2)
 
+        if seq_ids is not None:
+            # Keep the state-row gathers in bounds whatever the host sends.
+            seq_ids = seq_ids.clamp(min=0, max=self.conv_state_buffer.shape[0] - 1)
+
         if is_decode:
             if seq_ids is not None:
                 conv_state = torch.index_select(self.conv_state_buffer, 0, seq_ids)
@@ -810,7 +840,12 @@ class NeuronGatedDeltaNet(nn.Module):
                 new_conv_state = mixed[:, :, -3:].contiguous()
 
             alloc_bs = self.conv_state_buffer.shape[0]
-            if seq_ids is not None:
+            if seq_ids is not None and batch_size < alloc_bs:
+                # Continuous batching prefill: write only this request's slot.
+                new_conv_state = _write_state_rows(
+                    self.conv_state_buffer, new_conv_state, seq_ids
+                )
+            elif seq_ids is not None:
                 # BS=1 optimization: scatter to index 0 = direct replacement
                 new_conv_state = (
                     new_conv_state.to(self.conv_state_buffer.dtype)
@@ -953,7 +988,12 @@ class NeuronGatedDeltaNet(nn.Module):
             if final_state is not None:
                 final_state_bf16 = final_state.to(self.recurrent_state_buffer.dtype)
                 alloc_bs = self.recurrent_state_buffer.shape[0]
-                if seq_ids is not None:
+                if seq_ids is not None and batch_size < alloc_bs:
+                    # Continuous batching prefill: write only this request's slot.
+                    new_rec_state = _write_state_rows(
+                        self.recurrent_state_buffer, final_state_bf16, seq_ids
+                    )
+                elif seq_ids is not None:
                     # BS=1 optimization: scatter to index 0 of size-1 buffer = direct replacement
                     # Add buffer dependency for input_output_alias
                     new_rec_state = final_state_bf16 + self.recurrent_state_buffer * 0
@@ -1628,7 +1668,13 @@ class NeuronQwen35Model(NeuronBaseModel):
                 past_key_values_length = past_key_values[0][1].shape[2]
 
         if inputs_embeds is None:
-            inputs_embeds = self.embed_tokens(input_ids)
+            # Decode guard: the token fed back is the previous step's sampled id.
+            # An invalid id (e.g. argmax over NaN logits) would make this gather
+            # read out of bounds (status=1006). Clamp into the vocab.
+            embed_ids = input_ids
+            if not is_for_context_encoding:
+                embed_ids = input_ids.clamp(min=0, max=self.vocab_size - 1)
+            inputs_embeds = self.embed_tokens(embed_ids)
 
         # CRITICAL: Zero out embeddings for padding tokens so DeltaNet recurrence
         # is not polluted. DeltaNet has no attention mask -- it processes all
@@ -2360,6 +2406,32 @@ class NeuronQwen35ForCausalLM(NeuronBaseForCausalLM):
         """Override to pass all 24 positional args explicitly."""
         if _text_only():
             # Text-only: defer to the stock NxDI dispatch (no VL tensors).
+            if os.environ.get("QWEN35_DEBUG_IO") == "1":
+                is_pf = self._is_prefill(position_ids)
+                print(
+                    f"[QWEN35_DEBUG_IO] in phase={'CTE' if is_pf else 'TKG'} "
+                    f"input_ids={input_ids.shape}/{input_ids.dtype} {input_ids.reshape(-1)[:8].tolist()} "
+                    f"pos={position_ids.reshape(-1)[:8].tolist()} seq_ids={seq_ids.tolist()} "
+                    f"mask={tuple(attention_mask.shape)} mask_sum={attention_mask.sum(-1).tolist()}",
+                    flush=True,
+                )
+                out, on_neuron = super()._get_model_outputs(
+                    input_ids, attention_mask, position_ids, seq_ids, sampling_params,
+                    prev_hidden, adapter_ids, medusa_args, llava_args,
+                    slot_mapping=slot_mapping, block_table=block_table,
+                    full_context_lens=full_context_lens,
+                    computed_context_lens=computed_context_lens, tf_args=tf_args,
+                )
+                outs = out if isinstance(out, (list, tuple)) else [out]
+                for i, t in enumerate(outs[:3]):
+                    if hasattr(t, "shape"):
+                        print(
+                            f"[QWEN35_DEBUG_IO] out[{i}] phase={'CTE' if is_pf else 'TKG'} "
+                            f"type={type(out).__name__} shape={tuple(t.shape)} dtype={t.dtype} "
+                            f"vals={t.reshape(-1)[:8].tolist()}",
+                            flush=True,
+                        )
+                return out, on_neuron
             return super()._get_model_outputs(
                 input_ids,
                 attention_mask,

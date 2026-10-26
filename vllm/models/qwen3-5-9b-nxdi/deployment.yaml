@@ -208,10 +208,15 @@ spec:
               # rootfs is read-only for non-root) and expose via PYTHONPATH.
               # Mirrors inference/run-benchmark.sh's pip-to-/tmp pattern.
               export PYTHONPATH="/tmp/pip-packages:${PYTHONPATH:-}"
-              python3 -c "import fastapi, uvicorn, pydantic_settings" 2>/dev/null || \
+              python3 -c "import fastapi, uvicorn, pydantic_settings, httpx" 2>/dev/null || \
                 pip install --quiet --no-cache-dir --target=/tmp/pip-packages \
-                  fastapi==0.111.0 "uvicorn[standard]==0.30.1" pydantic-settings==2.3.4 || {
+                  fastapi==0.111.0 "uvicorn[standard]==0.30.1" pydantic-settings==2.3.4 httpx==0.27.2 || {
                     echo "ERROR: failed to install FastAPI shim deps"; exit 1; }
+              # DP>1: router.py launches N TP replicas on distinct core slices.
+              if [ "${QWEN35_DP_REPLICAS:-1}" -gt 1 ]; then
+                echo "Data-parallel: ${QWEN35_DP_REPLICAS:-1} replicas x TP${QWEN35_TP_DEGREE:-4}"
+                exec python3 router.py
+              fi
               exec python3 server.py
           ports:
             - name: http
@@ -224,8 +229,11 @@ spec:
               value: "nxdi"
             - name: AWS_DEFAULT_REGION
               value: "${AWS_REGION}"
+            # NEFF cache lives UNDER /compiled so model-sync pulls it from S3
+            # (COMPILED_FOLDER/neuronx_cache/). With a populated cache, model.load()
+            # finds the NEFF and skips the ~40 min on-device recompile per pod.
             - name: NEURONX_CACHE
-              value: "/tmp/neuronx_cache"
+              value: "/compiled/neuronx_cache"
             - name: NEURON_RT_NUM_CORES
               value: "${NEURON_CORES}"
             - name: NEURON_LOGICAL_NC_CONFIG
@@ -260,6 +268,26 @@ spec:
               value: "1"
             - name: QWEN35_PORT
               value: "8000"
+            # Compile parity (only used if server.py has to compile on first boot).
+            - name: QWEN35_MAX_CONTEXT_LEN
+              value: "${QWEN35_MAX_CONTEXT_LEN}"
+            - name: QWEN35_CONTEXT_BUCKETS
+              value: "${QWEN35_CONTEXT_BUCKETS}"
+            - name: QWEN35_TKG_BUCKETS
+              value: "${QWEN35_TKG_BUCKETS}"
+            - name: QWEN35_CTX_BATCH_SIZE
+              value: "${QWEN35_CTX_BATCH_SIZE}"
+            - name: QWEN35_CONTINUOUS_BATCHING
+              value: "${QWEN35_CONTINUOUS_BATCHING}"
+            - name: QWEN35_DISABLE_ARGMAX_KERNEL
+              value: "${QWEN35_DISABLE_ARGMAX_KERNEL}"
+            # Data parallelism (router.py). 16 x TP4 = all 16 chips.
+            - name: QWEN35_DP_REPLICAS
+              value: "${QWEN35_DP_REPLICAS}"
+            - name: QWEN35_DP_START_PARALLEL
+              value: "${QWEN35_DP_START_PARALLEL}"
+            - name: QWEN35_WORKER_THREADS
+              value: "8"
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: false
@@ -271,13 +299,15 @@ spec:
             seccompProfile:
               type: RuntimeDefault
           resources:
+            # Sized for 16 worker processes (one per chip) + router. Host RAM
+            # peaks while replicas load sharded weights (START_PARALLEL at a time).
             requests:
-              cpu: "16"
-              memory: "64Gi"
+              cpu: "48"
+              memory: "256Gi"
               aws.amazon.com/neuron: "${NEURON_DEVICE_COUNT}"
             limits:
-              cpu: "32"
-              memory: "128Gi"
+              cpu: "160"
+              memory: "1024Gi"
               aws.amazon.com/neuron: "${NEURON_DEVICE_COUNT}"
           # startupProbe gates liveness/readiness. A fresh pod runs a LOAD-TIME
           # neuronx-cc compile of the DeltaNet CTE graph (the NEFF binary is not
@@ -291,7 +321,8 @@ spec:
               port: 8000
             initialDelaySeconds: 60
             periodSeconds: 30
-            failureThreshold: 120
+            # 16 replicas load in waves (1 then 4 at a time): allow 2 h.
+            failureThreshold: 240
             timeoutSeconds: 5
           readinessProbe:
             httpGet:
@@ -355,4 +386,4 @@ spec:
             sizeLimit: 16Gi
         - name: tmp
           emptyDir:
-            sizeLimit: 100Gi
+            sizeLimit: 200Gi

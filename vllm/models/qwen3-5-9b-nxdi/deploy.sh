@@ -63,12 +63,34 @@ export MODEL_BUCKET BENCHMARK_NAMESPACE NEURON_NXDI_IMAGE SOURCE_FOLDER COMPILED
     QWEN35_SEQ_LEN QWEN35_MAX_BATCH_SIZE QWEN35_TP_DEGREE QWEN35_LOGICAL_NC_CONFIG \
     QWEN35_TORCH_DTYPE QWEN35_TOP_K_ON_DEVICE QWEN35_TEXT_ONLY
 
+# 10k / continuous-batching / data-parallel knobs (defaults = running 2048 build).
+export QWEN35_MAX_CONTEXT_LEN="${QWEN35_MAX_CONTEXT_LEN:-$QWEN35_SEQ_LEN}"
+export QWEN35_CONTEXT_BUCKETS="${QWEN35_CONTEXT_BUCKETS:-$QWEN35_MAX_CONTEXT_LEN}"
+export QWEN35_TKG_BUCKETS="${QWEN35_TKG_BUCKETS:-$QWEN35_SEQ_LEN}"
+export QWEN35_CTX_BATCH_SIZE="${QWEN35_CTX_BATCH_SIZE:-$QWEN35_MAX_BATCH_SIZE}"
+export QWEN35_CONTINUOUS_BATCHING="${QWEN35_CONTINUOUS_BATCHING:-auto}"
+export QWEN35_DISABLE_ARGMAX_KERNEL="${QWEN35_DISABLE_ARGMAX_KERNEL:-0}"
+export QWEN35_DP_REPLICAS="${QWEN35_DP_REPLICAS:-1}"
+export QWEN35_DP_START_PARALLEL="${QWEN35_DP_START_PARALLEL:-4}"
+
+# Guard: replicas x cores must fit the instance (trn2: 4 logical cores/chip at LNC=2).
+TOTAL_CORES=$(( NEURON_DEVICE_COUNT * 4 ))
+if (( QWEN35_DP_REPLICAS * QWEN35_TP_DEGREE > TOTAL_CORES )); then
+    log_error "QWEN35_DP_REPLICAS(${QWEN35_DP_REPLICAS}) x TP(${QWEN35_TP_DEGREE}) > ${TOTAL_CORES} cores on ${NEURON_INSTANCE_TYPE}"
+    exit 1
+fi
+
+ENVSUBST_COMMON='${QWEN35_SEQ_LEN} ${QWEN35_MAX_BATCH_SIZE} ${QWEN35_TP_DEGREE} ${QWEN35_LOGICAL_NC_CONFIG} ${QWEN35_TORCH_DTYPE} ${QWEN35_TOP_K_ON_DEVICE} ${QWEN35_TEXT_ONLY} ${QWEN35_MAX_CONTEXT_LEN} ${QWEN35_CONTEXT_BUCKETS} ${QWEN35_TKG_BUCKETS} ${QWEN35_CTX_BATCH_SIZE} ${QWEN35_CONTINUOUS_BATCHING} ${QWEN35_DISABLE_ARGMAX_KERNEL}'
+
 echo ""
 echo "=============================================================="
 echo "  DEPLOYING (NxDI) - Qwen/Qwen3.5-9B  (DeltaNet + GQA)"
 echo "  Deployment    : ${DEPLOYMENT_NAME}"
 echo "  Instance type : ${NEURON_INSTANCE_TYPE}  (NeuronCores=${NEURON_CORES}, devices=${NEURON_DEVICE_COUNT})"
-echo "  seq_len/batch : ${QWEN35_SEQ_LEN} / ${QWEN35_MAX_BATCH_SIZE}"
+echo "  seq_len/prompt: ${QWEN35_SEQ_LEN} / ${QWEN35_MAX_CONTEXT_LEN}  (prefill buckets ${QWEN35_CONTEXT_BUCKETS})"
+echo "  decode batch  : ${QWEN35_MAX_BATCH_SIZE} per replica (prefill batch ${QWEN35_CTX_BATCH_SIZE}, CB=${QWEN35_CONTINUOUS_BATCHING})"
+echo "  replicas      : ${QWEN35_DP_REPLICAS} x TP${QWEN35_TP_DEGREE}  -> $(( QWEN35_DP_REPLICAS * QWEN35_MAX_BATCH_SIZE )) concurrent decode slots"
+echo "  artifact      : s3://${MODEL_BUCKET}/${COMPILED_FOLDER}/"
 echo "  Compile first : ${RUN_COMPILE}   Managed-NG: ${USE_MANAGED_NG}"
 echo "=============================================================="
 echo ""
@@ -79,6 +101,7 @@ create_code_configmaps() {
     kubectl create configmap "oai-infopt-nxdi-code-${MODEL_ID}" \
         --from-file=server.py="${SCRIPT_DIR}/server.py" \
         --from-file=compile.py="${SCRIPT_DIR}/compile.py" \
+        --from-file=router.py="${SCRIPT_DIR}/router.py" \
         -n "${BENCHMARK_NAMESPACE}" --dry-run=client -o yaml | kubectl apply -f -
     kubectl create configmap "oai-infopt-nxdi-src-${MODEL_ID}" \
         --from-file="${SCRIPT_DIR}/src/__init__.py" \
@@ -134,7 +157,19 @@ create_code_configmaps
 
 if [[ "${RUN_COMPILE}" == "true" ]]; then
     log_info "Submitting NxDI compile job (idempotent)..."
-    envsubst '${BENCHMARK_NAMESPACE} ${DOWNLOAD_SERVICE_ACCOUNT} ${MODEL_BUCKET} ${AWS_REGION} ${S3_BUCKET_REGION} ${NEURON_NXDI_IMAGE} ${SOURCE_FOLDER} ${COMPILED_FOLDER} ${QWEN35_SEQ_LEN} ${QWEN35_MAX_BATCH_SIZE} ${QWEN35_TP_DEGREE} ${QWEN35_LOGICAL_NC_CONFIG} ${QWEN35_TORCH_DTYPE} ${QWEN35_TOP_K_ON_DEVICE} ${QWEN35_TEXT_ONLY} ${NEURON_CORES} ${NEURON_DEVICE_COUNT} ${COMPILE_NODE_SELECTOR_KEY} ${COMPILE_NODE_SELECTOR_VALUE}' \
+    # Job spec.template is immutable (Troubleshooting #8): remove a FINISHED old
+    # job so the new env applies. A RUNNING compile is never deleted.
+    JOB="oai-infopt-nxdi-compile-qwen3-5-9b-nxdi"
+    if kubectl get job "${JOB}" -n "${BENCHMARK_NAMESPACE}" >/dev/null 2>&1; then
+        ACTIVE=$(kubectl get job "${JOB}" -n "${BENCHMARK_NAMESPACE}" -o jsonpath='{.status.active}' 2>/dev/null || true)
+        if [[ -n "${ACTIVE}" && "${ACTIVE}" != "0" ]]; then
+            log_warn "Compile job ${JOB} is still running - not touching it; waiting on it."
+        else
+            log_info "Deleting finished compile job ${JOB} (template is immutable)..."
+            kubectl delete job "${JOB}" -n "${BENCHMARK_NAMESPACE}" --wait=true
+        fi
+    fi
+    envsubst '${BENCHMARK_NAMESPACE} ${DOWNLOAD_SERVICE_ACCOUNT} ${MODEL_BUCKET} ${AWS_REGION} ${S3_BUCKET_REGION} ${NEURON_NXDI_IMAGE} ${SOURCE_FOLDER} ${COMPILED_FOLDER} ${NEURON_CORES} ${NEURON_DEVICE_COUNT} ${COMPILE_NODE_SELECTOR_KEY} ${COMPILE_NODE_SELECTOR_VALUE} '"${ENVSUBST_COMMON}" \
         < "${SCRIPT_DIR}/compile-job.yaml" | kubectl apply -f -
     log_info "Waiting for compile job (up to 12h)..."
     kubectl wait job/oai-infopt-nxdi-compile-qwen3-5-9b-nxdi --for=condition=Complete --timeout=43200s -n "${BENCHMARK_NAMESPACE}" || {
@@ -154,7 +189,7 @@ else
     DEPLOY_FILE="${SCRIPT_DIR}/deployment.yaml"
 fi
 log_info "Applying deployment: ${DEPLOYMENT_NAME} (S3 region=${S3_BUCKET_REGION})..."
-envsubst '${BENCHMARK_NAMESPACE} ${NEURON_NXDI_IMAGE} ${MODEL_BUCKET} ${SOURCE_FOLDER} ${COMPILED_FOLDER} ${SERVED_NAME} ${NEURON_CORES} ${NEURON_DEVICE_COUNT} ${AWS_REGION} ${S3_BUCKET_REGION} ${INSTANCE_FAMILY} ${TRN2_NODEGROUP_NAME} ${QWEN35_SEQ_LEN} ${QWEN35_MAX_BATCH_SIZE} ${QWEN35_TP_DEGREE} ${QWEN35_LOGICAL_NC_CONFIG} ${QWEN35_TORCH_DTYPE} ${QWEN35_TOP_K_ON_DEVICE} ${QWEN35_TEXT_ONLY}' \
+envsubst '${BENCHMARK_NAMESPACE} ${NEURON_NXDI_IMAGE} ${MODEL_BUCKET} ${SOURCE_FOLDER} ${COMPILED_FOLDER} ${SERVED_NAME} ${NEURON_CORES} ${NEURON_DEVICE_COUNT} ${AWS_REGION} ${S3_BUCKET_REGION} ${INSTANCE_FAMILY} ${TRN2_NODEGROUP_NAME} ${QWEN35_DP_REPLICAS} ${QWEN35_DP_START_PARALLEL} '"${ENVSUBST_COMMON}" \
     < "${DEPLOY_FILE}" | kubectl apply -f -
 
 log_info "Waiting for pod..."

@@ -33,13 +33,9 @@ serving:
   served_name: Qwen3.5-9B
   tokenizer: Qwen/Qwen3.5-9B
   quantization: bf16
-  max_model_len: 2048            # seq_len baked at compile; DeltaNet CTE kernel
-                                 # hung on-device at 4096 (32 chunks), 2048=16 chunks
-  max_num_seqs: 4                # prefill batch baked at compile time; batch=16 overflows
-                                 # Trainium2 HBM (NCC_EVRF009, needs ~54GB/core vs 24GB), 4 fits
-  tensor_parallel_size: 4        # TP=4 — reference-validated. TP=16 hung on-device
-                                 # (DeltaNet NKI ALLGATHER collective -> NRT_TIMEOUT)
-                                 # NOTE: baked at compile time; RECOMPILE required when changing
+  max_model_len: 10240           # prompt (<= 8192) + generation; baked at compile
+  max_num_seqs: 128              # 16 DP replicas x 8 decode slots (continuous batching)
+  tensor_parallel_size: 4        # TP=4 per replica (validated). Source of truth: model.env
 
 resources:
   cpu_request: "48"
@@ -57,9 +53,9 @@ instances:
 neuron:
   engine: nxdi
   source_folder: Qwen3.5-9B
-  compiled_folder: qwen3-5-9b-nxdi-traced
-  sequence_length: 2048          # DeltaNet CTE kernel hung at 4096; 2048 = 16 chunks
-  batch_size: 4                  # prefill batch baked at compile; 16 overflows HBM (NCC_EVRF009)
+  compiled_folder: qwen3-5-9b-nxdi-textonly-10k-cb8-traced
+  sequence_length: 10240         # prefill buckets 1024/2048/4096/8192, chunked DeltaNet kernel
+  batch_size: 8                  # decode batch per replica; prefill runs 1 request at a time
   auto_cast_type: bf16
   instance_family: trn2
   logical_neuron_config: 2

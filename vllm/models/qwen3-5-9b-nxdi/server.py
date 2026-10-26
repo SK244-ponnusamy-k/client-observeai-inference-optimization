@@ -7,28 +7,30 @@ Jira: client-observeai-inference-optimization (Qwen3.5 nxdi bring-up)
 
 Why this exists
 ---------------
-Qwen3.5 is a hybrid DeltaNet + GQA decoder. vLLM-Neuron does NOT support this
-architecture out of the box, so we cannot `vllm serve` it. The reference
-NeuronX Distributed Inference (NxDI) contrib implementation
-(`src/modeling_qwen35.py` + custom NKI DeltaNet kernels) exposes only a Python
-API: build config -> compile -> load -> generate via HuggingFaceGenerationAdapter.
+Qwen3.5 is a hybrid DeltaNet + GQA decoder that vLLM-Neuron cannot serve. The
+reference NxDI contrib model (src/) exposes only a Python API, so this thin
+FastAPI server implements the OpenAI subset the harness uses (/health,
+/v1/completions, /v1/chat/completions, /v1/models, /metrics) on :8000.
 
-This module wraps that Python API in a thin FastAPI server that implements the
-subset of the OpenAI REST API the benchmark/quality harness depends on
-(`/health`, `/v1/completions`, `/v1/chat/completions`, `/v1/models`). The HTTP
-contract matches the vLLM serving path on :8000, so every downstream stage
-(benchmark, observability, teardown) is unchanged — only this deploy differs,
-per the framework's "shared tail" rule.
+One process = one TP replica. For data parallelism across the 16 Trainium2
+chips of a trn2.48xlarge, router.py launches N of these on distinct NeuronCore
+slices and load-balances across them.
 
-Configuration is env-only (Pydantic settings); nothing is hardcoded. The model
-is compiled on first boot if a traced/NEFF artifact is not already present,
-otherwise the cached artifact is loaded.
+Serving behaviour
+-----------------
+* Dynamic micro-batching up to the compiled decode batch (read from the
+  artifact, not env), RIGHT padding (NxDI's KV/mask bookkeeping assumes it;
+  left padding silently corrupted every row but the longest in a batch).
+* True per-token SSE streaming: a StoppingCriteria hook sees every decode step
+  and pushes tokens to the request, so TTFT = queue + prefill (previously the
+  whole completion was sent as one chunk, so "TTFT" == end-to-end latency).
+* Per-request max_tokens / EOS handling, prompt-length validation (HTTP 400
+  instead of a device error), max_tokens capped to the compiled context.
 """
 
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass
 import json
 import logging
 import os
@@ -36,24 +38,17 @@ import sys
 import time
 import uuid
 from contextlib import asynccontextmanager
+from dataclasses import dataclass, field
 from threading import Lock
-from typing import Any, Dict, List, Optional
+from typing import Any, AsyncIterator, Dict, List, Optional, Set
 
 import torch
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-
-@dataclass
-class _BatchItem:
-    prompt: str
-    max_new_tokens: int
-    correlation_id: str
-    future: asyncio.Future
-    ignore_eos: bool = False
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Structured JSON logging (correlation id per request)
@@ -68,6 +63,7 @@ class _JsonLogFormatter(logging.Formatter):
             "ts": self.formatTime(record, "%Y-%m-%dT%H:%M:%S%z"),
             "level": record.levelname,
             "service": "qwen35-nxdi-shim",
+            "worker": os.environ.get("QWEN35_WORKER_ID", "0"),
             "msg": record.getMessage(),
         }
         corr = getattr(record, "correlation_id", None)
@@ -92,67 +88,121 @@ def _log(level: int, msg: str, correlation_id: Optional[str] = None, **fields: A
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Settings — env only, validated by Pydantic. No hardcoded paths/endpoints.
+# Settings — env only. Compile-time shape params are only used for a first-boot
+# compile; at serve time the limits come from the loaded artifact.
 # ──────────────────────────────────────────────────────────────────────────────
 
 
 class Settings(BaseSettings):
-    """Runtime configuration. Every value is overridable via environment."""
-
     model_config = SettingsConfigDict(env_prefix="QWEN35_", extra="ignore")
 
-    # Filesystem paths (populated by the init container that syncs S3 -> local).
-    model_path: str = Field(default="/model", description="HF weights dir (config.json + safetensors)")
-    compiled_path: str = Field(default="/compiled", description="Traced/NEFF artifact dir")
-
-    # NxDI / Neuron compile-time parameters. These are BAKED into the compiled
-    # artifact — changing them forces a recompile.
-    tp_degree: int = Field(default=4, description="Tensor-parallel degree = NeuronCores")
-    seq_len: int = Field(default=160, description="Max sequence length (reference-validated: 160)")
-    max_batch_size: int = Field(default=1, description="Max concurrent sequences")
-    logical_nc_config: int = Field(default=2, description="LNC: fuse N physical cores into 1 logical (trn2=2)")
-    torch_dtype: str = Field(default="bfloat16", description="bfloat16 | float16 | float32")
-    top_k_on_device: int = Field(default=1, description="On-device sampling top-k (1 = greedy)")
-
-    # Server. Binds all interfaces so the in-cluster Service can reach the pod;
-    # exposure is controlled by k8s Service + NetworkPolicy, not by the bind addr.
+    model_path: str = Field(default="/model")
+    compiled_path: str = Field(default="/compiled")
     host: str = Field(default="0.0.0.0", description="Bind host")  # nosec B104
-    port: int = Field(default=8000, description="Bind port — matches the vLLM serving contract")
-    served_model_name: str = Field(default="Qwen3.5-9B", description="Name clients call in the `model` field")
+    port: int = Field(default=8000)
+    served_model_name: str = Field(default="Qwen3.5-9B")
+    default_max_tokens: int = Field(default=256)
+    batch_window_ms: float = Field(default=10.0, description="Micro-batch collection window")
 
-    # Generation defaults / ceilings
-    default_max_tokens: int = Field(default=256, description="max_new_tokens when a request omits it")
 
-    def resolved_dtype(self) -> torch.dtype:
-        mapping = {
-            "bfloat16": torch.bfloat16,
-            "bf16": torch.bfloat16,
-            "float16": torch.float16,
-            "fp16": torch.float16,
-            "float32": torch.float32,
-            "fp32": torch.float32,
-        }
-        key = self.torch_dtype.lower()
-        if key not in mapping:
-            raise ValueError(
-                f"Unsupported QWEN35_TORCH_DTYPE={self.torch_dtype!r}; "
-                f"expected one of {sorted(mapping)}"
-            )
-        return mapping[key]
+class PromptError(ValueError):
+    """Client error (HTTP 400): prompt empty or longer than the compiled context."""
+
+
+@dataclass
+class _BatchItem:
+    prompt_ids: List[int]
+    max_new_tokens: int
+    correlation_id: str
+    future: asyncio.Future
+    loop: asyncio.AbstractEventLoop
+    ignore_eos: bool = False
+    stream: Optional[asyncio.Queue] = None
+
+
+@dataclass
+class _Metrics:
+    running: int = 0
+    prompt_tokens_total: int = 0
+    generation_tokens_total: int = 0
+    requests_total: int = 0
+    batches_total: int = 0
+
+
+@dataclass
+class _RowState:
+    tokens: List[int] = field(default_factory=list)
+    done: bool = False
+    finish_reason: str = "length"
+
+
+class _StepTracker:
+    """HF StoppingCriteria hook: called once per generated token for the whole batch.
+
+    Pushes each row's new token to its stream, applies per-row max_tokens / EOS,
+    and stops generation as soon as every row is finished.
+    """
+
+    def __init__(self, items: List[_BatchItem], eos_ids: Set[int],
+                 vocab_size: int = 0, safe_token_id: int = 0) -> None:
+        self.items = items
+        self.eos_ids = eos_ids
+        self.rows = [_RowState() for _ in items]
+        self.vocab_size = int(vocab_size or 0)
+        self.safe_token_id = int(safe_token_id)
+        self.step = 0
+
+    def __call__(self, input_ids: torch.Tensor, scores: Any = None, **kwargs: Any) -> torch.Tensor:
+        last = input_ids[:, -1].tolist()
+        self.step += 1
+        if self.step == 1:
+            _log(logging.DEBUG, "first sampled tokens (prefill output)", token_ids=last)
+        for i, (item, row) in enumerate(zip(self.items, self.rows)):
+            tok = int(last[i])
+            # Device guard: the next decode step feeds this id straight into the
+            # embedding gather. An id outside [0, vocab) (e.g. argmax over NaN
+            # logits) triggers a scatter/gather OOB (status=1006) that kills the
+            # whole batch. Swap in a valid id in place (HF reads input_ids[:, -1:]
+            # next step) and end the row with an error instead.
+            if self.vocab_size and not 0 <= tok < self.vocab_size:
+                input_ids[i, -1] = self.safe_token_id
+                if not row.done:
+                    _log(logging.ERROR, "invalid sampled token id; ending row",
+                         correlation_id=item.correlation_id, token_id=tok,
+                         step=self.step, vocab_size=self.vocab_size)
+                    row.done, row.finish_reason = True, "error"
+                continue
+            if row.done:
+                continue
+            if not item.ignore_eos and tok in self.eos_ids:
+                row.done, row.finish_reason = True, "stop"
+                continue
+            row.tokens.append(tok)
+            if item.stream is not None:
+                item.loop.call_soon_threadsafe(item.stream.put_nowait, ("tok", tok))
+            if len(row.tokens) >= item.max_new_tokens:
+                row.done, row.finish_reason = True, "length"
+        all_done = all(r.done for r in self.rows)
+        return torch.full((input_ids.shape[0],), all_done, dtype=torch.bool, device=input_ids.device)
+
+
+def _make_stopping_criteria(tracker: _StepTracker):
+    from transformers import StoppingCriteria  # noqa: WPS433
+
+    class _Hook(StoppingCriteria):
+        def __call__(self, input_ids, scores, **kwargs):  # type: ignore[override]
+            return tracker(input_ids, scores, **kwargs)
+
+    return _Hook()
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Model engine — loads the NxDI model once, serializes generate() calls.
+# Model engine
 # ──────────────────────────────────────────────────────────────────────────────
 
 
 class Qwen35Engine:
-    """Owns the compiled NxDI model + tokenizer and runs generation.
-
-    The compiled Neuron graph is single-tenant: concurrent generate() calls on
-    one engine are not safe. Concurrency is achieved via dynamic micro-batching
-    up to `max_batch_size` in a non-blocking background worker.
-    """
+    """Owns the compiled NxDI model + tokenizer; micro-batches requests onto it."""
 
     def __init__(self, settings: Settings) -> None:
         self._settings = settings
@@ -163,180 +213,161 @@ class Qwen35Engine:
         self._ready = False
         self._queue: Optional[asyncio.Queue[_BatchItem]] = None
         self._worker_task: Optional[asyncio.Task] = None
+        self.seq_len = 0
+        self.max_context_length = 0
+        self.max_batch_size = 1
+        self.pad_id = 0
+        self.vocab_size = 0
+        self.eos_ids: Set[int] = set()
+        self.metrics = _Metrics()
 
     @property
     def ready(self) -> bool:
         return self._ready
 
-    def load(self) -> None:
-        """Build config, compile if needed, load the model and tokenizer.
+    @property
+    def waiting(self) -> int:
+        return self._queue.qsize() if self._queue is not None else 0
 
-        Raises:
-            RuntimeError: if the reference modeling package or weights are missing.
-        """
+    # ---- load ---------------------------------------------------------------
+
+    def load(self) -> None:
         s = self._settings
-        # Ensure the vendored reference package (src/) is importable.
         here = os.path.dirname(os.path.abspath(__file__))
         if here not in sys.path:
             sys.path.insert(0, here)
 
         try:
-            from transformers import AutoTokenizer  # noqa: WPS433 (lazy heavy import)
-            from neuronx_distributed_inference.models.config import (  # noqa: WPS433
-                NeuronConfig,
-                OnDeviceSamplingConfig,
-            )
+            from transformers import AutoTokenizer  # noqa: WPS433
             from neuronx_distributed_inference.utils.hf_adapter import (  # noqa: WPS433
                 HuggingFaceGenerationAdapter,
             )
-            from src.modeling_qwen35 import (  # noqa: WPS433
-                Qwen35InferenceConfig,
-                NeuronQwen35ForCausalLM,
-            )
+            from src.modeling_qwen35 import NeuronQwen35ForCausalLM  # noqa: WPS433
+            import compile as qwen_compile  # noqa: WPS433  (sibling compile.py)
         except ImportError as exc:  # pragma: no cover - env-specific
-            raise RuntimeError(
-                "NxDI runtime not available. This server must run inside the "
-                "NeuronX Distributed Inference environment (SDK 2.29+, NKI 0.3). "
-                f"Import failed: {exc}"
-            ) from exc
+            raise RuntimeError(f"NxDI runtime not available: {exc}") from exc
 
-        config_json = os.path.join(s.model_path, "config.json")
-        if not os.path.isfile(config_json):
-            raise RuntimeError(f"Weights not found: missing {config_json}")
+        if not os.path.isfile(os.path.join(s.model_path, "config.json")):
+            raise RuntimeError(f"Weights not found: missing {s.model_path}/config.json")
 
-        _log(logging.INFO, "Building NeuronConfig", tp_degree=s.tp_degree, seq_len=s.seq_len,
-             max_batch_size=s.max_batch_size, dtype=s.torch_dtype, lnc=s.logical_nc_config)
-
-        neuron_config = NeuronConfig(
-            tp_degree=s.tp_degree,
-            batch_size=s.max_batch_size,
-            ctx_batch_size=s.max_batch_size,
-            tkg_batch_size=s.max_batch_size,
-            max_batch_size=s.max_batch_size,
-            seq_len=s.seq_len,
-            torch_dtype=s.resolved_dtype(),
-            logical_nc_config=s.logical_nc_config,
-            enable_bucketing=False,
-            flash_decoding_enabled=False,
-            on_device_sampling_config=OnDeviceSamplingConfig(top_k=s.top_k_on_device),
-            save_sharded_checkpoint=True,
-        )
-
-        with open(config_json, encoding="utf-8") as handle:
-            hf_config = json.load(handle)
-        text_config = hf_config.get("text_config", hf_config)
-        config_dict = dict(text_config)
-        config_dict["pad_token_id"] = text_config.get("eos_token_id", 248044)
-        config_dict["tie_word_embeddings"] = hf_config.get(
-            "tie_word_embeddings",
-            text_config.get("tie_word_embeddings", False),
-        )
-        if "rope_parameters" in text_config:
-            config_dict["rope_theta"] = text_config["rope_parameters"].get("rope_theta", 10000000)
-
-        config = Qwen35InferenceConfig(neuron_config=neuron_config, **config_dict)
-
-        compiled_ready = os.path.isdir(s.compiled_path) and any(
-            os.scandir(s.compiled_path)
-        )
+        compiled_ready = os.path.isdir(s.compiled_path) and any(os.scandir(s.compiled_path))
         if not compiled_ready:
-            _log(logging.INFO, "No compiled artifact found — compiling (first boot)",
-                 compiled_path=s.compiled_path)
-            os.makedirs(s.compiled_path, exist_ok=True)
-            model = NeuronQwen35ForCausalLM(s.model_path, config)
-            model.compile(s.compiled_path)
-            _log(logging.INFO, "Compile complete", compiled_path=s.compiled_path)
+            params = qwen_compile.resolve_build_params()
+            _log(logging.INFO, "No compiled artifact — compiling (first boot)", **params.__dict__)
+            qwen_compile.compile_model(s.model_path, s.compiled_path, params)
         else:
             _log(logging.INFO, "Reusing cached compiled artifact", compiled_path=s.compiled_path)
+            self._check_build_info(qwen_compile.BUILD_INFO_FILE)
 
         model = NeuronQwen35ForCausalLM(s.compiled_path)
         model.load(s.compiled_path)
 
-        # model_path is a LOCAL dir synced from our own S3 bucket (not a Hub
-        # repo), so there is no remote download/revision to pin here.
-        # Left-padding is required for causal LM batch generation.
-        tokenizer = AutoTokenizer.from_pretrained(s.model_path, padding_side="left")  # nosec B615
-        if tokenizer.pad_token is None:
-            tokenizer.pad_token = tokenizer.eos_token
+        # Serve limits come from the artifact that was actually compiled.
+        nc = model.config.neuron_config
+        self.seq_len = int(nc.seq_len)
+        self.max_context_length = int(getattr(nc, "max_context_length", nc.seq_len) or nc.seq_len)
+        self.max_batch_size = int(getattr(nc, "tkg_batch_size", None) or nc.max_batch_size)
+        if getattr(nc, "padding_side", "right") != "right":
+            raise RuntimeError(f"artifact padding_side={nc.padding_side}; server pads right")
+        self.pad_id = int(model.config.pad_token_id)
+        self.vocab_size = int(getattr(model.config, "vocab_size", 0) or 0)
+
+        tokenizer = AutoTokenizer.from_pretrained(s.model_path, padding_side="right")  # nosec B615
+        self.eos_ids = {i for i in (tokenizer.eos_token_id, self.pad_id) if i is not None}
+        im_end = tokenizer.convert_tokens_to_ids("<|im_end|>")
+        if isinstance(im_end, int) and im_end >= 0:
+            self.eos_ids.add(im_end)
 
         self._model = model
         self._gen_model = HuggingFaceGenerationAdapter(model)
+        # EOS is handled per row by _StepTracker. Clear the model-level default so
+        # HF generate() doesn't re-inject it (on-device sampling bypasses
+        # min_new_tokens, so an injected EOS would stop ignore_eos rows early).
+        if getattr(self._gen_model, "generation_config", None) is not None:
+            self._gen_model.generation_config.eos_token_id = None
 
-        # Text-only build (QWEN35_TEXT_ONLY=1): the compiled graph is a plain
-        # text decoder with the stock NxDI forward signature. The VL llava_args
-        # monkeypatch below is only needed for the 24-input VL artifact, so skip
-        # it — the stock HuggingFaceGenerationAdapter + plain generate() works.
-        if os.environ.get("QWEN35_TEXT_ONLY") == "1":
-            self._tokenizer = tokenizer
-            self._ready = True
-            _log(
-                logging.INFO,
-                "Model ready (text-only)",
-                served_model_name=s.served_model_name,
-            )
-            return
-
-        # The compiled graph is a vision-language model with a 24-input forward
-        # signature (last 3 = mrope_position_ids, vision_embeddings, vision_mask).
-        # Passing llava_args to generate() does NOT survive HF 4.57's kwarg
-        # handling into the per-step model call, so forward() fails with
-        # "missing value for argument_9". Instead we wrap the adapter's
-        # prepare_inputs_for_generation so EVERY step injects dummy text-only
-        # VL tensors as llava_args, which _get_model_outputs unpacks into the
-        # trailing positional args. Sized to the step's own input so the
-        # text-only no-op vision branch is taken. No recompile needed.
-        _hidden_size = int(self._model.config.hidden_size)
-        _vdtype = self._model.config.neuron_config.torch_dtype
-        # The CTE (prefill) graph runs at the compiled bucket sequence length,
-        # NOT the raw prompt length. get_model_output rejects vision tensors whose
-        # seq dim != the padded bucket (it logged "[4,17,1] does not match padded
-        # sequence length 2048"), so the dummy VL tensors MUST be sized to the
-        # compiled seq_len. Decode steps use seq dim 1.
-        _cte_seq_len = int(self._model.config.neuron_config.seq_len)
-        _orig_prepare = self._gen_model.prepare_inputs_for_generation
-
-        def _prepare_with_llava(input_ids, *args, **kwargs):
-            model_inputs = _orig_prepare(input_ids, *args, **kwargs)
-            ids = model_inputs.get("input_ids")
-            if ids is None:
-                ids = input_ids
-            bsz = int(ids.shape[0])
-            step_len = int(ids.shape[1])
-            # Prefill: size to the compiled bucket so get_model_output takes the
-            # text-only no-op branch (seq dim == seq_length). Decode: size to 1.
-            slen = _cte_seq_len if step_len > 1 else 1
-            ve = torch.zeros((bsz, slen, _hidden_size), dtype=_vdtype)
-            vm = torch.full((bsz, slen, 1), fill_value=slen - 1, dtype=torch.int32)
-            mr = (
-                torch.arange(0, slen, dtype=torch.int32)
-                .unsqueeze(0)
-                .unsqueeze(0)
-                .expand(3, bsz, -1)
-                .contiguous()
-            )
-            # NeuronQwen35ForCausalLM._get_model_outputs (our override) reads
-            #   vision_embeddings = llava_args[0]
-            #   vision_mask       = llava_args[1]
-            #   mrope             = llava_args[2]
-            # and builds the 14 empty placeholders itself, then calls the traced
-            # model with 7 real + *empties(14) + mrope + vis_emb + vis_mask = 24.
-            # So llava_args must be EXACTLY these 3 tensors in this order.
-            model_inputs["llava_args"] = [ve, vm, mr]
-            return model_inputs
-
-        self._gen_model.prepare_inputs_for_generation = _prepare_with_llava
+        if os.environ.get("QWEN35_TEXT_ONLY") != "1":
+            self._install_vl_shim()
 
         self._tokenizer = tokenizer
         self._ready = True
-        _log(logging.INFO, "Model ready", served_model_name=s.served_model_name)
+        _log(logging.INFO, "Model ready", served_model_name=s.served_model_name,
+             seq_len=self.seq_len, max_context_length=self.max_context_length,
+             max_batch_size=self.max_batch_size,
+             continuous_batching=bool(getattr(nc, "is_continuous_batching", False)),
+             ctx_buckets=getattr(nc, "context_encoding_buckets", None),
+             tkg_buckets=getattr(nc, "token_generation_buckets", None))
+
+    def _check_build_info(self, filename: str) -> None:
+        path = os.path.join(self._settings.compiled_path, filename)
+        if not os.path.isfile(path):
+            return  # artifacts from before build-info existed
+        with open(path, encoding="utf-8") as handle:
+            info = json.load(handle)
+        built = info.get("env", {}).get("QWEN35_TEXT_ONLY", "")
+        now = os.environ.get("QWEN35_TEXT_ONLY", "")
+        if built != now:
+            raise RuntimeError(f"QWEN35_TEXT_ONLY mismatch: artifact={built!r} serve={now!r}")
+
+    def _install_vl_shim(self) -> None:
+        """Legacy VL (24-input) artifact support: inject dummy llava_args each step."""
+        hidden = int(self._model.config.hidden_size)
+        vdtype = self._model.config.neuron_config.torch_dtype
+        cte_len = int(self._model.config.neuron_config.seq_len)
+        orig = self._gen_model.prepare_inputs_for_generation
+
+        def _prepare(input_ids, *args, **kwargs):
+            inputs = orig(input_ids, *args, **kwargs)
+            ids = inputs.get("input_ids", input_ids)
+            bsz, slen = int(ids.shape[0]), (cte_len if int(ids.shape[1]) > 1 else 1)
+            ve = torch.zeros((bsz, slen, hidden), dtype=vdtype)
+            vm = torch.full((bsz, slen, 1), fill_value=slen - 1, dtype=torch.int32)
+            mr = torch.arange(0, slen, dtype=torch.int32).unsqueeze(0).unsqueeze(0).expand(3, bsz, -1).contiguous()
+            inputs["llava_args"] = [ve, vm, mr]
+            return inputs
+
+        self._gen_model.prepare_inputs_for_generation = _prepare
+
+    # ---- request admission --------------------------------------------------
+
+    def tokenize(self, prompt: str) -> List[int]:
+        return list(self._tokenizer(prompt, add_special_tokens=False)["input_ids"])
+
+    def admit(self, prompt_ids: List[int], requested: int) -> int:
+        """Validate the prompt; return the max_new_tokens this request can have."""
+        n = len(prompt_ids)
+        if n == 0:
+            raise PromptError("prompt is empty")
+        if n > self.max_context_length:
+            raise PromptError(
+                f"prompt has {n} tokens; this model was compiled for prompts up to "
+                f"{self.max_context_length} tokens (QWEN35_MAX_CONTEXT_LEN)"
+            )
+        allowance = self.seq_len - n - 1
+        if allowance < 1:
+            raise PromptError(f"prompt has {n} tokens; no room to generate within {self.seq_len}")
+        return max(1, min(requested, allowance))
+
+    async def submit(self, prompt_ids: List[int], max_new: int, corr: str,
+                     ignore_eos: bool, stream: bool) -> _BatchItem:
+        if not self._ready or self._queue is None:
+            raise RuntimeError("Model not loaded")
+        loop = asyncio.get_running_loop()
+        item = _BatchItem(
+            prompt_ids=prompt_ids, max_new_tokens=max_new, correlation_id=corr,
+            future=loop.create_future(), loop=loop, ignore_eos=ignore_eos,
+            stream=asyncio.Queue() if stream else None,
+        )
+        await self._queue.put(item)
+        return item
+
+    # ---- batch worker -------------------------------------------------------
 
     def start_worker(self) -> None:
-        """Initialize the async request queue and start the batch worker loop."""
         self._queue = asyncio.Queue()
         self._worker_task = asyncio.create_task(self._batch_loop())
 
     async def stop_worker(self) -> None:
-        """Cancel the background batch worker loop cleanly."""
         if self._worker_task is not None:
             self._worker_task.cancel()
             try:
@@ -346,178 +377,121 @@ class Qwen35Engine:
             self._worker_task = None
 
     async def _batch_loop(self) -> None:
-        """Worker loop that dynamically batches requests up to max_batch_size."""
+        window = self._settings.batch_window_ms / 1000.0
         while True:
             try:
                 assert self._queue is not None
-                item = await self._queue.get()
+                items = [await self._queue.get()]
             except asyncio.CancelledError:
                 break
-
-            items = [item]
-            max_batch = self._settings.max_batch_size
-            # 10ms micro-batch window: collect concurrent requests without adding latency
-            batch_window_s = 0.010
-            t_start = time.time()
-            while len(items) < max_batch:
-                time_left = max(0.001, batch_window_s - (time.time() - t_start))
+            t_start = time.monotonic()
+            while len(items) < self.max_batch_size:
+                left = window - (time.monotonic() - t_start)
+                if left <= 0:
+                    # Window elapsed: still drain anything already queued (no wait).
+                    while len(items) < self.max_batch_size and not self._queue.empty():
+                        items.append(self._queue.get_nowait())
+                    break
                 try:
-                    next_item = await asyncio.wait_for(self._queue.get(), timeout=time_left)
-                    items.append(next_item)
-                except (asyncio.TimeoutError, asyncio.CancelledError):
+                    items.append(await asyncio.wait_for(self._queue.get(), timeout=left))
+                except asyncio.TimeoutError:
                     break
 
+            self.metrics.running = len(items)
             try:
-                # Offload blocking inference to thread pool to keep event loop responsive
                 results = await asyncio.to_thread(self._process_batch, items)
                 for itm, res in zip(items, results):
+                    if itm.stream is not None:
+                        itm.stream.put_nowait(("done", res))
                     if not itm.future.done():
                         itm.future.set_result(res)
-            except Exception as exc:  # pragma: no cover
+            except Exception as exc:  # pragma: no cover - device errors
                 _log(logging.ERROR, "batch processing failed", error=str(exc))
                 for itm in items:
+                    if itm.stream is not None:
+                        itm.stream.put_nowait(("error", str(exc)))
                     if not itm.future.done():
                         itm.future.set_exception(exc)
+            finally:
+                self.metrics.running = 0
 
-    def _process_batch(self, items: List[_BatchItem]) -> List[Dict[str, int | str]]:
-        """Synchronously execute a batched generation on the compiled model."""
-        if not self._ready:
-            raise RuntimeError("Model not loaded")
-
+    def _process_batch(self, items: List[_BatchItem]) -> List[Dict[str, Any]]:
         from transformers import GenerationConfig  # noqa: WPS433
 
-        s = self._settings
-        tokenizer = self._tokenizer
-        prompts = [it.prompt for it in items]
-        max_new_tokens = max(it.max_new_tokens for it in items)
+        n = len(items)
+        padded_len = max(len(it.prompt_ids) for it in items)
+        input_ids = torch.full((n, padded_len), self.pad_id, dtype=torch.long)
+        attention_mask = torch.zeros((n, padded_len), dtype=torch.long)
+        for i, it in enumerate(items):
+            L = len(it.prompt_ids)
+            input_ids[i, :L] = torch.tensor(it.prompt_ids, dtype=torch.long)
+            attention_mask[i, :L] = 1
 
-        inputs = tokenizer(prompts, padding=True, return_tensors="pt")
-        prompt_lengths = [int(mask.sum().item()) for mask in inputs.attention_mask]
-        padded_prompt_len = int(inputs.input_ids.shape[-1])
-
-        # ignore_eos (benchmark sends --ignore-eos): force the model to emit the
-        # full max_new_tokens of real content instead of stopping at the first
-        # EOS. This model is a thinking model whose greedy decode otherwise emits
-        # end/special tokens almost immediately (decoded content was empty, so
-        # vllm bench serve counted 0 output tokens). With ignore_eos we drop the
-        # eos stop criterion and floor min_new_tokens so throughput is stable and
-        # measurable. Any single item requesting ignore_eos applies to the batch.
-        ignore_eos = any(getattr(it, "ignore_eos", False) for it in items)
-        gen_kwargs = dict(
-            do_sample=s.top_k_on_device > 1,
-            top_k=s.top_k_on_device,
-            pad_token_id=tokenizer.pad_token_id,
+        # All rows decode in lock-step, so the batch budget is bounded by the
+        # longest prompt; each row is still cut at its own max_tokens.
+        max_new = max(1, min(max(it.max_new_tokens for it in items), self.seq_len - padded_len - 1))
+        tracker = _StepTracker(items, self.eos_ids, vocab_size=self.vocab_size,
+                               safe_token_id=self.pad_id)
+        top_k = int(getattr(self._model.config.neuron_config.on_device_sampling_config, "top_k", 1) or 1)
+        gen_config = GenerationConfig(
+            do_sample=top_k > 1, top_k=top_k, max_new_tokens=max_new,
+            pad_token_id=self.pad_id, eos_token_id=None,
         )
-        if ignore_eos:
-            gen_kwargs["eos_token_id"] = None
-            gen_kwargs["min_new_tokens"] = max_new_tokens
-        else:
-            gen_kwargs["eos_token_id"] = tokenizer.eos_token_id
-        gen_config = GenerationConfig(**gen_kwargs)
 
-        # VL inputs (llava_args) are injected per-step by the wrapped
-        # prepare_inputs_for_generation installed at load time, so the generate
-        # call stays a plain text request.
         t0 = time.time()
         with self._lock:
-            outputs = self._gen_model.generate(
-                inputs.input_ids,
+            self._gen_model.generate(
+                input_ids,
+                attention_mask=attention_mask,
                 generation_config=gen_config,
-                attention_mask=inputs.attention_mask,
-                max_new_tokens=max_new_tokens,
+                stopping_criteria=[_make_stopping_criteria(tracker)],
             )
         latency_ms = round((time.time() - t0) * 1000.0, 1)
 
-        results: List[Dict[str, int | str]] = []
-        for i, itm in enumerate(items):
-            full = outputs[i]
-            completion_ids = full[padded_prompt_len:]
-            text = tokenizer.decode(completion_ids, skip_special_tokens=True)
-            # Strip any leading thinking block so the returned content is the
-            # answer, not the chain-of-thought (benchmark + quality want the
-            # visible answer). No-op when enable_thinking=False already removed it.
+        results: List[Dict[str, Any]] = []
+        for it, row in zip(items, tracker.rows):
+            completion_tokens = len(row.tokens) + (1 if row.finish_reason == "stop" else 0)
+            text = self._tokenizer.decode(row.tokens, skip_special_tokens=True)
             if "</think>" in text:
                 text = text.split("</think>", 1)[1].lstrip("\n")
-            completion_tokens = int(completion_ids.shape[-1])
-
-            _log(logging.INFO, "generation complete", correlation_id=itm.correlation_id,
-                 prompt_tokens=prompt_lengths[i], completion_tokens=completion_tokens,
-                 batch_size=len(items), latency_ms=latency_ms)
-
+            self.metrics.prompt_tokens_total += len(it.prompt_ids)
+            self.metrics.generation_tokens_total += completion_tokens
+            self.metrics.requests_total += 1
+            _log(logging.INFO, "generation complete", correlation_id=it.correlation_id,
+                 prompt_tokens=len(it.prompt_ids), completion_tokens=completion_tokens,
+                 finish_reason=row.finish_reason, batch_size=n, latency_ms=latency_ms)
             results.append({
                 "text": text,
-                "prompt_tokens": prompt_lengths[i],
+                "prompt_tokens": len(it.prompt_ids),
                 "completion_tokens": completion_tokens,
+                "finish_reason": row.finish_reason,
             })
+        self.metrics.batches_total += 1
         return results
 
-    async def generate_async(
-        self, prompt: str, max_new_tokens: int, correlation_id: str,
-        ignore_eos: bool = False,
-    ) -> Dict[str, int | str]:
-        """Enqueue request into the dynamic batch queue and await result."""
-        if not self._ready or self._queue is None:
-            raise RuntimeError("Model not loaded or queue not ready")
-
-        loop = asyncio.get_running_loop()
-        future: asyncio.Future = loop.create_future()
-        await self._queue.put(
-            _BatchItem(
-                prompt=prompt,
-                max_new_tokens=max_new_tokens,
-                correlation_id=correlation_id,
-                future=future,
-                ignore_eos=ignore_eos,
-            )
-        )
-        return await future
-
-    def generate(self, prompt: str, max_new_tokens: int, correlation_id: str) -> Dict[str, int | str]:
-        """Synchronous fallback for direct generation."""
-        item = _BatchItem(
-            prompt=prompt,
-            max_new_tokens=max_new_tokens,
-            correlation_id=correlation_id,
-            future=asyncio.Future(),
-        )
-        return self._process_batch([item])[0]
-
     def apply_chat_template(self, messages: List[Dict[str, str]]) -> str:
-        """Render chat messages to a prompt string via the model's chat template.
-
-        Qwen3.5 is a thinking model: its default chat template appends an open
-        <think> block, after which greedy on-device sampling emits reasoning /
-        end tokens that decode to empty text (benchmark counted 0 output
-        tokens). Render with enable_thinking=False so the assistant turn starts
-        directly at the answer. Falls back to the default template on older
-        tokenizers that don't accept the kwarg.
-        """
+        """Render chat messages; enable_thinking=False so the answer starts immediately."""
         try:
             return self._tokenizer.apply_chat_template(
-                messages,
-                tokenize=False,
-                add_generation_prompt=True,
-                enable_thinking=False,
+                messages, tokenize=False, add_generation_prompt=True, enable_thinking=False
             )
         except TypeError:
-            return self._tokenizer.apply_chat_template(
-                messages, tokenize=False, add_generation_prompt=True
-            )
+            return self._tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+
+    def decode(self, ids: List[int]) -> str:
+        return self._tokenizer.decode(ids, skip_special_tokens=True)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# OpenAI-compatible request/response schemas (subset used by the harness)
+# OpenAI-compatible schemas (subset used by the harness)
 # ──────────────────────────────────────────────────────────────────────────────
 
 
 class CompletionRequest(BaseModel):
-    # Tolerate any extra OpenAI fields vllm bench serve sends (logprobs,
-    # stream_options, n, stop, presence_penalty, ...) so they don't 422.
     model_config = ConfigDict(extra="ignore")
     model: Optional[str] = None
     prompt: str
     max_tokens: Optional[int] = None
-    # Accepted for API compatibility; sampling is governed by on-device config.
     temperature: Optional[float] = None
     top_p: Optional[float] = None
     stream: bool = False
@@ -531,11 +505,11 @@ class ChatMessage(BaseModel):
 
 
 class ChatCompletionRequest(BaseModel):
-    # Tolerate any extra OpenAI fields vllm bench serve sends so they don't 422.
     model_config = ConfigDict(extra="ignore")
     model: Optional[str] = None
     messages: List[ChatMessage]
     max_tokens: Optional[int] = None
+    max_completion_tokens: Optional[int] = None
     temperature: Optional[float] = None
     top_p: Optional[float] = None
     stream: bool = False
@@ -548,10 +522,8 @@ _ENGINE = Qwen35Engine(_SETTINGS)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):  # noqa: D401
-    """Load the model at startup; surface load failures as a crash (fail fast)."""
-    _log(logging.INFO, "Starting Qwen3.5 NxDI shim", served_model_name=_SETTINGS.served_model_name,
-         port=_SETTINGS.port)
-    _ENGINE.load()
+    _log(logging.INFO, "Starting Qwen3.5 NxDI shim", port=_SETTINGS.port)
+    await asyncio.to_thread(_ENGINE.load)
     _ENGINE.start_worker()
     yield
     await _ENGINE.stop_worker()
@@ -571,7 +543,6 @@ async def _correlation_id_mw(request: Request, call_next):
 
 @app.get("/health")
 async def health() -> JSONResponse:
-    """Readiness: 200 only once the compiled model is loaded (matches vLLM /health)."""
     if not _ENGINE.ready:
         return JSONResponse(status_code=503, content={"status": "loading"})
     return JSONResponse(status_code=200, content={"status": "ok"})
@@ -579,149 +550,136 @@ async def health() -> JSONResponse:
 
 @app.get("/v1/models")
 async def list_models() -> Dict[str, Any]:
-    return {
-        "object": "list",
-        "data": [
-            {
-                "id": _SETTINGS.served_model_name,
-                "object": "model",
-                "owned_by": "observeai-inference-optimization",
-            }
-        ],
-    }
+    return {"object": "list", "data": [{
+        "id": _SETTINGS.served_model_name, "object": "model",
+        "owned_by": "observeai-inference-optimization", "max_model_len": _ENGINE.seq_len,
+    }]}
 
 
-def _max_tokens(requested: Optional[int]) -> int:
-    return requested if requested and requested > 0 else _SETTINGS.default_max_tokens
+@app.get("/metrics")
+async def metrics() -> PlainTextResponse:
+    """vLLM-compatible gauge/counter names so load-test.py / probe samplers work."""
+    m = _ENGINE.metrics
+    slots = max(_ENGINE.max_batch_size, 1)
+    lines = [
+        f"vllm:num_requests_running {m.running}",
+        f"vllm:num_requests_waiting {_ENGINE.waiting}",
+        f"vllm:kv_cache_usage_perc {m.running / slots:.4f}",
+        f"vllm:prompt_tokens_total {m.prompt_tokens_total}",
+        f"vllm:generation_tokens_total {m.generation_tokens_total}",
+        f"vllm:request_success_total {m.requests_total}",
+        f"qwen35:batches_total {m.batches_total}",
+        f"qwen35:decode_slots {slots}",
+    ]
+    return PlainTextResponse("\n".join(lines) + "\n")
 
 
-def _sse_completion_stream(corr: str, model: str, result: Dict[str, Any]) -> Any:
-    """Emit a text_completion result as OpenAI-style SSE chunks.
+def _max_tokens(*candidates: Optional[int]) -> int:
+    for c in candidates:
+        if c and c > 0:
+            return c
+    return _SETTINGS.default_max_tokens
 
-    The engine is non-streaming (full text computed at once), so we send the
-    text as one content chunk then a final chunk with finish_reason=stop and
-    the [DONE] sentinel. This satisfies `vllm bench serve`, which streams by
-    default and tallies output tokens from the streamed deltas.
-    """
+
+async def _admit(prompt: str, requested: int) -> tuple[List[int], int]:
+    ids = await asyncio.to_thread(_ENGINE.tokenize, prompt)
+    try:
+        return ids, _ENGINE.admit(ids, requested)
+    except PromptError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+def _usage(res: Dict[str, Any]) -> Dict[str, int]:
+    return {"prompt_tokens": res["prompt_tokens"], "completion_tokens": res["completion_tokens"],
+            "total_tokens": res["prompt_tokens"] + res["completion_tokens"]}
+
+
+async def _sse(item: _BatchItem, corr: str, model: str, chat: bool) -> AsyncIterator[str]:
+    """Stream one SSE chunk per generated token, then finish + usage-only chunk."""
     created = int(time.time())
-    first = {
-        "id": f"cmpl-{corr}", "object": "text_completion", "created": created,
-        "model": model,
-        "choices": [{"index": 0, "text": result["text"], "finish_reason": None, "logprobs": None}],
-    }
-    yield f"data: {json.dumps(first)}\n\n"
-    final = {
-        "id": f"cmpl-{corr}", "object": "text_completion", "created": created,
-        "model": model,
-        "choices": [{"index": 0, "text": "", "finish_reason": "stop", "logprobs": None}],
-        "usage": {
-            "prompt_tokens": result["prompt_tokens"],
-            "completion_tokens": result["completion_tokens"],
-            "total_tokens": result["prompt_tokens"] + result["completion_tokens"],
-        },
-    }
-    yield f"data: {json.dumps(final)}\n\n"
-    yield "data: [DONE]\n\n"
+    obj = "chat.completion.chunk" if chat else "text_completion"
+    cid = f"{'chatcmpl' if chat else 'cmpl'}-{corr}"
+
+    def chunk(text: Optional[str], finish: Optional[str], first: bool = False) -> str:
+        if chat:
+            delta: Dict[str, Any] = {} if text is None else {"content": text}
+            if first:
+                delta["role"] = "assistant"
+            choice = {"index": 0, "delta": delta, "finish_reason": finish}
+        else:
+            choice = {"index": 0, "text": text or "", "finish_reason": finish, "logprobs": None}
+        return f"data: {json.dumps({'id': cid, 'object': obj, 'created': created, 'model': model, 'choices': [choice]})}\n\n"
+
+    assert item.stream is not None
+    ids: List[int] = []
+    emitted = ""
+    first = True
+    while True:
+        kind, val = await item.stream.get()
+        if kind == "tok":
+            ids.append(val)
+            text = _ENGINE.decode(ids)
+            if text.endswith("\ufffd"):
+                continue  # incomplete multi-byte char; wait for the next token
+            delta, emitted = text[len(emitted):], text
+            yield chunk(delta, None, first)
+            first = False
+        elif kind == "done":
+            yield chunk(None if chat else "", val["finish_reason"], first)
+            usage = {"id": cid, "object": obj, "created": created, "model": model,
+                     "choices": [], "usage": _usage(val)}
+            yield f"data: {json.dumps(usage)}\n\n"
+            yield "data: [DONE]\n\n"
+            return
+        else:  # error after headers were sent
+            yield f"data: {json.dumps({'error': {'message': val, 'type': 'server_error'}})}\n\n"
+            yield "data: [DONE]\n\n"
+            return
 
 
-def _sse_chat_stream(corr: str, model: str, result: Dict[str, Any]) -> Any:
-    """Emit a chat.completion result as OpenAI-style SSE chunks (role, content, stop)."""
-    created = int(time.time())
-    role_chunk = {
-        "id": f"chatcmpl-{corr}", "object": "chat.completion.chunk", "created": created,
-        "model": model,
-        "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}],
-    }
-    yield f"data: {json.dumps(role_chunk)}\n\n"
-    content_chunk = {
-        "id": f"chatcmpl-{corr}", "object": "chat.completion.chunk", "created": created,
-        "model": model,
-        "choices": [{"index": 0, "delta": {"content": result["text"]}, "finish_reason": None}],
-    }
-    yield f"data: {json.dumps(content_chunk)}\n\n"
-    final = {
-        "id": f"chatcmpl-{corr}", "object": "chat.completion.chunk", "created": created,
-        "model": model,
-        "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
-        "usage": {
-            "prompt_tokens": result["prompt_tokens"],
-            "completion_tokens": result["completion_tokens"],
-            "total_tokens": result["prompt_tokens"] + result["completion_tokens"],
-        },
-    }
-    yield f"data: {json.dumps(final)}\n\n"
-    yield "data: [DONE]\n\n"
+async def _run(prompt: str, requested: int, ignore_eos: bool, stream: bool,
+               corr: str, model: str, chat: bool) -> Any:
+    if not _ENGINE.ready:
+        raise HTTPException(status_code=503, detail="Model not loaded")
+    ids, max_new = await _admit(prompt, requested)
+    try:
+        item = await _ENGINE.submit(ids, max_new, corr, ignore_eos, stream)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    if stream:
+        return StreamingResponse(_sse(item, corr, model, chat), media_type="text/event-stream")
+    try:
+        res = await item.future
+    except Exception as exc:  # noqa: BLE001
+        _log(logging.ERROR, "generation failed", correlation_id=corr, error=str(exc))
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    base = {"id": f"{'chatcmpl' if chat else 'cmpl'}-{corr}", "created": int(time.time()),
+            "model": model, "usage": _usage(res)}
+    if chat:
+        return {**base, "object": "chat.completion", "choices": [{
+            "index": 0, "message": {"role": "assistant", "content": res["text"]},
+            "finish_reason": res["finish_reason"]}]}
+    return {**base, "object": "text_completion", "choices": [{
+        "index": 0, "text": res["text"], "finish_reason": res["finish_reason"], "logprobs": None}]}
 
 
 @app.post("/v1/completions")
 async def completions(req: CompletionRequest, request: Request) -> Any:
     corr = getattr(request.state, "correlation_id", uuid.uuid4().hex)
-    try:
-        result = await _ENGINE.generate_async(
-            req.prompt, _max_tokens(req.max_tokens), corr, ignore_eos=req.ignore_eos
-        )
-    except RuntimeError as exc:
-        _log(logging.ERROR, "generation failed", correlation_id=corr, error=str(exc))
-        raise HTTPException(status_code=503, detail=str(exc)) from exc
-
-    model = req.model or _SETTINGS.served_model_name
-    if req.stream:
-        return StreamingResponse(
-            _sse_completion_stream(corr, model, result), media_type="text/event-stream"
-        )
-    return {
-        "id": f"cmpl-{corr}",
-        "object": "text_completion",
-        "created": int(time.time()),
-        "model": model,
-        "choices": [
-            {"index": 0, "text": result["text"], "finish_reason": "stop", "logprobs": None}
-        ],
-        "usage": {
-            "prompt_tokens": result["prompt_tokens"],
-            "completion_tokens": result["completion_tokens"],
-            "total_tokens": result["prompt_tokens"] + result["completion_tokens"],
-        },
-    }
+    return await _run(req.prompt, _max_tokens(req.max_tokens), req.ignore_eos, req.stream,
+                      corr, req.model or _SETTINGS.served_model_name, chat=False)
 
 
 @app.post("/v1/chat/completions")
 async def chat_completions(req: ChatCompletionRequest, request: Request) -> Any:
     corr = getattr(request.state, "correlation_id", uuid.uuid4().hex)
-    messages = [{"role": m.role, "content": m.content} for m in req.messages]
-    prompt = _ENGINE.apply_chat_template(messages)
-    try:
-        result = await _ENGINE.generate_async(
-            prompt, _max_tokens(req.max_tokens), corr, ignore_eos=req.ignore_eos
-        )
-    except RuntimeError as exc:
-        _log(logging.ERROR, "chat generation failed", correlation_id=corr, error=str(exc))
-        raise HTTPException(status_code=503, detail=str(exc)) from exc
-
-    model = req.model or _SETTINGS.served_model_name
-    if req.stream:
-        return StreamingResponse(
-            _sse_chat_stream(corr, model, result), media_type="text/event-stream"
-        )
-    return {
-        "id": f"chatcmpl-{corr}",
-        "object": "chat.completion",
-        "created": int(time.time()),
-        "model": model,
-        "choices": [
-            {
-                "index": 0,
-                "message": {"role": "assistant", "content": result["text"]},
-                "finish_reason": "stop",
-            }
-        ],
-        "usage": {
-            "prompt_tokens": result["prompt_tokens"],
-            "completion_tokens": result["completion_tokens"],
-            "total_tokens": result["prompt_tokens"] + result["completion_tokens"],
-        },
-    }
+    if not _ENGINE.ready:
+        raise HTTPException(status_code=503, detail="Model not loaded")
+    prompt = _ENGINE.apply_chat_template([{"role": m.role, "content": m.content} for m in req.messages])
+    return await _run(prompt, _max_tokens(req.max_completion_tokens, req.max_tokens), req.ignore_eos,
+                      req.stream, corr, req.model or _SETTINGS.served_model_name, chat=True)
 
 
 if __name__ == "__main__":
-    uvicorn.run(app, host=_SETTINGS.host, port=_SETTINGS.port, log_config=None)
+    uvicorn.run(app, host=_SETTINGS.host, port=_SETTINGS.port, log_config=None,
+                backlog=4096, timeout_keep_alive=75)

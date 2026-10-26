@@ -1,5 +1,5 @@
 # ==============================================================================
-# vllm/models/qwen3-5-9b-nxdi/deployment.yaml
+# vllm/models/qwen3-5-9b-nxdi/deployment-managed-ng.yaml  (generated from deployment.yaml; only nodeSelector differs)
 #
 # NxDI serve stage for Qwen3.5-9B (hybrid DeltaNet + GQA).
 #
@@ -14,8 +14,7 @@
 # Then the main container runs `python3 server.py`, which loads the cached
 # compiled artifact (or compiles on first boot if absent) and serves.
 #
-# Managed node-group path — nodeSelector targets the trn2 node group.
-# Used with:  bash deploy.sh --managed-ng
+# nodeSelector targets the managed trn2 node group (deploy.sh --managed-ng).
 #
 # Runtime values injected via envsubst by deploy.sh:
 #   ${BENCHMARK_NAMESPACE} ${NEURON_NXDI_IMAGE} ${MODEL_BUCKET} ${SOURCE_FOLDER}
@@ -203,6 +202,20 @@ spec:
           args:
             - |
               echo "Qwen3.5 NxDI shim  model=/model  compiled=/compiled  cores/TP=${NEURON_CORES}"
+              # The NxDI inference DLC ships torch/neuron but NOT the FastAPI web
+              # shim deps server.py needs. Install them to /tmp (writable; the
+              # rootfs is read-only for non-root) and expose via PYTHONPATH.
+              # Mirrors inference/run-benchmark.sh's pip-to-/tmp pattern.
+              export PYTHONPATH="/tmp/pip-packages:${PYTHONPATH:-}"
+              python3 -c "import fastapi, uvicorn, pydantic_settings, httpx" 2>/dev/null || \
+                pip install --quiet --no-cache-dir --target=/tmp/pip-packages \
+                  fastapi==0.111.0 "uvicorn[standard]==0.30.1" pydantic-settings==2.3.4 httpx==0.27.2 || {
+                    echo "ERROR: failed to install FastAPI shim deps"; exit 1; }
+              # DP>1: router.py launches N TP replicas on distinct core slices.
+              if [ "${QWEN35_DP_REPLICAS:-1}" -gt 1 ]; then
+                echo "Data-parallel: ${QWEN35_DP_REPLICAS:-1} replicas x TP${QWEN35_TP_DEGREE:-4}"
+                exec python3 router.py
+              fi
               exec python3 server.py
           ports:
             - name: http
@@ -215,8 +228,9 @@ spec:
               value: "nxdi"
             - name: AWS_DEFAULT_REGION
               value: "${AWS_REGION}"
+            # NEFF cache under /compiled so model-sync pulls it from S3; skips recompile.
             - name: NEURONX_CACHE
-              value: "/tmp/neuronx_cache"
+              value: "/compiled/neuronx_cache"
             - name: NEURON_RT_NUM_CORES
               value: "${NEURON_CORES}"
             - name: NEURON_LOGICAL_NC_CONFIG
@@ -240,8 +254,37 @@ spec:
               value: "${QWEN35_TORCH_DTYPE}"
             - name: QWEN35_TOP_K_ON_DEVICE
               value: "${QWEN35_TOP_K_ON_DEVICE}"
+            # TEXT-ONLY serve gate. MUST match the compile job: in text-only
+            # mode server.py skips the VL llava_args monkeypatch and uses the
+            # stock generation path against the 7-input traced graph.
+            - name: QWEN35_TEXT_ONLY
+              value: "${QWEN35_TEXT_ONLY}"
+            # Must match the compile job: the fused DeltaNet CTE kernel hung
+            # on-device at seq_len=4096. Serve with the per-chunk kernel path.
+            - name: USE_NKI_CHUNKED
+              value: "1"
             - name: QWEN35_PORT
               value: "8000"
+            # Compile parity (only used if server.py has to compile on first boot).
+            - name: QWEN35_MAX_CONTEXT_LEN
+              value: "${QWEN35_MAX_CONTEXT_LEN}"
+            - name: QWEN35_CONTEXT_BUCKETS
+              value: "${QWEN35_CONTEXT_BUCKETS}"
+            - name: QWEN35_TKG_BUCKETS
+              value: "${QWEN35_TKG_BUCKETS}"
+            - name: QWEN35_CTX_BATCH_SIZE
+              value: "${QWEN35_CTX_BATCH_SIZE}"
+            - name: QWEN35_CONTINUOUS_BATCHING
+              value: "${QWEN35_CONTINUOUS_BATCHING}"
+            - name: QWEN35_DISABLE_ARGMAX_KERNEL
+              value: "${QWEN35_DISABLE_ARGMAX_KERNEL}"
+            # Data parallelism (router.py). 16 x TP4 = all 16 chips.
+            - name: QWEN35_DP_REPLICAS
+              value: "${QWEN35_DP_REPLICAS}"
+            - name: QWEN35_DP_START_PARALLEL
+              value: "${QWEN35_DP_START_PARALLEL}"
+            - name: QWEN35_WORKER_THREADS
+              value: "8"
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: false
@@ -253,19 +296,36 @@ spec:
             seccompProfile:
               type: RuntimeDefault
           resources:
+            # Sized for 16 worker processes (one per chip) + router. Host RAM
+            # peaks while replicas load sharded weights (START_PARALLEL at a time).
             requests:
-              cpu: "16"
-              memory: "64Gi"
+              cpu: "48"
+              memory: "256Gi"
               aws.amazon.com/neuron: "${NEURON_DEVICE_COUNT}"
             limits:
-              cpu: "32"
-              memory: "128Gi"
+              cpu: "160"
+              memory: "1024Gi"
               aws.amazon.com/neuron: "${NEURON_DEVICE_COUNT}"
+          # startupProbe gates liveness/readiness. A fresh pod runs a LOAD-TIME
+          # neuronx-cc compile of the DeltaNet CTE graph (the NEFF binary is not
+          # persisted in S3 — only the traced model.pt is), which can take
+          # 30-40 min. Without a startupProbe, the livenessProbe killed the pod
+          # mid-compile (~17 min) and it crash-looped. The startupProbe tolerates
+          # up to 60 min (120 * 30s) of startup before liveness takes over.
+          startupProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 60
+            periodSeconds: 30
+            # 16 replicas load in waves (1 then 4 at a time): allow 2 h.
+            failureThreshold: 240
+            timeoutSeconds: 5
           readinessProbe:
             httpGet:
               path: /health
               port: 8000
-            initialDelaySeconds: 600
+            initialDelaySeconds: 60
             periodSeconds: 15
             failureThreshold: 480
             timeoutSeconds: 5
@@ -273,7 +333,7 @@ spec:
             httpGet:
               path: /health
               port: 8000
-            initialDelaySeconds: 720
+            initialDelaySeconds: 0
             periodSeconds: 30
             failureThreshold: 10
             timeoutSeconds: 5
@@ -292,13 +352,19 @@ spec:
       volumes:
         - name: model-weights
           emptyDir:
-            sizeLimit: 60Gi
+            # bf16 HF weights (~18Gi); headroom for safety.
+            sizeLimit: 120Gi
         - name: compiled
+          # TP=16 sharded NxDI artifact (16 shards + model.pt) exceeds 60Gi and
+          # the kubelet EVICTED the pod ("EmptyDir volume compiled exceeds 60Gi",
+          # exit 137). trn2.48xlarge has ample ephemeral storage, so raise it.
           emptyDir:
-            sizeLimit: 60Gi
+            sizeLimit: 200Gi
         - name: app
+          # /app accumulates __pycache__ + runtime temp files; 16Mi can evict a
+          # long-running server (exit 137). Raised to 2Gi for headroom.
           emptyDir:
-            sizeLimit: 16Mi
+            sizeLimit: 2Gi
         - name: stage-code
           configMap:
             name: oai-infopt-nxdi-code-qwen3-5-9b-nxdi
@@ -317,4 +383,4 @@ spec:
             sizeLimit: 16Gi
         - name: tmp
           emptyDir:
-            sizeLimit: 100Gi
+            sizeLimit: 200Gi
