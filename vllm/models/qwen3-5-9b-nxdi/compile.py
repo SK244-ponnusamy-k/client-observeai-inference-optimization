@@ -20,7 +20,6 @@ Compile-time knobs (all env, all BAKED into the artifact):
   QWEN35_CTX_BATCH_SIZE       prefill batch: = MAX_BATCH_SIZE (static) or 1
   QWEN35_CONTINUOUS_BATCHING  auto | 1 | 0 (auto -> on when CTX_BATCH < MAX_BATCH)
   QWEN35_TP_DEGREE / QWEN35_LOGICAL_NC_CONFIG / QWEN35_TORCH_DTYPE / QWEN35_TOP_K_ON_DEVICE
-  QWEN35_DISABLE_ARGMAX_KERNEL 1 -> torch argmax instead of the NKI argmax kernel
 
 Defaults (single bucket, CTX_BATCH == MAX_BATCH) reproduce the validated
 TP=4 / seq 2048 / batch 4 build exactly.
@@ -74,7 +73,6 @@ class BuildParams:
     lnc: int = 2
     dtype: str = "bfloat16"
     top_k: int = 1
-    disable_argmax_kernel: bool = False
 
     @property
     def bucketing(self) -> bool:
@@ -124,7 +122,6 @@ def resolve_build_params() -> BuildParams:
         lnc=int(_env("QWEN35_LOGICAL_NC_CONFIG", "2")),
         dtype=_env("QWEN35_TORCH_DTYPE", "bfloat16").lower(),
         top_k=int(_env("QWEN35_TOP_K_ON_DEVICE", "1")),
-        disable_argmax_kernel=_env("QWEN35_DISABLE_ARGMAX_KERNEL", "0").strip() in ("1", "true", "yes"),
     )
 
 
@@ -153,10 +150,6 @@ def build_neuron_config(params: BuildParams):
         flash_decoding_enabled=False,
         on_device_sampling_config=OnDeviceSamplingConfig(top_k=params.top_k),
         save_sharded_checkpoint=True,
-        # Greedy on-device sampling uses the NKI argmax kernel by default. On the
-        # 10k / batch-8 / CB decode graph it returned float bits as the token id
-        # (TROUBLESHOOTING #14). True -> plain torch argmax + TP all-gather.
-        disable_argmax_kernel=params.disable_argmax_kernel,
     )
     if params.bucketing:
         kwargs.update(

@@ -214,8 +214,6 @@ spec:
               value: "${QWEN35_CTX_BATCH_SIZE}"
             - name: QWEN35_CONTINUOUS_BATCHING
               value: "${QWEN35_CONTINUOUS_BATCHING}"
-            - name: QWEN35_DISABLE_ARGMAX_KERNEL
-              value: "${QWEN35_DISABLE_ARGMAX_KERNEL}"
             # TEXT-ONLY trace gate. When "1", modeling_qwen35's input_generator
             # drops the 3 VL tensors + empty placeholders so the traced graph
             # has the stock 7-input signature the SDK generation path fills.

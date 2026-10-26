@@ -279,8 +279,6 @@ spec:
               value: "${QWEN35_CTX_BATCH_SIZE}"
             - name: QWEN35_CONTINUOUS_BATCHING
               value: "${QWEN35_CONTINUOUS_BATCHING}"
-            - name: QWEN35_DISABLE_ARGMAX_KERNEL
-              value: "${QWEN35_DISABLE_ARGMAX_KERNEL}"
             # Data parallelism (router.py). 16 x TP4 = all 16 chips.
             - name: QWEN35_DP_REPLICAS
               value: "${QWEN35_DP_REPLICAS}"
