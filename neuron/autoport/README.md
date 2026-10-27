@@ -10,6 +10,7 @@ to Claude Code and pasting a prompt.
 | `launch-box.sh` | your laptop | trn2.48xlarge from the Neuron vLLM DLAMI into a Capacity Block; private subnet, SSM only |
 | `setup-box.sh` | the box | vllm-neuron source workspace (editable), weights from S3, Claude Code + Neuron skills |
 | `<model>/PROMPT.md` | the box | the AutoPort prompt with the model's architecture facts and acceptance bar |
+| `backup-workspace.sh` | the box (cron) | snapshots the workspace diff + new files to S3; the box's disk dies with the block |
 
 ```bash
 bash neuron/autoport/launch-box.sh --reservation cr-0123... --name autoport-gemma-4-31b --dry-run
@@ -20,6 +21,18 @@ cd ~/autoport/gemma4/vllm-neuron && claude
 # ... done porting:
 bash neuron/autoport/launch-box.sh --terminate i-0123...
 ```
+
+**Back up the port.** The box's root volume is deleted when the Capacity Block
+ends (EC2 reclaims the node up to ~40 min before the end time). Install
+`backup-workspace.sh` as a cron job on the box (hourly, denser near the end):
+
+```
+7 * * * * ubuntu flock -n /tmp/oai-autoport-backup.lock /usr/local/bin/oai-autoport-backup \
+    --workspace /home/ubuntu/autoport/<model> --dest s3://<bucket>/autoport-workspaces/<model>
+```
+
+Restore anywhere: check out the base commit in `latest/MANIFEST.json` and
+`git apply latest/workspace.patch`.
 
 **Capacity:** a Capacity Block with one instance serves either this box or the
 EKS `neuron-inf` NodePool, not both. Terminate the box to hand the slot back.
