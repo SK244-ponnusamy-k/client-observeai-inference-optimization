@@ -69,7 +69,17 @@ SUBNET=$(aws ec2 describe-subnets --region "${AWS_REGION}" \
     --query 'Subnets[0].SubnetId' --output text)
 SG=$(aws ec2 describe-security-groups --region "${AWS_REGION}" \
     --filters "Name=vpc-id,Values=${VPC}" "Name=group-name,Values=default" --query 'SecurityGroups[0].GroupId' --output text)
-AMI=$(aws ssm get-parameter --region "${AWS_REGION}" --name "${AMI_PARAM}" --query 'Parameter.Value' --output text)
+# AWS-owned public SSM parameters (the DLAMI image-id paths) are not resolvable
+# by the bare "/aws/service/..." name on every AWS CLI build - some require the
+# full public ARN "arn:aws:ssm:<region>::parameter/aws/service/...". Try the bare
+# name first, then fall back to the ARN form so this works across CLI versions.
+AMI=$(aws ssm get-parameter --region "${AWS_REGION}" --name "${AMI_PARAM}" --query 'Parameter.Value' --output text 2>/dev/null || true)
+if [[ -z "${AMI}" || "${AMI}" == "None" ]]; then
+    AMI=$(aws ssm get-parameter --region "${AWS_REGION}" \
+        --name "arn:aws:ssm:${AWS_REGION}::parameter${AMI_PARAM}" \
+        --query 'Parameter.Value' --output text 2>/dev/null || true)
+fi
+[[ -n "${AMI}" && "${AMI}" != "None" ]] || { log_error "Could not resolve DLAMI AMI from SSM parameter ${AMI_PARAM} (tried bare name and public ARN). Pass an explicit AMI path with --ami-param, or check the parameter exists in ${AWS_REGION}."; exit 1; }
 AMI_NAME=$(aws ec2 describe-images --region "${AWS_REGION}" --image-ids "${AMI}" --query 'Images[0].Name' --output text)
 [[ "${SUBNET}" != "None" ]] || { log_error "No private subnet in ${AZ} in ${VPC}."; exit 1; }
 
@@ -83,7 +93,12 @@ echo "  Disk      : ${DISK_GB} GB gp3     Profile: ${PROFILE}"
 echo "=============================================================="
 
 set +e
-OUT=$(aws ec2 run-instances --region "${AWS_REGION}" ${DRY_RUN} \
+# MSYS_NO_PATHCONV=1: on Git Bash / MSYS2 (Windows) the shell rewrites any arg
+# that looks like a Unix path (e.g. DeviceName=/dev/sda1) into a Windows path
+# (C:/Program Files/Git/dev/sda1), which AWS rejects as InvalidBlockDeviceMapping.
+# Disabling path conversion for this one call keeps /dev/sda1 intact. The var is
+# ignored on native Linux, so this is a no-op there.
+OUT=$(MSYS_NO_PATHCONV=1 aws ec2 run-instances --region "${AWS_REGION}" ${DRY_RUN} \
     --image-id "${AMI}" --instance-type "${ITYPE}" --count 1 \
     --instance-market-options MarketType=capacity-block \
     --capacity-reservation-specification "CapacityReservationTarget={CapacityReservationId=${RESERVATION}}" \

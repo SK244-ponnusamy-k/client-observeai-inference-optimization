@@ -51,7 +51,7 @@ done
 PY="${VENV}/bin/python"
 PIP=("${VENV}/bin/pip")
 [[ -w "${VENV}/lib" ]] || PIP=(sudo "${VENV}/bin/pip")
-INSTALLED=$("${PY}" -c "from importlib.metadata import version; print(version('vllm-neuron'))" 2>/dev/null || echo unknown)
+INSTALLED=$("${PY}" -c "from importlib.metadata import version; print(version('vllm-neuron'))" 2>/dev/null | tail -n1 || echo unknown)
 echo "venv ${VENV}  (vllm-neuron ${INSTALLED}, vllm $("${PY}" -c 'import vllm; print(vllm.__version__)' 2>/dev/null || echo '?'))"
 grep -q "${VENV}/bin/activate" "${HOME}/.bashrc" || echo "source ${VENV}/bin/activate" >> "${HOME}/.bashrc"
 
@@ -64,7 +64,10 @@ if [[ ! -d "${WORK}/vllm-neuron/.git" ]]; then
 fi
 # Editable + --no-deps: the DLAMI's pinned torch/vllm stay exactly as shipped.
 "${PIP[@]}" install --quiet --no-deps -e "${WORK}/vllm-neuron"
-LOADED=$("${PY}" -c "import vllm_neuron, os; print(os.path.dirname(vllm_neuron.__file__))")
+# Capture ONLY the last stdout line - importing vllm_neuron emits log noise
+# (PJRT_DEVICE warning, plugin-activation INFO, port_hold_patch) to stdout, which
+# otherwise pollutes the captured path and breaks this assertion.
+LOADED=$("${PY}" -c "import vllm_neuron, os; print(os.path.dirname(vllm_neuron.__file__))" 2>/dev/null | tail -n1)
 [[ "${LOADED}" == "${WORK}/vllm-neuron/"* ]] || { echo "ERROR: vllm_neuron still loads from ${LOADED}"; exit 1; }
 git -C "${WORK}/vllm-neuron" rev-parse HEAD > "${WORK}/BASE_COMMIT"
 echo "vllm_neuron now loads from ${LOADED} (base $(cut -c1-12 "${WORK}/BASE_COMMIT"))"
