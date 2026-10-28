@@ -102,9 +102,9 @@ spec:
             - "--port=8000"
             - "--served-model-name=${SERVED_NAME}"
             - "--tensor-parallel-size=${TP_SIZE}"
-            - "--gpu-memory-utilization=0.9"
+            - "--gpu-memory-utilization=0.85"
             - "--max-model-len=16384"
-            - "--max-num-seqs=256"
+            - "--max-num-seqs=128"
             - "--max-num-batched-tokens=8192"
             - "--enable-chunked-prefill"
             - "--enable-prefix-caching"
@@ -141,11 +141,11 @@ spec:
           resources:
             requests:
               cpu: "4"
-              memory: "24Gi"
+              memory: "64Gi"
               nvidia.com/gpu: "${GPU_COUNT}"
             limits:
               cpu: "8"
-              memory: "30Gi"
+              memory: "96Gi"
               nvidia.com/gpu: "${GPU_COUNT}"
 
           readinessProbe:

@@ -14,8 +14,8 @@ serving:
   tokenizer: zai-org/GLM-4.1V-9B-Thinking
   quantization: none
   max_model_len: 16384
-  gpu_memory_utilization: 0.9
-  max_num_seqs: 256
+  gpu_memory_utilization: 0.85
+  max_num_seqs: 128
   max_num_batched_tokens: 8192
   extra_args:
   - --enable-chunked-prefill
@@ -25,8 +25,8 @@ serving:
 resources:
   cpu_request: '4'
   cpu_limit: '8'
-  memory_request: 24Gi
-  memory_limit: 30Gi
+  memory_request: 64Gi
+  memory_limit: 96Gi
   vram_gb_required: 28
 instances:
   candidates:
