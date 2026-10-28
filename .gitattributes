@@ -1,0 +1,6 @@
+# Keep shell scripts and env files LF so they run correctly on Linux/Git Bash
+# even when checked out on Windows. Prevents CRLF-induced failures like
+# trailing \r in variables (e.g. SSM ParameterNotFound in launch-box.sh).
+*.sh    text eol=lf
+*.env   text eol=lf
+*.bash  text eol=lf
