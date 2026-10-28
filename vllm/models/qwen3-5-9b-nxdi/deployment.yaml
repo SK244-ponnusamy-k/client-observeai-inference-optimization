@@ -1,0 +1,387 @@
+# ==============================================================================
+# vllm/models/qwen3-5-9b-nxdi/deployment.yaml
+#
+# NxDI serve stage for Qwen3.5-9B (hybrid DeltaNet + GQA).
+#
+# vLLM-Neuron cannot load this architecture, so instead of `vllm serve` this
+# runs the vendored reference modeling code behind an OpenAI-compatible FastAPI
+# shim (server.py) on :8000. Downstream benchmark/observability/teardown are
+# identical to the vLLM path because the HTTP contract is identical.
+#
+# Init flow:
+#   1. code-assemble : build /app package layout from code ConfigMaps
+#   2. model-sync    : sync bf16 weights + compiled NxDI artifact from S3
+# Then the main container runs `python3 server.py`, which loads the cached
+# compiled artifact (or compiles on first boot if absent) and serves.
+#
+# nodeSelector uses instance-family (Karpenter). For the managed node-group
+# fallback see deployment-managed-ng.yaml.
+#
+# Runtime values injected via envsubst by deploy.sh:
+#   ${BENCHMARK_NAMESPACE} ${NEURON_NXDI_IMAGE} ${MODEL_BUCKET} ${SOURCE_FOLDER}
+#   ${COMPILED_FOLDER} ${SERVED_NAME} ${NEURON_CORES} ${NEURON_DEVICE_COUNT}
+#   ${AWS_REGION} ${S3_BUCKET_REGION} ${INSTANCE_FAMILY}
+#   ${QWEN35_SEQ_LEN} ${QWEN35_MAX_BATCH_SIZE} ${QWEN35_TP_DEGREE}
+#   ${QWEN35_LOGICAL_NC_CONFIG} ${QWEN35_TORCH_DTYPE} ${QWEN35_TOP_K_ON_DEVICE}
+# ==============================================================================
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: oai-infopt-vllm-qwen3-5-9b-nxdi
+  namespace: ${BENCHMARK_NAMESPACE}
+  labels:
+    app.kubernetes.io/name: oai-infopt-vllm-qwen3-5-9b-nxdi
+    app.kubernetes.io/component: inference-server
+    app.kubernetes.io/managed-by: oai-cli
+    app.kubernetes.io/version: "qwen3-5-9b-nxdi"
+    project: observeai-inference-optimization
+    engagement: shellkode-sow
+    environment: sandbox
+    model: qwen3-5-9b-nxdi
+    source: neuron
+  annotations:
+    checkov.io/skip1: "CKV_K8S_43=Image digest pinned in NEURON_NXDI_IMAGE via config/config.env"
+    checkov.io/skip2: "CKV_K8S_14=Image tag pinned in NEURON_NXDI_IMAGE; static analysis cannot resolve envsubst"
+    checkov.io/skip3: "CKV_K8S_15=imagePullPolicy IfNotPresent acceptable with pinned image"
+    checkov.io/skip4: "CKV_K8S_40=runAsUser 1000 pending NxDI DLC UID compatibility test"
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: oai-infopt-vllm-qwen3-5-9b-nxdi
+  template:
+    metadata:
+      labels:
+        app: oai-infopt-vllm-qwen3-5-9b-nxdi
+        app.kubernetes.io/name: oai-infopt-vllm-qwen3-5-9b-nxdi
+        app.kubernetes.io/component: inference-server
+        project: observeai-inference-optimization
+        engagement: shellkode-sow
+        environment: sandbox
+        model: qwen3-5-9b-nxdi
+        source: neuron
+    spec:
+      serviceAccountName: oai-infopt-serving-sa
+      automountServiceAccountToken: false
+      hostPID: false
+      hostIPC: false
+      hostNetwork: false
+
+      nodeSelector:
+        eks.amazonaws.com/instance-family: ${INSTANCE_FAMILY}
+
+      tolerations:
+        - key: aws.amazon.com/neuron
+          operator: Exists
+          effect: NoSchedule
+        - key: CriticalAddonsOnly
+          operator: Exists
+
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    app.kubernetes.io/component: benchmark-runner
+                topologyKey: kubernetes.io/hostname
+
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+
+      terminationGracePeriodSeconds: 180
+
+      initContainers:
+        # Assemble /app package layout from the flat code ConfigMaps.
+        - name: code-assemble
+          image: amazon/aws-cli:2.15.0
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              set -euo pipefail
+              mkdir -p /app/src/nki_kernels
+              cp /staging/code/* /app/
+              cp /staging/src/* /app/src/
+              cp /staging/nki/* /app/src/nki_kernels/
+              echo "Assembled /app:"; find /app -name '*.py' | sort
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: false
+            runAsNonRoot: true
+            runAsUser: 1000
+            runAsGroup: 1000
+            capabilities:
+              drop: ["ALL"]
+            seccompProfile:
+              type: RuntimeDefault
+          resources:
+            requests:
+              cpu: "1"
+              memory: "256Mi"
+            limits:
+              cpu: "2"
+              memory: "512Mi"
+          volumeMounts:
+            - name: app
+              mountPath: /app
+            - name: stage-code
+              mountPath: /staging/code
+            - name: stage-src
+              mountPath: /staging/src
+            - name: stage-nki
+              mountPath: /staging/nki
+        # Sync weights + the compiled NxDI artifact from S3.
+        - name: model-sync
+          image: amazon/aws-cli:2.15.0
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              set -euo pipefail
+              echo "Syncing weights s3://${MODEL_BUCKET}/${SOURCE_FOLDER}/ -> /model/"
+              aws s3 sync "s3://${MODEL_BUCKET}/${SOURCE_FOLDER}/" /model/ \
+                --region "${S3_BUCKET_REGION}" --no-progress
+              test -f /model/config.json && echo "config.json OK" || { echo "ERROR: config.json missing"; exit 1; }
+              echo "Syncing compiled artifact s3://${MODEL_BUCKET}/${COMPILED_FOLDER}/ -> /compiled/ (if present)"
+              if aws s3 ls "s3://${MODEL_BUCKET}/${COMPILED_FOLDER}/" --region "${S3_BUCKET_REGION}" 2>/dev/null | grep -q .; then
+                aws s3 sync "s3://${MODEL_BUCKET}/${COMPILED_FOLDER}/" /compiled/ \
+                  --region "${S3_BUCKET_REGION}" --no-progress
+                echo "Compiled artifact synced."
+              else
+                echo "No compiled artifact in S3 — server.py will compile on first boot (slow)."
+              fi
+          env:
+            - name: AWS_DEFAULT_REGION
+              value: "${AWS_REGION}"
+            - name: S3_BUCKET_REGION
+              value: "${S3_BUCKET_REGION}"
+            - name: MODEL_BUCKET
+              value: "${MODEL_BUCKET}"
+            - name: SOURCE_FOLDER
+              value: "${SOURCE_FOLDER}"
+            - name: COMPILED_FOLDER
+              value: "${COMPILED_FOLDER}"
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: false
+            runAsNonRoot: true
+            runAsUser: 1000
+            runAsGroup: 1000
+            capabilities:
+              drop: ["ALL"]
+            seccompProfile:
+              type: RuntimeDefault
+          resources:
+            requests:
+              cpu: "4"
+              memory: "8Gi"
+            limits:
+              cpu: "8"
+              memory: "16Gi"
+          volumeMounts:
+            - name: model-weights
+              mountPath: /model
+            - name: compiled
+              mountPath: /compiled
+
+      containers:
+        - name: nxdi-server
+          image: ${NEURON_NXDI_IMAGE}
+          imagePullPolicy: IfNotPresent
+          workingDir: /app
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              echo "Qwen3.5 NxDI shim  model=/model  compiled=/compiled  cores/TP=${NEURON_CORES}"
+              # The NxDI inference DLC ships torch/neuron but NOT the FastAPI web
+              # shim deps server.py needs. Install them to /tmp (writable; the
+              # rootfs is read-only for non-root) and expose via PYTHONPATH.
+              # Mirrors inference/run-benchmark.sh's pip-to-/tmp pattern.
+              export PYTHONPATH="/tmp/pip-packages:${PYTHONPATH:-}"
+              python3 -c "import fastapi, uvicorn, pydantic_settings, httpx" 2>/dev/null || \
+                pip install --quiet --no-cache-dir --target=/tmp/pip-packages \
+                  fastapi==0.111.0 "uvicorn[standard]==0.30.1" pydantic-settings==2.3.4 httpx==0.27.2 || {
+                    echo "ERROR: failed to install FastAPI shim deps"; exit 1; }
+              # DP>1: router.py launches N TP replicas on distinct core slices.
+              if [ "${QWEN35_DP_REPLICAS:-1}" -gt 1 ]; then
+                echo "Data-parallel: ${QWEN35_DP_REPLICAS:-1} replicas x TP${QWEN35_TP_DEGREE:-4}"
+                exec python3 router.py
+              fi
+              exec python3 server.py
+          ports:
+            - name: http
+              containerPort: 8000
+              protocol: TCP
+          env:
+            - name: HOME
+              value: "/tmp"
+            - name: USER
+              value: "nxdi"
+            - name: AWS_DEFAULT_REGION
+              value: "${AWS_REGION}"
+            # NEFF cache lives UNDER /compiled so model-sync pulls it from S3
+            # (COMPILED_FOLDER/neuronx_cache/). With a populated cache, model.load()
+            # finds the NEFF and skips the ~40 min on-device recompile per pod.
+            - name: NEURONX_CACHE
+              value: "/compiled/neuronx_cache"
+            - name: NEURON_RT_NUM_CORES
+              value: "${NEURON_CORES}"
+            - name: NEURON_LOGICAL_NC_CONFIG
+              value: "${QWEN35_LOGICAL_NC_CONFIG}"
+            # Shim/server configuration (QWEN35_ prefix -> Pydantic Settings)
+            - name: QWEN35_MODEL_PATH
+              value: "/model"
+            - name: QWEN35_COMPILED_PATH
+              value: "/compiled"
+            - name: QWEN35_SERVED_MODEL_NAME
+              value: "${SERVED_NAME}"
+            - name: QWEN35_TP_DEGREE
+              value: "${QWEN35_TP_DEGREE}"
+            - name: QWEN35_SEQ_LEN
+              value: "${QWEN35_SEQ_LEN}"
+            - name: QWEN35_MAX_BATCH_SIZE
+              value: "${QWEN35_MAX_BATCH_SIZE}"
+            - name: QWEN35_LOGICAL_NC_CONFIG
+              value: "${QWEN35_LOGICAL_NC_CONFIG}"
+            - name: QWEN35_TORCH_DTYPE
+              value: "${QWEN35_TORCH_DTYPE}"
+            - name: QWEN35_TOP_K_ON_DEVICE
+              value: "${QWEN35_TOP_K_ON_DEVICE}"
+            # TEXT-ONLY serve gate. MUST match the compile job: in text-only
+            # mode server.py skips the VL llava_args monkeypatch and uses the
+            # stock generation path against the 7-input traced graph.
+            - name: QWEN35_TEXT_ONLY
+              value: "${QWEN35_TEXT_ONLY}"
+            # Must match the compile job: the fused DeltaNet CTE kernel hung
+            # on-device at seq_len=4096. Serve with the per-chunk kernel path.
+            - name: USE_NKI_CHUNKED
+              value: "1"
+            - name: QWEN35_PORT
+              value: "8000"
+            # Compile parity (only used if server.py has to compile on first boot).
+            - name: QWEN35_MAX_CONTEXT_LEN
+              value: "${QWEN35_MAX_CONTEXT_LEN}"
+            - name: QWEN35_CONTEXT_BUCKETS
+              value: "${QWEN35_CONTEXT_BUCKETS}"
+            - name: QWEN35_TKG_BUCKETS
+              value: "${QWEN35_TKG_BUCKETS}"
+            - name: QWEN35_CTX_BATCH_SIZE
+              value: "${QWEN35_CTX_BATCH_SIZE}"
+            - name: QWEN35_CONTINUOUS_BATCHING
+              value: "${QWEN35_CONTINUOUS_BATCHING}"
+            # Data parallelism (router.py). 16 x TP4 = all 16 chips.
+            - name: QWEN35_DP_REPLICAS
+              value: "${QWEN35_DP_REPLICAS}"
+            - name: QWEN35_DP_START_PARALLEL
+              value: "${QWEN35_DP_START_PARALLEL}"
+            - name: QWEN35_WORKER_THREADS
+              value: "8"
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: false
+            runAsNonRoot: true
+            runAsUser: 1000
+            runAsGroup: 1000
+            capabilities:
+              drop: ["ALL"]
+            seccompProfile:
+              type: RuntimeDefault
+          resources:
+            # Sized for 16 worker processes (one per chip) + router. Host RAM
+            # peaks while replicas load sharded weights (START_PARALLEL at a time).
+            requests:
+              cpu: "48"
+              memory: "256Gi"
+              aws.amazon.com/neuron: "${NEURON_DEVICE_COUNT}"
+            limits:
+              cpu: "160"
+              memory: "1024Gi"
+              aws.amazon.com/neuron: "${NEURON_DEVICE_COUNT}"
+          # startupProbe gates liveness/readiness. A fresh pod runs a LOAD-TIME
+          # neuronx-cc compile of the DeltaNet CTE graph (the NEFF binary is not
+          # persisted in S3 — only the traced model.pt is), which can take
+          # 30-40 min. Without a startupProbe, the livenessProbe killed the pod
+          # mid-compile (~17 min) and it crash-looped. The startupProbe tolerates
+          # up to 60 min (120 * 30s) of startup before liveness takes over.
+          startupProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 60
+            periodSeconds: 30
+            # 16 replicas load in waves (1 then 4 at a time): allow 2 h.
+            failureThreshold: 240
+            timeoutSeconds: 5
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 60
+            periodSeconds: 15
+            failureThreshold: 480
+            timeoutSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 0
+            periodSeconds: 30
+            failureThreshold: 10
+            timeoutSeconds: 5
+          volumeMounts:
+            - name: model-weights
+              mountPath: /model
+            - name: compiled
+              mountPath: /compiled
+            - name: app
+              mountPath: /app
+            - name: dshm
+              mountPath: /dev/shm
+            - name: tmp
+              mountPath: /tmp
+
+      volumes:
+        - name: model-weights
+          emptyDir:
+            # bf16 HF weights (~18Gi); headroom for safety.
+            sizeLimit: 120Gi
+        - name: compiled
+          # TP=16 sharded NxDI artifact (16 shards + model.pt) exceeds 60Gi and
+          # the kubelet EVICTED the pod ("EmptyDir volume compiled exceeds 60Gi",
+          # exit 137). trn2.48xlarge has ample ephemeral storage, so raise it.
+          emptyDir:
+            sizeLimit: 200Gi
+        - name: app
+          # /app accumulates __pycache__ + runtime temp files; 16Mi can evict a
+          # long-running server (exit 137). Raised to 2Gi for headroom.
+          emptyDir:
+            sizeLimit: 2Gi
+        - name: stage-code
+          configMap:
+            name: oai-infopt-nxdi-code-qwen3-5-9b-nxdi
+            defaultMode: 0444
+        - name: stage-src
+          configMap:
+            name: oai-infopt-nxdi-src-qwen3-5-9b-nxdi
+            defaultMode: 0444
+        - name: stage-nki
+          configMap:
+            name: oai-infopt-nxdi-nki-qwen3-5-9b-nxdi
+            defaultMode: 0444
+        - name: dshm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 16Gi
+        - name: tmp
+          emptyDir:
+            sizeLimit: 200Gi

@@ -513,11 +513,18 @@ def _run_vllm_bench(
     """
     with tempfile.TemporaryDirectory() as tmp:
         result_file = Path(tmp) / "bench.json"
+        # Backend/endpoint are overridable via env so a model whose chat template
+        # injects control tokens (e.g. Qwen3.5's <think> block, which makes the
+        # chat endpoint decode to empty content and report 0 output tokens) can
+        # benchmark against the raw /v1/completions endpoint instead. Defaults
+        # preserve the standard openai-chat path for every other model.
+        bench_backend = os.getenv("OAI_BENCH_BACKEND", "openai-chat")
+        bench_endpoint = os.getenv("OAI_BENCH_ENDPOINT", "/v1/chat/completions")
         cmd = [
             "vllm", "bench", "serve",
-            "--backend", "openai-chat",
+            "--backend", bench_backend,
             "--base-url", base_url,
-            "--endpoint", "/v1/chat/completions",
+            "--endpoint", bench_endpoint,
             "--model", served_model,
             "--tokenizer", tokenizer,
             "--dataset-name", dataset_name,

@@ -179,10 +179,10 @@ spec:
               # versions mis-join with --endpoint and produce a bare '/v1/...' URL.
               # tee the bench summary into RESULT_FILE as well as stdout.
               vllm bench serve \
-                --backend openai-chat \
+                --backend "${BENCH_BACKEND:-openai-chat}" \
                 --host "${SERVICE}" \
                 --port 8000 \
-                --endpoint /v1/chat/completions \
+                --endpoint "${BENCH_ENDPOINT:-/v1/chat/completions}" \
                 --model "${SERVED_NAME}" \
                 --tokenizer "${TOKENIZER}" \
                 --dataset-name random \
@@ -256,6 +256,12 @@ spec:
               value: "${IGNORE_EOS}"
             - name: SEED
               value: "${SEED}"
+            # Neuron/NxDI: set BENCH_BACKEND=openai + BENCH_ENDPOINT=/v1/completions
+            # (chat template emits empty content). Default = openai-chat.
+            - name: BENCH_BACKEND
+              value: "${BENCH_BACKEND:-openai-chat}"
+            - name: BENCH_ENDPOINT
+              value: "${BENCH_ENDPOINT:-/v1/chat/completions}"
             - name: HF_HOME
               value: /tmp/hf
             - name: AWS_DEFAULT_REGION

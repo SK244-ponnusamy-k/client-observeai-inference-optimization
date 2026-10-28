@@ -1,0 +1,48 @@
+# ==============================================================================
+# configs/manifests/qwen3-5-4b-nxdi-trn2-bf16.yaml
+#
+# Benchmark run manifest for Qwen/Qwen3.5-4B (bf16) on trn2.3xlarge via NxDI.
+# Served by the OpenAI-compatible shim on :8000, so the load-test harness reads
+# this file unchanged. Edit catalog/models/qwen3-5-4b-nxdi.yaml or tweak here.
+# ==============================================================================
+run_id: qwen3-5-4b-nxdi-2026-10-21-001
+description: "Qwen/Qwen3.5-4B bf16 (DeltaNet+GQA), trn2.48xlarge, NxDI shim"
+
+model:
+  hf_id: Qwen/Qwen3.5-4B
+  served_name: Qwen3.5-4B
+  tokenizer: Qwen/Qwen3.5-4B
+  s3_prefix: Qwen3.5-4B/
+  source: neuron
+
+serving:
+  engine: nxdi
+  image: public.ecr.aws/neuron/pytorch-inference-neuronx:2.9.0-neuronx-py312-sdk2.31.1-ubuntu24.04
+  nodepool: neuron-inf
+  instance_type: trn2.48xlarge
+
+optimization_variants:
+  - label: bf16-trn2-48xl-nxdi
+    quantization: bf16
+    tensor_parallel_size: 16     # TP=16 — trn2.48xlarge (RECOMPILE required: QWEN35_TP_DEGREE baked)
+    max_num_seqs: 16
+    max_num_batched_tokens: 8192
+    max_model_len: 8192
+    kv_cache_dtype: auto
+
+benchmark:
+  workload_profiles:
+    - configs/workload_profiles/realtime_v1.yaml
+    - configs/workload_profiles/batch_v1.yaml
+
+cost:
+  instance_hourly_usd: 12.0      # trn2.48xlarge Capacity Block rate — VERIFY before run
+
+tags:
+  Project: observeai-inference-optimization
+  Engagement: shellkode-sow
+  Environment: sandbox
+  ManagedBy: oai-cli
+  Owner: TBD
+  CostCenter: TBD
+  RunId: qwen3-5-4b-nxdi-2026-10-21-001

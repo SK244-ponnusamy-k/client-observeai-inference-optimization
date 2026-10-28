@@ -15,6 +15,7 @@ successful deploy, so a user can onboard, deploy, and benchmark in one step.
 
 from __future__ import annotations
 
+import os
 import re
 
 from . import catalog, paths, shell, ui
@@ -199,7 +200,20 @@ def run(
     if tag and svc:
         args += ["--tag", tag, "--svc", svc]
 
-    rc = shell.run_bash(script, args)
+    # Neuron/NxDI custom-shim models (e.g. Qwen3.5 NxDI) serve a thinking model
+    # whose chat template injects a <think> control block; greedy on-device
+    # sampling then emits end/special tokens that decode to EMPTY content, so the
+    # openai-chat benchmark path records 0 output tokens. Benchmark these against
+    # the raw /v1/completions endpoint (no chat template) so output tokens are
+    # real. GPU/vLLM-serve models keep the standard openai-chat path. Overridable
+    # by a pre-set OAI_BENCH_* env if the user wants a different endpoint.
+    bench_env: dict[str, str] = {}
+    if spec.is_neuron:
+        bench_env["OAI_BENCH_BACKEND"] = os.environ.get("OAI_BENCH_BACKEND", "openai")
+        bench_env["OAI_BENCH_ENDPOINT"] = os.environ.get("OAI_BENCH_ENDPOINT", "/v1/completions")
+        ui.kv("Benchmark endpoint", f"{bench_env['OAI_BENCH_ENDPOINT']} (neuron/nxdi: raw completions)")
+
+    rc = shell.run_bash(script, args, env=bench_env or None)
     if rc != 0:
         # run-benchmark.sh exits 1 on SLO violation too - results may still be valid.
         ui.warn(f"Benchmark finished non-zero (exit {rc}).")

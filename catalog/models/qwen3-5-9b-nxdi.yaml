@@ -1,0 +1,74 @@
+# ==============================================================================
+# catalog/models/qwen3-5-9b-nxdi.yaml
+#
+# Qwen/Qwen3.5-9B on AWS Trainium2 via NeuronX Distributed Inference (NxDI).
+#
+# Architecture: DENSE hybrid DeltaNet + GQA text decoder (qwen3_5_text).
+#   - 32 layers: 24 Gated DeltaNet (linear attention) + 8 standard GQA
+#   - Hidden size 4096, dense SwiGLU MLP (no MoE), NOT a vision-language model
+#   - Not tied embeddings (differs from 4B)
+#
+# vLLM-Neuron does NOT support this architecture out of the box, so this is a
+# CUSTOM serving path (serving.engine: nxdi): the reference contrib modeling
+# code (vllm/models/qwen3-5-9b-nxdi/src/) runs behind an OpenAI-compatible
+# FastAPI shim on :8000. Deploy via vllm/models/qwen3-5-9b-nxdi/deploy.sh.
+#
+# Reference contrib validated on trn2.48xlarge, TP=4, BF16, seq_len=160, batch=1.
+# This entry targets trn2.3xlarge for bring-up; if 9B does not fit a single
+# trn2.3xlarge chip at the chosen seq_len, fall back to trn2.48xlarge.
+# ==============================================================================
+
+id: qwen3-5-9b-nxdi
+display_name: Qwen3.5-9B (Trainium / NxDI, DeltaNet+GQA)
+hardware: neuron
+
+source:
+  hf_id: Qwen/Qwen3.5-9B
+  gated: false
+  size_gb: 18
+  s3_folder: Qwen3.5-9B
+
+serving:
+  engine: nxdi                   # custom NxDI shim (NOT vllm serve)
+  served_name: Qwen3.5-9B
+  tokenizer: Qwen/Qwen3.5-9B
+  quantization: bf16
+  max_model_len: 10240           # prompt (<= 8192) + generation; baked at compile
+  max_num_seqs: 128              # 16 DP replicas x 8 decode slots (continuous batching)
+  tensor_parallel_size: 4        # TP=4 per replica (validated). Source of truth: model.env
+
+resources:
+  cpu_request: "48"
+  cpu_limit: "96"
+  memory_request: "256Gi"
+  memory_limit: "512Gi"
+
+instances:
+  neuron_cores: 4                # = tensor-parallel degree; must match compile time (TP=4)
+  logical_neuron_config: 2       # LNC=2 on trn2
+  candidates:
+    - trn2.48xlarge              # primary — reference-validated for TP=4
+  node_group: trn2-neuron
+
+neuron:
+  engine: nxdi
+  source_folder: Qwen3.5-9B
+  compiled_folder: qwen3-5-9b-nxdi-textonly-10k-cb8-traced
+  sequence_length: 10240         # prefill buckets 1024/2048/4096/8192, chunked DeltaNet kernel
+  batch_size: 8                  # decode batch per replica; prefill runs 1 request at a time
+  auto_cast_type: bf16
+  instance_family: trn2
+  logical_neuron_config: 2
+  # IMPORTANT: TP degree (QWEN35_TP_DEGREE=4) is baked at compile time.
+  # A full recompile on trn2.48xlarge is required before serving.
+
+benchmark:
+  auto: false
+  profiles:
+    - configs/workload_profiles/realtime_v1.yaml
+    - configs/workload_profiles/batch_v1.yaml
+  instance_hourly_usd: 12.0      # trn2.48xlarge Capacity Block rate
+
+tags:
+  Owner: TBD
+  CostCenter: TBD

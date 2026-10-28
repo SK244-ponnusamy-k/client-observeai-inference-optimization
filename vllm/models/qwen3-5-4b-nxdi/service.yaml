@@ -1,0 +1,23 @@
+# vllm/models/qwen3-5-4b-nxdi/service.yaml — ClusterIP for the Qwen3.5-4B NxDI shim.
+apiVersion: v1
+kind: Service
+metadata:
+  name: oai-infopt-vllm-qwen3-5-4b-nxdi
+  namespace: oai-infopt
+  labels:
+    app.kubernetes.io/name: oai-infopt-vllm-qwen3-5-4b-nxdi
+    app.kubernetes.io/component: inference-server
+    project: observeai-inference-optimization
+    engagement: shellkode-sow
+    environment: sandbox
+    model: qwen3-5-4b-nxdi
+    source: neuron
+spec:
+  type: ClusterIP
+  selector:
+    app: oai-infopt-vllm-qwen3-5-4b-nxdi
+  ports:
+    - name: http
+      port: 8000
+      targetPort: 8000
+      protocol: TCP

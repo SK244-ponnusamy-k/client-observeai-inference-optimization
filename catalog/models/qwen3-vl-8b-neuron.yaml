@@ -25,27 +25,27 @@ serving:
   tokenizer: Qwen/Qwen3-VL-8B-Instruct
   quantization: bf16
   max_model_len: 8192
-  max_num_seqs: 4
+  max_num_seqs: 16               # expanded for trn2.48xlarge (was 4 on trn2.3xlarge)
   max_num_batched_tokens: 8192
-  tensor_parallel_size: 4       # Reduced from 16 for trn2.3xlarge
+  tensor_parallel_size: 16       # TP=16 (AWS recommended for trn2.48xlarge — restored)
 
 resources:
-  cpu_request: "4"
-  cpu_limit: "8"
-  memory_request: "32Gi"
-  memory_limit: "64Gi"
+  cpu_request: "48"
+  cpu_limit: "96"
+  memory_request: "256Gi"
+  memory_limit: "512Gi"
 
 instances:
-  neuron_cores: 4               # trn2.3xlarge has 4 NeuronCores
+  neuron_cores: 16               # trn2.48xlarge has 16 NeuronCores
   candidates:
-    - trn2.3xlarge
+    - trn2.48xlarge              # primary — AWS recommended configuration for this model
   node_group: trn2-neuron
 
 neuron:
   source_folder: Qwen3-VL-8B-Instruct
   neff_folder: qwen3-vl-8b-neuron
   sequence_length: 8192
-  batch_size: 4
+  batch_size: 16                 # expanded for trn2.48xlarge (was 4)
   auto_cast_type: bf16
   instance_family: trn2
   vision_encoder_parallelism: true
@@ -55,4 +55,4 @@ benchmark:
   profiles:
     - configs/workload_profiles/realtime_v1.yaml
     - configs/workload_profiles/batch_v1.yaml
-  instance_hourly_usd: 2.235    # trn2.3xlarge on-demand
+  instance_hourly_usd: 12.0      # trn2.48xlarge Capacity Block rate
