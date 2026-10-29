@@ -1,0 +1,60 @@
+name: security-scan
+
+# Full Checkov / Bandit / Semgrep suite (SECURITY.md item 6).
+# Replaces the environment-limited local scan and catches regressions on every
+# push and pull request. Each scanner runs independently so one failure still
+# lets the others report.
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: ["**"]
+  schedule:
+    # Weekly re-scan (Mondays 06:00 UTC) to catch newly disclosed rule updates.
+    - cron: "0 6 * * 1"
+
+permissions:
+  contents: read
+
+jobs:
+  bandit:
+    name: Bandit (Python SAST)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install Bandit
+        run: pip install "bandit[toml]==1.7.5"
+      - name: Run Bandit
+        # Mirrors the pre-commit hook: config in pyproject.toml, medium+ severity.
+        # Scans the whole tree so CI covers files the local snippet scan missed.
+        run: bandit -c pyproject.toml -r . --severity-level medium
+
+  semgrep:
+    name: Semgrep (multi-language SAST)
+    runs-on: ubuntu-latest
+    container:
+      image: semgrep/semgrep:latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run Semgrep
+        # p/ci bundles the security-audit, secrets, and OWASP rule packs.
+        run: semgrep scan --config p/ci --error --timeout 300
+
+  checkov:
+    name: Checkov (IaC)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install Checkov
+        run: pip install checkov
+      - name: Run Checkov
+        # Scans CloudFormation, Kubernetes, Dockerfiles, and shell-adjacent IaC.
+        # Soft-fail off so misconfigurations (e.g. open SSH/egress) fail the build.
+        run: checkov --directory . --compact --quiet

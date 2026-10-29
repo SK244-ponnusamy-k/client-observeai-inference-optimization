@@ -60,12 +60,14 @@ def sync_results_from_s3(bucket: str, local_dir: Path) -> None:
     """Sync both load benchmark results and quality eval results from S3."""
     import subprocess
 
-    cmd_perf = f"aws s3 sync s3://{bucket}/results/ {local_dir}/perf/"
-    cmd_qual = f"aws s3 sync s3://{bucket}/quality/ {local_dir}/quality/"
+    # Pass argument lists (no shell=True) so bucket/local_dir values are never
+    # interpreted by the shell — prevents command injection (Bandit B602/B603).
+    cmd_perf = ["aws", "s3", "sync", f"s3://{bucket}/results/", f"{local_dir}/perf/"]
+    cmd_qual = ["aws", "s3", "sync", f"s3://{bucket}/quality/", f"{local_dir}/quality/"]
     print(f"Syncing benchmark & quality results from S3 (s3://{bucket}) ...")
     try:
-        subprocess.run(cmd_perf, shell=True, check=True)
-        subprocess.run(cmd_qual, shell=True, check=True)
+        subprocess.run(cmd_perf, check=True)
+        subprocess.run(cmd_qual, check=True)
         print("S3 sync complete.")
     except Exception as e:
         print(f"Warning: S3 sync failed or AWS CLI not found: {e}")

@@ -154,49 +154,64 @@ Resources:
       IpProtocol: "-1"
       ToPort: 65536
   
-  NodeSecurityGroupEgressAllIpv4:
+  # Internet-bound egress scoped to only what the nodes need (MEDIUM-1 /
+  # CKV_AWS_382). Was IpProtocol "-1" to 0.0.0.0/0 + ::/0 (all ports, all
+  # protocols). Intra-node and control-plane egress keep their own SG-referenced
+  # rules above/below; these rules only govern traffic leaving to the internet:
+  #   443 -> HTTPS to S3 / ECR / HuggingFace / Secrets Manager / EKS API
+  #    53 -> DNS (TCP + UDP)
+  # If an EFA/NCCL path needs additional outbound ports, add narrowly scoped
+  # rules rather than reopening all protocols.
+  NodeSecurityGroupEgressHttpsIpv4:
     Type: "AWS::EC2::SecurityGroupEgress"
     DependsOn: NodeSecurityGroup
     Properties:
-      Description: Allow the efa worker nodes outbound communication
-      FromPort: 0
+      Description: Allow HTTPS egress (S3, ECR, HuggingFace, Secrets Manager, EKS API)
+      FromPort: 443
       CidrIp: "0.0.0.0/0"
       GroupId: !Ref NodeSecurityGroup
-      IpProtocol: "-1"
-      ToPort: 65536
+      IpProtocol: "tcp"
+      ToPort: 443
 
-  NodeSecurityGroupEgressAllIpv6:
+  NodeSecurityGroupEgressHttpsIpv6:
     Type: "AWS::EC2::SecurityGroupEgress"
     DependsOn: NodeSecurityGroup
     Properties:
-      Description: Allow the efa worker nodes outbound communication
-      FromPort: 0
+      Description: Allow HTTPS egress (IPv6)
+      FromPort: 443
       CidrIpv6: "::/0"
       GroupId: !Ref NodeSecurityGroup
-      IpProtocol: "-1"
-      ToPort: 65536
+      IpProtocol: "tcp"
+      ToPort: 443
+
+  NodeSecurityGroupEgressDnsTcpIpv4:
+    Type: "AWS::EC2::SecurityGroupEgress"
+    DependsOn: NodeSecurityGroup
+    Properties:
+      Description: Allow DNS (TCP) egress
+      FromPort: 53
+      CidrIp: "0.0.0.0/0"
+      GroupId: !Ref NodeSecurityGroup
+      IpProtocol: "tcp"
+      ToPort: 53
+
+  NodeSecurityGroupEgressDnsUdpIpv4:
+    Type: "AWS::EC2::SecurityGroupEgress"
+    DependsOn: NodeSecurityGroup
+    Properties:
+      Description: Allow DNS (UDP) egress
+      FromPort: 53
+      CidrIp: "0.0.0.0/0"
+      GroupId: !Ref NodeSecurityGroup
+      IpProtocol: "udp"
+      ToPort: 53
   
-  NodeSecurityGroupIngressSSHIpv4:
-    Type: "AWS::EC2::SecurityGroupIngress"
-    DependsOn: NodeSecurityGroup
-    Properties:
-      Description: Allow SSH
-      FromPort: 22
-      CidrIp: "0.0.0.0/0"
-      GroupId: !Ref NodeSecurityGroup
-      IpProtocol: "tcp"
-      ToPort: 22
-
-  NodeSecurityGroupIngressSSHIpv6:
-    Type: "AWS::EC2::SecurityGroupIngress"
-    DependsOn: NodeSecurityGroup
-    Properties:
-      Description: Allow SSH
-      FromPort: 22
-      CidrIpv6: "::/0"
-      GroupId: !Ref NodeSecurityGroup
-      IpProtocol: "tcp"
-      ToPort: 22
+  # SSH ingress removed (was 0.0.0.0/0 + ::/0 — HIGH-2 / CKV_AWS_24).
+  # Worker nodes attach AmazonSSMManagedInstanceCore, so interactive access is via
+  # AWS SSM Session Manager (no inbound port required):
+  #   aws ssm start-session --target <instance-id>
+  # If direct SSH is ever required, add a SecurityGroupIngress on TCP/22 scoped to a
+  # known bastion/VPN CIDR via a SshAllowedCidr parameter — never 0.0.0.0/0.
 
   ClusterControlPlaneSecurityGroupIngress:
     Type: "AWS::EC2::SecurityGroupIngress"
